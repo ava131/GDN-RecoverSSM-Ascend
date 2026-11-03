@@ -80,24 +80,6 @@ def validate_gdn_recoverssm(config) -> None:
         raise ValueError("Ascend GDN RecoverSSM requires --mamba-backend triton")
 
     cache = config.cache_config
-    if cache.mamba_cache_mode == "align":
-        # Known, documented conflict (issue #1 review, section 4): our commit
-        # writes the checkpoint to the block that holds the last committed token
-        # -- (computed + accepted - 1) // block -- while the framework's Recover
-        # postprocess advances a "running column" with
-        # (computed + accepted) // block, and Ascend's native align postprocess
-        # then copies state between those columns as if RecoverSSM had not
-        # restored anything. With computed=127, accepted=1, block=128 the commit
-        # writes column 0 while the running column becomes 1, and the native copy
-        # overwrites the restored state with the stale one. Until the ownership of
-        # the align postprocess for Recover rows is settled, refuse the mode
-        # instead of producing wrong prefix-cache checkpoints.
-        raise ValueError(
-            "Ascend GDN RecoverSSM does not support mamba_cache_mode='align' yet "
-            "(column bookkeeping conflict with the native align postprocess); "
-            "use --mamba-cache-mode none"
-        )
-
     if cache.mamba_cache_mode not in ("none", "align"):
         raise ValueError(
             "Ascend GDN RecoverSSM supports only none and align Mamba cache "

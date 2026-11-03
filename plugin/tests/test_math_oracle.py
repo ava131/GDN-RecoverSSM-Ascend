@@ -159,11 +159,10 @@ def commit_plan(num_computed: int, mamba_block_size: int, accepted: int, block_t
     Returns (final_block_col, boundary_block_col_or_None, boundary_len).
     """
     final_num_computed = num_computed + accepted
-    # Must match the kernel: the committed state belongs to the block holding
-    # the last committed token, so the column is (final - 1) // block.
-    final_col = min(
-        max(final_num_computed - 1, 0) // mamba_block_size, block_table_width - 1
-    )
+    # Must match the kernel and the framework's running column:
+    # (num_computed + num_sampled) // block. The native align postprocess then
+    # moves it into the completed block when a boundary is crossed.
+    final_col = min(final_num_computed // mamba_block_size, block_table_width - 1)
     next_boundary = (num_computed // mamba_block_size + 1) * mamba_block_size
     crosses = final_num_computed >= next_boundary
     boundary_col = None
@@ -174,15 +173,47 @@ def commit_plan(num_computed: int, mamba_block_size: int, accepted: int, block_t
     return final_col, boundary_col, boundary_len
 
 
+def test_align_boundary_lifecycle():
+    """The exact counterexample from the review, traced end to end.
+
+    computed=127, Q=2, accepted=1, block=128:
+      commit writes column 1,
+      framework running column = 1,
+      native postprocess copies 1 -> 0 (bias 0) and keeps column 1,
+    so the next step reads column 1 == the restored state.
+    """
+    block = 128
+    computed, accepted = 127, 1
+    commit_col, boundary_col, boundary_len = commit_plan(computed, block, accepted, 8)
+    running_col = min((computed + accepted) // block, 8 - 1)
+    assert commit_col == running_col == 1, (commit_col, running_col)
+    # native postprocess decision, mirrored from
+    # vllm_ascend/ops/triton/mamba/postprocess.py
+    num_tokens_running_state = computed + 1
+    new_num_computed = num_tokens_running_state + 1 - 1
+    aligned = (new_num_computed // block) * block
+    needs_copy = aligned >= num_tokens_running_state
+    bias = aligned - num_tokens_running_state
+    dest = aligned // block - 1
+    assert needs_copy and bias == 0 and dest == 0, (needs_copy, bias, dest)
+    # source is the running column our commit filled -> the copy carries the
+    # restored state into column 0 instead of the stale pre-copy.
+    assert running_col != dest
+    # non-boundary step: the native postprocess must stay out of the way
+    _, _, _ = commit_plan(128, block, 1, 8)
+    n2 = 128 + 1
+    assert ((n2 // block) * block) < n2
+
+
 def test_commit_plan_boundary_cases():
     block = 128
     # exactly on a boundary: nothing crosses, final lands on the new column
     assert commit_plan(128, block, 3, 8) == (1, None, 0)
-    # One token before the boundary, one accepted: the last committed token is
-    # #127 and still lives in column 0, while the window crosses the boundary.
-    # (The kernel computes (final-1)//block, so the column stays 0.)
-    assert commit_plan(127, block, 1, 8) == (0, 0, 1)
-    # one token before the boundary, all rejected -> stays
+    # One token before the boundary, one accepted: the state after 128 tokens
+    # belongs to column 1 (the running column); the native postprocess then
+    # copies it into column 0 and keeps column 1 live for the next step.
+    assert commit_plan(127, block, 1, 8) == (1, 0, 1)
+    # one token before the boundary, all rejected -> stays in column 0
     assert commit_plan(127, block, 0, 8) == (0, None, 0)
     # a full window crossing the boundary
     assert commit_plan(126, block, 4, 8) == (1, 0, 2)

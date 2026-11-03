@@ -646,8 +646,18 @@ def _prepare_commit_plan_kernel(
         # The committed state belongs to the block holding the last committed
         # token. A window ending exactly on a boundary stays in that block; the
         # next block may still be unallocated.
+        # Column convention must match the framework's running column,
+        # ``(num_computed + num_sampled) // block_size`` (vllm's
+        # _postprocess_recoverssm_align_kernel), NOT "the block that holds the
+        # last committed token". The native align postprocess moves the running
+        # column into the completed block when a boundary is crossed:
+        #   dest = aligned // block - 1, bias = aligned - running
+        # so at computed=127, accepted=1, block=128 our state must sit in column
+        # 1 (not 0); the native copy then moves it to column 0 and keeps it in
+        # column 1 for the next step, which is exactly the invariant the rest of
+        # the machinery maintains.
         final_state_col = tl.minimum(
-            tl.maximum(final_num_computed - 1, 0) // mamba_block_size,
+            final_num_computed // mamba_block_size,
             block_table_width - 1,
         )
         final_state_idx = tl.load(
