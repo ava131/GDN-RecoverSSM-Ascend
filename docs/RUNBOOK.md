@@ -5,6 +5,41 @@
 
 ---
 
+## 0. 容器/启动参数（最容易踩的三个坑）
+
+### 0.1 `/dev/shm` 必须放大，否则引擎起不来
+
+```
+RuntimeError: Insufficient space in /dev/shm: 160 MiB required, 64 MiB free.
+```
+
+这是 Docker 默认 `--shm-size=64m` 导致的，**发生在模型加载之前**，与本插件无关。
+
+```bash
+docker run --shm-size=16g ...          # 或 --ipc=host
+# K8s:
+#   volumes: [{name: dshm, emptyDir: {medium: Memory, sizeLimit: 16Gi}}]
+#   volumeMounts: [{name: dshm, mountPath: /dev/shm}]
+```
+
+### 0.2 `VLLM_USE_V2_MODEL_RUNNER=1` 是硬要求
+
+RecoverSSM 的 **commit 挂在 V2 model-state 生命周期里**
+（`MambaHybridModelState.postprocess_state` → `RecoverSSMState.commit_step`）。
+V1 runner（`vllm/v1/worker/gpu_model_runner.py`）里 **没有任何 recoverssm 代码**：
+
+```bash
+grep -c recoverssm vllm/v1/worker/gpu_model_runner.py    # -> 0
+```
+
+所以在 V1 上会是这样：verify 照跑、记录照写，**但永远没有 commit** → 检查点冻结 →
+输出越跑越偏，而且**不报错**。插件的配置校验现在会直接拒绝这种组合（fail fast）。
+
+### 0.3 投机长度按 `Q=4` 配（`num_speculative_tokens=3`）
+
+`num_speculative_tokens=1` ⇒ Q=2。按量化模型，**Q=2 时 RecoverSSM 的状态访存是 0.98×（反而更亏）**，
+交叉点在 Q≈2.06。要看到收益必须 `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`。
+
 ## 0. 前置检查（5 分钟）
 
 ```bash

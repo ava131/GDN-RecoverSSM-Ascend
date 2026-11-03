@@ -84,10 +84,16 @@ def validate_gdn_recoverssm(config) -> None:
             "Ascend GDN RecoverSSM supports only none and align Mamba cache "
             f"modes, got {cache.mamba_cache_mode}"
         )
-    if cache.mamba_cache_mode == "align" and not config.use_v2_model_runner:
+    # RecoverSSM's post-sampling commit lives in the V2 model-state lifecycle
+    # (``MambaHybridModelState.postprocess_state`` -> ``RecoverSSMState.commit_step``).
+    # The V1 runner has no RecoverSSM hooks at all: verify would run and write
+    # records, but nothing would ever commit, so the checkpoint would freeze and
+    # the output would silently drift. This is required for **both** cache modes.
+    if not config.use_v2_model_runner:
         raise ValueError(
-            "Ascend GDN RecoverSSM with align mode requires "
-            "VLLM_USE_V2_MODEL_RUNNER=1"
+            "Ascend GDN RecoverSSM requires the V2 model runner "
+            "(export VLLM_USE_V2_MODEL_RUNNER=1); the V1 runner has no "
+            "post-sampling commit hook, so the checkpoint would never advance"
         )
     block = cache.mamba_block_size
     if block is not None and block % query_len != 0:
