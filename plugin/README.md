@@ -71,6 +71,9 @@ Notes:
 ## Kill switch
 
 ```bash
+# 真正的原生基线必须**同时**去掉 --use-replayssm：
+# 只设这个变量时插件入口直接返回，上游 validator 随后会因 Qwen 架构
+# 不支持而拒绝启动（ValueError）。
 export GDN_RECOVERSSM_DISABLE=1   # plugin loads but does nothing
 ```
 or simply omit `--use-replayssm`.
