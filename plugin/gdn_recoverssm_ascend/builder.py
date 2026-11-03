@@ -149,6 +149,20 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         self._ctx_unbound_logged = False
         self._mapping_logged = False
         self._capturing = False
+        # A full-graph replay re-uses the addresses captured at capture time, so
+        # the accepted-token input must live in one **persistent** buffer that is
+        # rewritten in place. Allocating a clone per step (the previous
+        # behaviour) hands the graph a fresh address every step while the
+        # captured kernel keeps reading the old one; the old storage can even be
+        # freed and reused. Neutral value is 1: the checkpoint already holds the
+        # accepted state, so the next convolution starts a one-token window.
+        max_rows = max(
+            vllm_config.scheduler_config.max_num_seqs,
+            int(getattr(self, "decode_cudagraph_max_bs", 0) or 0),
+        )
+        self._accepted_buffer = torch.ones(
+            max_rows, dtype=torch.int32, device=device
+        )
 
     # ------------------------------------------------------------------ context
     def _get_context(self):
@@ -253,15 +267,18 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         # conv update must start from the compacted window: one accepted token.
         # Allocate from the actual tensor shape: the spec index table can be
         # sized by the graph batch, which may exceed max_num_seqs.
-        if meta.num_accepted_tokens is not None:
-            num_accepted = meta.num_accepted_tokens.clone()
-            num_accepted[:n] = 1
-        else:
-            num_accepted = torch.ones(
-                meta.spec_state_indices_tensor.shape[0],
-                dtype=torch.int32,
-                device=state_indices.device,
+        # Stable address + in-place neutral value (see __init__). Every row gets
+        # 1: real spec rows because the checkpoint is compacted, padding rows
+        # because the framework's dummy value is 1 as well.
+        need = int(meta.spec_state_indices_tensor.shape[0])
+        if need > self._accepted_buffer.numel():
+            # Graph batch larger than the configured ceiling: grow once, keep the
+            # new buffer for the rest of the process.
+            self._accepted_buffer = torch.ones(
+                need, dtype=torch.int32, device=self._accepted_buffer.device
             )
+        num_accepted = self._accepted_buffer[:need]
+        num_accepted.fill_(1)
 
         # The layer's convolution reads the **nested** descriptor, which the base
         # builder created before we rewrote the top-level tensor. Rebinding both

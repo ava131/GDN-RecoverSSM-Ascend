@@ -191,8 +191,13 @@ def _install_gdn_stub():
                          for_capture=False, ubatch_idx=0):
             return {"layer.0": "metadata"}
 
+    # Faithful three-class topology: base (vLLM), real layer (vLLM subclass),
+    # donor (vllm-ascend subclass). The donor is a *sibling* of the real class.
+    class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+        """Method donor: holds the Ascend overrides, never instantiated."""
+
     mod = types.ModuleType("vllm_ascend.ops.gdn")
-    mod.AscendGatedDeltaNetAttention = GatedDeltaNetAttention
+    mod.AscendGatedDeltaNetAttention = AscendGatedDeltaNetAttention
     mod.recurrent_gated_delta_rule = stock_recurrent
     mod.__dict__["_calls"] = calls
 
@@ -237,13 +242,29 @@ def _install_gdn_stub():
     sys.modules["vllm_ascend.worker.v2.model_states.mamba_hybrid"] = ms
     sys.modules["vllm_ascend.worker.v2.model_states"].mamba_hybrid = ms
 
-    # real layer class lives in vLLM; the Ascend class is only a donor
+    # Faithful topology: one shared base, the real layer as a **sibling** of the
+    # Ascend donor, and the worker's by-value method copy (patch_qwen3_5).
     qg = types.ModuleType("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn")
 
     class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
-        pass
+        """Real layer class; starts with only the base behaviour."""
 
     qg.QwenGatedDeltaNetAttention = QwenGatedDeltaNetAttention
+
+    def _simulate_worker_patch(use_saved_init=True):
+        """patch_qwen3_5: copy donor methods onto the real class."""
+        donor = AscendGatedDeltaNetAttention
+        original_init = QwenGatedDeltaNetAttention.__init__
+        if use_saved_init:
+            def _init(self, *a, **k):
+                original_init(self, *a, **k)
+            QwenGatedDeltaNetAttention.__init__ = _init
+        QwenGatedDeltaNetAttention._forward_core = donor._forward_core
+        QwenGatedDeltaNetAttention.get_attn_backend = donor.get_attn_backend
+
+    QwenGatedDeltaNetAttention._simulate_worker_patch = staticmethod(
+        _simulate_worker_patch
+    )
     for name in ("vllm.model_executor", "vllm.model_executor.layers",
                  "vllm.model_executor.layers.mamba",
                  "vllm.model_executor.layers.mamba.gdn"):
@@ -385,6 +406,8 @@ def test_plugin_wiring():
 
     layer = cls()
     assert layer_patch._enabled(layer) is True
+    backend = layer.get_attn_backend()
+    assert backend.get_name() == "ASCEND_GDN_RECOVERSSM", backend.get_name()
 
     from gdn_recoverssm_ascend.builder import AscendGDNRecoverSSMBackend  # noqa: F401
 
@@ -491,6 +514,26 @@ def test_loggers_live_under_vllm():
     ):
         mod = importlib.import_module(name)
         assert mod.logger.name.startswith("vllm."), (name, mod.logger.name)
+
+
+def test_worker_patch_order_independent():
+    """The other load order: plugin first, worker's by-value copy afterwards."""
+    _install_torch_stub()
+    _install_vllm_stubs()
+    gdn_mod, _donor = _install_gdn_stub()
+    cls = sys.modules[
+        "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn"
+    ].QwenGatedDeltaNetAttention
+    layer_patch = _reset_plugin()
+    captured = _install_kernels_stub()
+
+    layer_patch.install()
+    cls._simulate_worker_patch()          # worker runs second and overwrites
+
+    layer = cls()
+    assert layer.get_attn_backend().get_name() == "ASCEND_GDN_RECOVERSSM"
+    layer._forward_core()
+    assert captured.get("kw_state_indices") is not None, "verify did not run"
 
 
 def test_state_calculator_patch():
