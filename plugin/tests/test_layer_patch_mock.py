@@ -373,7 +373,12 @@ def _reset_plugin():
 def test_plugin_wiring():
     _install_torch_stub()
     _install_vllm_stubs()
-    gdn_mod, cls = _install_gdn_stub()
+    gdn_mod, _donor = _install_gdn_stub()
+    # Real layers are instances of the vLLM class the worker patches, not of the
+    # Ascend donor subclass. Instantiate the real one.
+    cls = sys.modules[
+        "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn"
+    ].QwenGatedDeltaNetAttention
     layer_patch = _reset_plugin()
     captured = _install_kernels_stub()
     layer_patch.install()
@@ -448,7 +453,12 @@ def test_padded_rows_use_offset_length():
     """num_spec_decodes may count graph-padded rows; qsl len is authoritative."""
     _install_torch_stub()
     _install_vllm_stubs()
-    gdn_mod, cls = _install_gdn_stub()
+    gdn_mod, _donor = _install_gdn_stub()
+    # Real layers are instances of the vLLM class the worker patches, not of the
+    # Ascend donor subclass. Instantiate the real one.
+    cls = sys.modules[
+        "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn"
+    ].QwenGatedDeltaNetAttention
     layer_patch = _reset_plugin()
     captured = _install_kernels_stub()
 
@@ -512,7 +522,12 @@ def test_state_calculator_patch():
 def test_disable_flag_keeps_stock_path():
     _install_torch_stub()
     _install_vllm_stubs()
-    gdn_mod, cls = _install_gdn_stub()
+    gdn_mod, _donor = _install_gdn_stub()
+    # Real layers are instances of the vLLM class the worker patches, not of the
+    # Ascend donor subclass. Instantiate the real one.
+    cls = sys.modules[
+        "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn"
+    ].QwenGatedDeltaNetAttention
     layer_patch = _reset_plugin()
     _install_kernels_stub()
     layer_patch.install()
