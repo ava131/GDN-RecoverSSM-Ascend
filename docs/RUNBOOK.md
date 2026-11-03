@@ -180,7 +180,8 @@ Ascend GDN RecoverSSM stats: verify_steps=200 commit_steps=200 spec_rows=1600 co
 
 | # | 用例 | 判据 | 怎么做 |
 |---|---|---|---|
-| 1 | `num_speculative_tokens=0`（即 Q=1） | 与不开 `--use-replayssm` **逐位一致** | 相同 prompt、贪心解码，比较 token 序列 |
+| 1 | 同 greedy 输入，开/关 RecoverSSM | `check_logprobs_close` 通过；接受长度不显著下降 | 相同 prompt、`temperature=0`、固定 seed，跑 200 条 |
+| 1b | **不要**用 `num_speculative_tokens=0` 做"逐位一致"验证 | 说明 | Q=1 时配置校验会把 `use_kda_recoverssm` 置 False，路径根本不激活，测了等于没测 |
 | 2 | 接受长度 a=0 的请求 | 检查点逐位不变 | 构造"必然被拒"的 draft（例如强 temperature + 故意错 token） |
 | 3 | 全部接受 / 部分接受 | 与 FP32 顺序 oracle 相对误差 < 1e-5 | 用 `plugin/tests/test_math_oracle.py` 的公式在 NPU 上重算 |
 | 4 | align 跨块边界 | `num_computed % 128 == 0` 与 `== 127` 两种都要覆盖 | 让 prompt 长度落在块边界前后 |
