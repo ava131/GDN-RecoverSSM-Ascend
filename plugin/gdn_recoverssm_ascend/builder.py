@@ -136,6 +136,7 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         self._context: Any = None
         self._ctx_key: tuple[int, ...] | None = None
         self._ctx_unbound_logged = False
+        self._mapping_logged = False
         self._capturing = False
 
     # ------------------------------------------------------------------ context
@@ -261,36 +262,47 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             num_computed = m.compute_num_computed_tokens()
             block_size = self.kv_cache_spec.block_size
 
-        # Ascend's spec rows may be a non-contiguous subset of the batch rows, so
-        # the commit plan gets the batch-row mapping. It is always passed (instead
-        # of only when it differs from the identity prefix) because deciding that
-        # would need a device->host sync on the hot path; one extra int32 load per
-        # program in the plan kernel is cheaper.
+        # ``spec_sequence_masks`` is indexed by **batch row** and
+        # ``spec_state_indices_tensor`` was gathered with
+        # ``nonzero(spec_sequence_masks)``, so spec row i corresponds to batch row
+        # ``nonzero(masks)[i]``. The commit plan needs exactly that mapping:
+        # identity here is only correct when the spec rows happen to be the first
+        # n rows, which is false as soon as chunked prefill puts a prefill row in
+        # front of a decode row.
         request_indices = None
         masks = meta.spec_sequence_masks
-        if masks is not None and masks.numel() == meta.spec_state_indices_tensor.shape[0]:
-            request_indices = masks.nonzero(as_tuple=False).flatten()[:n].to(torch.int32)
-            if request_indices.numel() != n:
-                # Padding rows were counted; fall back to the identity mapping and
-                # let the plan kernel treat row i as batch row i.
-                logger.warning_once(
-                    "GDN RecoverSSM: %d spec rows but %d masked rows; the commit "
-                    "plan falls back to the identity row mapping.",
+        if masks is not None and masks.numel() > 0:
+            rows = masks.nonzero(as_tuple=False).flatten()
+            if rows.numel() < n:
+                # Never guess: a wrong mapping folds another request's records
+                # into this request's checkpoint (silent corruption).
+                logger.warning(
+                    "Ascend GDN RecoverSSM: %d spec rows but only %d carry the "
+                    "spec mask; skipping the commit for this step.",
                     n,
-                    request_indices.numel(),
+                    rows.numel(),
                 )
-                request_indices = None
-        elif masks is not None:
-            # Graph-padded state buffers: the builder materialises graph-sized
-            # tensors after building on the logical batch, so the mask and the
-            # index table have different lengths. Identity is the documented
-            # layout for the padded case.
-            logger.warning_once(
-                "GDN RecoverSSM: spec mask length %d != state index rows %d; "
-                "using the identity row mapping.",
-                masks.numel(),
-                meta.spec_state_indices_tensor.shape[0],
+                return meta
+            request_indices = rows[:n].to(torch.int32)
+            if not self._mapping_logged:
+                self._mapping_logged = True
+                identity = bool(
+                    torch.equal(
+                        request_indices,
+                        torch.arange(n, dtype=torch.int32, device=request_indices.device),
+                    )
+                )
+                if not identity:
+                    logger.info(
+                        "Ascend GDN RecoverSSM: spec rows are not the batch "
+                        "prefix; commit maps rows %s", request_indices.tolist()
+                    )
+        elif n > 0:
+            logger.warning(
+                "Ascend GDN RecoverSSM: no spec mask on the metadata; skipping the "
+                "commit for this step."
             )
+            return meta
 
         commit = AscendGDNRecoverSSMCommitMetadata(
             state_indices=state_indices,
