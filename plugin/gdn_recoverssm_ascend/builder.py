@@ -57,6 +57,11 @@ from vllm_ascend.ops.gdn_attn_builder import (
 logger = init_logger("vllm.gdn_recoverssm_ascend.builder")
 
 
+def _env_flag(name: str) -> bool:
+    value = os.getenv(name)
+    return value is not None and value.strip() not in ("", "0", "false", "False")
+
+
 @dataclass
 class AscendGDNRecoverSSMCommitMetadata:
     """Everything the post-sampling commit needs, captured at build time."""
@@ -93,6 +98,11 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
             logger.warning(
                 "Ascend GDN RecoverSSM: commit skipped, the KV cache is not bound yet"
             )
+            return None
+        if _env_flag("GDN_RECOVERSSM_NO_COMMIT"):
+            # Bisect switch: verify runs and writes records, but the checkpoint
+            # never advances. Output will be wrong; the point is to see whether
+            # the crash disappears.
             return None
         n = int(commit.state_indices.shape[0])
         if n == 0:

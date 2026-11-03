@@ -130,6 +130,7 @@ def install() -> None:
             and _enabled(layer)
             and kwargs.get("num_accepted_tokens") is not None
             and len(args) >= 4
+            and not _env_flag("GDN_RECOVERSSM_NO_VERIFY")
         ):
             return _verify(layer, args[0], args[1], args[2], args[3], kwargs)
         return original_recurrent(*args, **kwargs)
@@ -170,6 +171,12 @@ def install() -> None:
 
 
 _TRACE = {"steps": 0}
+
+
+def _env_flag(name: str) -> bool:
+    """Read a diagnostic switch every call: bisecting needs no restart of code."""
+    value = os.getenv(name)
+    return value is not None and value.strip() not in ("", "0", "false", "False")
 
 
 def _trace_step(layer, attn_metadata, rows, total, query_start_loc, checkpoint_indices):
