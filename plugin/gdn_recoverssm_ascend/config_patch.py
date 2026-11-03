@@ -16,10 +16,11 @@ shapes the Ascend kernel supports and then enable the same downstream machinery
 from __future__ import annotations
 
 import functools
-import logging
 import os
 
-logger = logging.getLogger(__name__)
+from vllm.logger import init_logger
+
+logger = init_logger("vllm.gdn_recoverssm_ascend." + __name__.rsplit(".", 1)[-1])
 
 _GDN_ARCHITECTURES = (
     "Qwen3_5ForCausalLM",

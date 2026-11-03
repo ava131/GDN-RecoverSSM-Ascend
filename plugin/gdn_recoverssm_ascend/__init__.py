@@ -21,10 +21,11 @@ The commit after sampling needs no patching: vLLM v0.30.0 already calls
 
 from __future__ import annotations
 
-import logging
 import os
 
-logger = logging.getLogger(__name__)
+from vllm.logger import init_logger
+
+logger = init_logger("vllm.gdn_recoverssm_ascend." + __name__.rsplit(".", 1)[-1])
 
 _INSTALLED = False
 

@@ -54,7 +54,7 @@ from vllm_ascend.ops.gdn_attn_builder import (
     AscendGDNAttentionMetadataBuilder,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.gdn_recoverssm_ascend.builder")
 
 
 @dataclass
@@ -78,18 +78,26 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
     """GDN metadata that also carries the RecoverSSM commit payload."""
 
     recoverssm_commit: AscendGDNRecoverSSMCommitMetadata | None = None
-    recoverssm_context: Any = field(default=None, repr=False, compare=False)
+    # The builder resolves (and re-resolves) the commit context, so a metadata
+    # object created before the KV cache was bound still commits correctly.
+    recoverssm_builder: Any = field(default=None, repr=False, compare=False)
 
     def commit_recoverssm_state(
         self, num_accepted_tokens: torch.Tensor
     ) -> RecoverSSMPostprocessMetadata | None:
         commit = self.recoverssm_commit
-        if commit is None or self.recoverssm_context is None:
+        if commit is None or self.recoverssm_builder is None:
+            return None
+        context = self.recoverssm_builder._get_context()
+        if context is None:
+            logger.warning(
+                "Ascend GDN RecoverSSM: commit skipped, the KV cache is not bound yet"
+            )
             return None
         n = int(commit.state_indices.shape[0])
         if n == 0:
             return None
-        self.recoverssm_context.commit(
+        context.commit(
             num_accepted_tokens,
             commit.state_indices,
             commit.query_start_loc,
@@ -126,34 +134,71 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._context: Any = None
+        self._ctx_key: tuple[int, ...] | None = None
+        self._ctx_unbound_logged = False
         self._capturing = False
 
     # ------------------------------------------------------------------ context
     def _get_context(self):
-        """Create the per-layer commit context lazily.
+        """Create (or refresh) the per-layer commit context.
 
-        Must be lazy: at builder-construction time the layers are not bound to
-        their KV caches yet.
+        The context caches the **data pointers** of every layer's state pages, so
+        it must be rebuilt whenever the KV cache is re-bound: vLLM allocates the
+        real cache after the profiling run, and a sleep/wake or re-profile
+        replaces the tensors. Stale pointers turn the commit kernel into a write
+        to freed device memory, which surfaces much later as "MTE accesses an
+        invalid GM address" or "SUSPECT REMOTE ERROR". Upstream main hit the same
+        class of bug (vllm#63045: "the commit context is rebuilt when the KV
+        cache is re-bound").
         """
-        if self._context is None:
-            from .kernels import GDNRecoverSSMCommitContext
+        from .kernels import GDNRecoverSSMCommitContext
 
-            fc = self.vllm_config.compilation_config.static_forward_context
-            layers = [fc[name] for name in self.layer_names]
-            # The plan buffers must cover the graph batch too: a full-graph step
-            # can carry more rows than max_num_seqs.
-            max_rows = max(
-                self.vllm_config.scheduler_config.max_num_seqs,
-                int(getattr(self, "decode_cudagraph_max_bs", 0) or 0),
-            )
-            self._context = GDNRecoverSSMCommitContext.create(
-                layers,
-                spec_query_len=1 + self.num_spec,
-                max_num_reqs=max_rows,
-            )
-            first = layers[0]
-            kv = getattr(first, "kv_cache", ())
+        fc = self.vllm_config.compilation_config.static_forward_context
+        layers = [fc[name] for name in self.layer_names]
 
+        kv = getattr(layers[0], "kv_cache", None)
+        if kv is None or len(kv) < 3:
+            # KV cache not bound yet (profiling / early build).
+            if not self._ctx_unbound_logged:
+                self._ctx_unbound_logged = True
+                logger.warning(
+                    "Ascend GDN RecoverSSM: layers expose %s KV-cache entries; "
+                    "commit context deferred until the KV cache is bound.",
+                    "no" if kv is None else len(kv),
+                )
+            return None
+
+        # Cheap identity of the bound tensors; data_ptr changes on re-bind.
+        key = tuple(t.data_ptr() for t in kv)
+        if self._context is not None and key == self._ctx_key:
+            return self._context
+        if self._context is not None:
+            logger.warning(
+                "Ascend GDN RecoverSSM: KV cache re-bound, rebuilding the commit "
+                "context (stale pointers would write to freed device memory)."
+            )
+
+        # Plan buffers must cover the graph batch too: a full-graph step can
+        # carry more rows than max_num_seqs.
+        max_rows = max(
+            self.vllm_config.scheduler_config.max_num_seqs,
+            int(getattr(self, "decode_cudagraph_max_bs", 0) or 0),
+        )
+        self._context = GDNRecoverSSMCommitContext.create(
+            layers,
+            spec_query_len=1 + self.num_spec,
+            max_num_reqs=max_rows,
+        )
+        self._ctx_key = key
+        logger.info(
+            "Ascend GDN RecoverSSM commit context: %d layers, spec_query_len=%d, "
+            "state tensors per layer=%d, replay shape=%s, plan rows=%d",
+            len(layers),
+            1 + self.num_spec,
+            len(kv),
+            tuple(kv[2].shape),
+            max_rows,
+        )
         return self._context
 
     # -------------------------------------------------------------------- build
@@ -261,7 +306,7 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         out = AscendGDNRecoverSSMMetadata(
             **base,
             recoverssm_commit=commit,
-            recoverssm_context=self._get_context(),
+            recoverssm_builder=self,
         )
         return out
 

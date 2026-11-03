@@ -455,6 +455,19 @@ def test_padded_rows_use_offset_length():
     assert tuple(qsl.shape) == (3,), qsl.shape  # rows + 1, not 9
 
 
+def test_loggers_live_under_vllm():
+    """vLLM only configures the ``vllm`` logger tree; anything else is dropped."""
+    import importlib
+
+    for name in (
+        "gdn_recoverssm_ascend.config_patch",
+        "gdn_recoverssm_ascend.layer_patch",
+        "gdn_recoverssm_ascend.state_patch",
+    ):
+        mod = importlib.import_module(name)
+        assert mod.logger.name.startswith("vllm."), (name, mod.logger.name)
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()

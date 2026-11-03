@@ -18,9 +18,10 @@ it has accepted a Qwen GDN RecoverSSM configuration.
 from __future__ import annotations
 
 import functools
-import logging
 
-logger = logging.getLogger(__name__)
+from vllm.logger import init_logger
+
+logger = init_logger("vllm.gdn_recoverssm_ascend." + __name__.rsplit(".", 1)[-1])
 
 _FLAG = {"enabled": False, "spec_query_len": 0, "head_k": 0, "head_v": 0}
 
