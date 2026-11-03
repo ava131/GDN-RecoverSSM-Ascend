@@ -100,24 +100,12 @@ if num_decodes > 0 and num_spec_decodes > 0:
 
 ## 已知的两个结构性风险（尚未验证）
 
-### R1 路径不统一（高）
+### R1 【已撤回】"无 draft 行必须强制走 spec"
 
-上游 RecoverSSM 会**强制把所有活跃 decode 行都放到投机路径**：
-
-```python
-# recoverssm_utils.py（上游）
-active_decode = (~is_prefilling_cpu[:num_reqs]) & (query_lens > 0)
-spec_mask = (num_decode_draft_tokens_cpu[:num_reqs] >= 0) | active_decode
-drafts[:num_reqs] = torch.where(spec_mask, 1, -1)
-```
-
-理由是：RecoverSSM 把 conv 窗口从 `conv_kernel-1` 扩展成 `conv_kernel-1+Q`，
-**所有 decode 行必须使用同一套窗口布局**，否则一行在不同步之间切换路径，conv 状态就对不上。
-
-Ascend 的 builder 用 `spec_decode_mask = (drafts > 0) & is_decode` 判断，
-**drafts==0 的 decode 行无法被强制进投机路径**。所以一个请求在
-"有 draft → 无 draft"之间切换时，conv 窗口布局会切换 → **conv 状态错乱**
-（表现为输出漂移，不一定是崩溃）。
+早前版本的本节主张：Ascend 把 `drafts == 0` 的 decode 行排除在投机路径外，
+会导致 conv 窗口布局不一致。**该主张已被撤回**：对照固定 FLA NPU conv 源码，
+模拟 1000 轮 spec/plain 随机切换，conv history 匹配；issue #1 的 CPU 复核也没有
+复现这个问题。不要再基于它改代码。
 
 ### R2 之前的行数/映射 bug（已修，`16f4c2c` + `9864fb0`）
 
