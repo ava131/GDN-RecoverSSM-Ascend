@@ -159,10 +159,12 @@ def commit_plan(num_computed: int, mamba_block_size: int, accepted: int, block_t
     Returns (final_block_col, boundary_block_col_or_None, boundary_len).
     """
     final_num_computed = num_computed + accepted
-    # Must match the kernel and the framework's running column:
-    # (num_computed + num_sampled) // block. The native align postprocess then
-    # moves it into the completed block when a boundary is crossed.
-    final_col = min(final_num_computed // mamba_block_size, block_table_width - 1)
+    # Must match the kernel: the destination is the block that holds the last
+    # committed token, which is always allocated ((C+A)//B can point one column
+    # past the allocated range when the window ends exactly on a boundary).
+    final_col = min(
+        max(final_num_computed - 1, 0) // mamba_block_size, block_table_width - 1
+    )
     next_boundary = (num_computed // mamba_block_size + 1) * mamba_block_size
     crosses = final_num_computed >= next_boundary
     boundary_col = None
@@ -173,46 +175,59 @@ def commit_plan(num_computed: int, mamba_block_size: int, accepted: int, block_t
     return final_col, boundary_col, boundary_len
 
 
-def test_align_boundary_lifecycle():
-    """The exact counterexample from the review, traced end to end.
+def test_commit_destinations_are_allocated():
+    """The destination column must be one the request has actually allocated.
 
-    computed=127, Q=2, accepted=1, block=128:
-      commit writes column 1,
-      framework running column = 1,
-      native postprocess copies 1 -> 0 (bias 0) and keeps column 1,
-    so the next step reads column 1 == the restored state.
+    P1 from the review: final_col = (C + A) // B picks column 1 at
+    C=124, A=4, B=128 while the manager only guarantees ceil(128/128) = 1 block,
+    so the write can land on a null page.
     """
     block = 128
-    computed, accepted = 127, 1
-    commit_col, boundary_col, boundary_len = commit_plan(computed, block, accepted, 8)
-    running_col = min((computed + accepted) // block, 8 - 1)
-    assert commit_col == running_col == 1, (commit_col, running_col)
-    # native postprocess decision, mirrored from
-    # vllm_ascend/ops/triton/mamba/postprocess.py
-    num_tokens_running_state = computed + 1
-    new_num_computed = num_tokens_running_state + 1 - 1
-    aligned = (new_num_computed // block) * block
-    needs_copy = aligned >= num_tokens_running_state
-    bias = aligned - num_tokens_running_state
-    dest = aligned // block - 1
-    assert needs_copy and bias == 0 and dest == 0, (needs_copy, bias, dest)
-    # source is the running column our commit filled -> the copy carries the
-    # restored state into column 0 instead of the stale pre-copy.
-    assert running_col != dest
-    # non-boundary step: the native postprocess must stay out of the way
-    _, _, _ = commit_plan(128, block, 1, 8)
-    n2 = 128 + 1
-    assert ((n2 // block) * block) < n2
+    for computed, accepted in ((124, 4), (125, 3), (126, 2), (127, 1), (128, 1), (255, 1)):
+        col, _, _ = commit_plan(computed, block, accepted, 8)
+        needed_blocks = -(-(computed + accepted) // block)  # ceil
+        assert col <= max(needed_blocks - 1, 0), (computed, accepted, col, needed_blocks)
+
+
+def test_boundary_state_starts_from_same_checkpoint():
+    """P1 from the review: folding the boundary in a second pass resurrects state.
+
+    C=126, A=3, boundary_len=2, with h <- 0.5*h + 1 from h0=10:
+      final  = 3   (10 -> 6 -> 4 -> 3)
+      boundary = 4 (10 -> 6 -> 4)
+    A second pass over the page the final fold already overwrote produced 2.25.
+    """
+    h0, decay, corr, key = 10.0, 0.5, 1.0, 1.0
+
+    def fold(steps, start):
+        h = start
+        for _ in range(steps):
+            h = h * decay + corr * key
+        return h
+
+    records = [corr] * 3
+    assert abs(fold(3, h0) - 3.0) < 1e-12                     # final
+    assert abs(fold(2, h0) - 4.0) < 1e-12                     # boundary, one pass
+
+    # single pass: snapshot after 2 steps, continue to 3
+    h, boundary = h0, None
+    for t, c in enumerate(records):
+        h = h * decay + c * key
+        if t + 1 == 2:
+            boundary = h
+    assert abs(h - 3.0) < 1e-12 and abs(boundary - 4.0) < 1e-12
+
+    # the old two-pass shape: boundary folded again starting from the final state
+    assert abs(fold(2, 3.0) - 2.25) < 1e-12
 
 
 def test_commit_plan_boundary_cases():
     block = 128
     # exactly on a boundary: nothing crosses, final lands on the new column
     assert commit_plan(128, block, 3, 8) == (1, None, 0)
-    # One token before the boundary, one accepted: the state after 128 tokens
-    # belongs to column 1 (the running column); the native postprocess then
-    # copies it into column 0 and keeps column 1 live for the next step.
-    assert commit_plan(127, block, 1, 8) == (1, 0, 1)
+    # One token before the boundary, one accepted: the committed token is #127,
+    # which lives in column 0 (the only allocated column).
+    assert commit_plan(127, block, 1, 8) == (0, 0, 1)
     # one token before the boundary, all rejected -> stays in column 0
     assert commit_plan(127, block, 0, 8) == (0, None, 0)
     # a full window crossing the boundary

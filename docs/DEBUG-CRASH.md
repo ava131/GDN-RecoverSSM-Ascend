@@ -98,6 +98,26 @@ if num_decodes > 0 and num_spec_decodes > 0:
 
 ---
 
+## align 模式：当前**未验证**，不要当成可用
+
+已确认的两个问题（issue #1 最新一轮审查）：
+
+1. **boundary 状态必须与 final 同源**：早前实现用两次 launch，final 先写、boundary 后读，
+   当 final 落回 source 页时 boundary 读到的是被覆盖后的状态。
+   例：`C=126, A=3, boundary_len=2`，初态 10、每步 `h=0.5h+1` → boundary 应为 4，实得 2.25。
+   **已改**为单次递推中在 `t+1 == boundary_len` 处快照。
+2. **目标列必须是已分配的列**：`(C+A)//B` 在 `C=124, A=4, B=128` 时指向 column 1，
+   而分配器只保证 `ceil(128/128)=1` 块，该列可能是 null page → 两个 kernel 直接返回、
+   checkpoint 不推进，但框架已把 running column 记为 1。
+   **已改回** `(C+A-1)//B`（最后提交 token 所在块，必然已分配）。
+
+仍未解决：framework 的 `_postprocess_recoverssm_align_kernel` 会把 running column 推进到
+`(C+A)//B`，与我们的目标列在边界处相差 1；而原生 align 后处理随后会用 running column 做
+`src + bias` 的**槽位**寻址，在 `num_speculative_blocks=0` 下没有槽位可寻。
+
+因此 align 目前**保持开启（不拒绝），但不声明可用**：需要按上游 #63045 的做法重新划分
+"commit 写入位置 / running column / 原生后处理职责"三者，并做多轮边界实测。
+
 ## 已知的两个结构性风险（尚未验证）
 
 ### R1 【已撤回】"无 draft 行必须强制走 spec"

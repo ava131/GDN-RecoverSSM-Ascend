@@ -646,18 +646,15 @@ def _prepare_commit_plan_kernel(
         # The committed state belongs to the block holding the last committed
         # token. A window ending exactly on a boundary stays in that block; the
         # next block may still be unallocated.
-        # Column convention must match the framework's running column,
-        # ``(num_computed + num_sampled) // block_size`` (vllm's
-        # _postprocess_recoverssm_align_kernel), NOT "the block that holds the
-        # last committed token". The native align postprocess moves the running
-        # column into the completed block when a boundary is crossed:
-        #   dest = aligned // block - 1, bias = aligned - running
-        # so at computed=127, accepted=1, block=128 our state must sit in column
-        # 1 (not 0); the native copy then moves it to column 0 and keeps it in
-        # column 1 for the next step, which is exactly the invariant the rest of
-        # the machinery maintains.
+        # The destination must be a column the request actually owns. The
+        # manager only guarantees ceil(tokens / block) blocks (align mode ignores
+        # the lookahead and num_speculative_blocks is 0 here), so
+        # ``(computed + accepted) // block`` can point one column past the
+        # allocated range when the window ends exactly on a boundary
+        # (C=124, A=4, B=128 -> column 1, which may still be a null page).
+        # The block holding the last committed token always exists.
         final_state_col = tl.minimum(
-            final_num_computed // mamba_block_size,
+            tl.maximum(final_num_computed - 1, 0) // mamba_block_size,
             block_table_width - 1,
         )
         final_state_idx = tl.load(
@@ -806,16 +803,12 @@ def _commit_gdn_state_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     NUM_HEADS: tl.constexpr,
-    BOUNDARY: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
 ):
-    # Every program runs one fold and keeps one tile live. In align mode the
-    # block-boundary state (the window's first boundary_len tokens) is folded by a
-    # second launch (BOUNDARY): a crossing window's boundary state goes into its
-    # source block, which the first launch's final-state fold must still read.
-    #
-    # Upstream names this constexpr BOUNDARY; the Python side derives both
-    # launches from ALIGN_MODE (= block_table is not None), final states first.
+    # Every program runs ONE fold and keeps one tile live. In align mode the
+    # block-boundary state (the first boundary_len tokens of the window) is
+    # snapshotted during that same fold, so it always starts from the original
+    # checkpoint even when the final destination aliases the source page.
     # The commit reads gate/beta out of the replay record, so it needs no gate
     # parameters (unlike the KDA port, which re-runs its gate here).
     pid_v = tl.program_id(0)
@@ -835,13 +828,15 @@ def _commit_gdn_state_kernel(
     if final_idx <= null_block_id:
         return
     dst_idx = final_idx
-    if BOUNDARY:
-        dst_idx = tl.load(boundary_state_indices_ptr + pid_b).to(tl.int64)
-        # A window ending exactly on the boundary keeps its final state in that
-        # block: the first launch already wrote it (and may have overwritten src).
-        if dst_idx <= null_block_id or dst_idx == final_idx:
-            return
-        n = tl.load(boundary_recovery_lens_ptr + pid_b)
+    # Boundary state is captured DURING the same fold. It must never be a second
+    # pass over the source page: when the final state lands in the window's
+    # source column, a second launch would read the already-overwritten
+    # checkpoint and resurrect the wrong history (C=126, A=3, boundary_len=2
+    # gave 2.25 instead of 4).
+    b_idx = tl.load(boundary_state_indices_ptr + pid_b).to(tl.int64)
+    b_len = tl.load(boundary_recovery_lens_ptr + pid_b).to(tl.int32)
+    # Chained ``and`` is rejected by triton-ascend, so fold into one bitwise term.
+    store_boundary = (b_idx > null_block_id) & (b_idx != final_idx) & (b_len > 0)
     state_ptr = tl.load(state_base_addrs_ptr + pid_l).to(
         tl.pointer_type(state_ref_ptr.dtype.element_ty)
     )
@@ -872,12 +867,22 @@ def _commit_gdn_state_kernel(
     # the KDA Ascend port had to do on A3 to fit a 192 KiB UB. Static unrolling is
     # the fallback if Triton-Ascend rejects a runtime bound.
     h = s0
+    b_dst = state_ptr + b_idx * sbs + pid_h * stride_state_head + sp
     for t in range(n):
         rec = rec_base + t * stride_replay_pos
         c = tl.load(rec + offs_v * stride_replay_dim, mask=mask_v, other=0.0)
         kk = tl.load(rec + (V + offs_k) * stride_replay_dim, mask=mask_k, other=0.0)
         decay = tl.load(rec + (V + K) * stride_replay_dim)
         h = tl.fma(c[:, None], kk[None, :], h * decay)
+        if store_boundary:
+            if t + 1 == b_len:
+                # Snapshot of the state after ``boundary_len`` tokens, taken from
+                # the same starting checkpoint as the final fold.
+                tl.store(
+                    b_dst,
+                    h.to(state_ref_ptr.dtype.element_ty),
+                    mask=mask_state,
+                )
     tl.store(
         state_ptr + dst_idx * sbs + pid_h * stride_state_head + sp,
         h.to(state_ref_ptr.dtype.element_ty),
@@ -1185,9 +1190,9 @@ class GDNRecoverSSMCommitContext:
             state_indices.stride(0),
         )
         grid = (triton.cdiv(V, BV), batch, num_layers * HV)
-        # Final states first: a boundary state can land in the window's source
-        # slot, which the final-state fold reads (stream order separates them).
-        for boundary in (False, True) if align else (False,):
+        # One launch per layer set: both the final and the boundary state come
+        # out of a single fold over one checkpoint load.
+        if True:
             _commit_gdn_state_kernel[grid](
                 *args,
                 K=K,
@@ -1195,7 +1200,6 @@ class GDNRecoverSSMCommitContext:
                 BK=BK,
                 BV=BV,
                 NUM_HEADS=HV,
-                BOUNDARY=boundary,
                 NUM_BLOCKS=self.num_blocks,
                 num_warps=4,
                 num_stages=2,

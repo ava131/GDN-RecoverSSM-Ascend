@@ -117,16 +117,13 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
             num_computed_tokens=commit.num_computed_tokens,
             mamba_block_size=commit.block_size,
         )
-        if commit.block_table is None:
-            return None
-        assert commit.block_size is not None and commit.num_computed_tokens is not None
-        return RecoverSSMPostprocessMetadata(
-            num_spec_decodes=n,
-            request_indices=commit.request_indices,
-            block_table=commit.block_table,
-            num_computed_tokens=commit.num_computed_tokens,
-            block_size=commit.block_size,
-        )
+        # Deliberately no RecoverSSMPostprocessMetadata: it would make the
+        # framework advance the running column to (computed + sampled) // block,
+        # which can be a column the request has not allocated yet and which does
+        # not match the column we just committed into. Align-mode column
+        # bookkeeping therefore stays open (see docs/DEBUG-CRASH.md) and align
+        # must not be claimed as validated.
+        return None
 
 
 class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
