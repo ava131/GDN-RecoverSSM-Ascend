@@ -150,6 +150,15 @@ vllm serve /models/Qwen3.8-27B \
 
 插件在四个时机打日志，全部走 vLLM 的 `init_logger`，默认 INFO 就会出现在 server 的 stdout。
 
+### 0.4 一条命令出结论（推荐）
+
+```bash
+python plugin/tools/check_startup.py server.log        # 或：grep -E "RecoverSSM|gdn_recoverssm" server.log | python plugin/tools/check_startup.py -
+```
+
+输出是一张 5 项的表（插件加载 / 配置生效 / commit context / verify / 运行时统计），
+每项标 `OK` / `FAIL` / `--`(未到时候)，FAIL 项直接给出下一步动作。退出码 0 = 启动期通过。
+
 ### ① 启动期：配置被接受 + 记录张量真的分配了
 
 ```bash
