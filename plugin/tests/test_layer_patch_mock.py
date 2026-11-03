@@ -369,13 +369,6 @@ def test_plugin_wiring():
     # 4) the shim returns [T, HV, V] so the layer's .unsqueeze(0) restores the batch dim
     assert tuple(out.shape) == (12, 8, 128), out.shape
 
-    # 5) telemetry: verify counted, banner emitted once
-    from gdn_recoverssm_ascend import telemetry
-
-    assert telemetry._STATE["verify_steps"] == 1, telemetry._STATE
-    assert telemetry._STATE["verify_rows"] == 2
-    assert telemetry._STATE["banner_done"] is True
-
     # 6) Ascend's prepare_attn override is wrapped so record_step still fires
     ms = sys.modules["vllm_ascend.worker.v2.model_states.mamba_hybrid"]
     state = ms.AscendMambaHybridModelState()

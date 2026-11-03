@@ -114,7 +114,7 @@ def install() -> None:
     )
 
     _APPLIED = True
-    logger.info(
+    logger.debug(
         "gdn_recoverssm_ascend: GDN state calculators patched "
         "(replay record appended when enabled)"
     )

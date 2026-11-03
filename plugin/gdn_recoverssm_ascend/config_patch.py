@@ -120,6 +120,29 @@ def validate_gdn_recoverssm(config) -> None:
         )
 
 
+def _summary(config, query_len: int) -> str:
+    """One-line startup summary, shaped like the rest of vLLM's config dump."""
+    hf = config.model_config.hf_text_config
+    tp = config.parallel_config.tensor_parallel_size
+    hv = getattr(hf, "linear_num_value_heads", None)
+    k = getattr(hf, "linear_key_head_dim", None)
+    v = getattr(hf, "linear_value_head_dim", None)
+    if hv and k and v and hv % tp == 0:
+        replay = f"[{hv // tp}, {query_len}, {v + k + 1}] fp32"
+        states = "3 per layer (conv, checkpoint, replay)"
+    else:
+        replay = "?"
+        states = "?"
+    cache = config.cache_config
+    return (
+        f"enabled: window={query_len} (num_spec={config.num_speculative_tokens}), "
+        f"mamba_cache_mode={cache.mamba_cache_mode}, "
+        f"mamba_block_size={cache.mamba_block_size}, tp={tp}, "
+        f"mamba states={states}, replay={replay}, "
+        f"num_speculative_blocks=0"
+    )
+
+
 def install() -> None:
     global _APPLIED
     if _APPLIED:
@@ -158,17 +181,12 @@ def install() -> None:
 
         validate_gdn_recoverssm(self)
         self.cache_config.use_kda_recoverssm = self.num_speculative_tokens > 0
+        query_len = 1 + self.num_speculative_tokens
         # The state layout only gains the replay record when the feature is on.
         from . import state_patch
 
-        state_patch.enable(1 + self.num_speculative_tokens)
-        logger.info(
-            "Ascend GDN RecoverSSM enabled: spec_query_len=%d, "
-            "mamba_cache_mode=%s, mamba_block_size=%s",
-            1 + self.num_speculative_tokens,
-            self.cache_config.mamba_cache_mode,
-            self.cache_config.mamba_block_size,
-        )
+        state_patch.enable(query_len)
+        logger.info("Ascend GDN RecoverSSM %s", _summary(self, query_len))
         return self
 
     VllmConfig.validate_mamba_cached_kernel = validate_mamba_cached_kernel

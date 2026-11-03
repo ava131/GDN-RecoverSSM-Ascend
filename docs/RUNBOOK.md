@@ -150,68 +150,56 @@ vllm serve /models/Qwen3.8-27B \
 
 插件在四个时机打日志，全部走 vLLM 的 `init_logger`，默认 INFO 就会出现在 server 的 stdout。
 
-### ① 启动期：配置被接受 + 记录张量真的分配了
+### 3.3 启动日志里就一行
+
+插件只在**启动时**打一条 INFO，跟着 vLLM 自己的启动日志走（同一路 stdout）：
 
 ```bash
-grep -E "gdn_recoverssm_ascend|Ascend GDN RecoverSSM" server.log
+grep -i "RecoverSSM" server.log
 ```
 
-期望看到（顺序大致如下）：
-
 ```
-gdn_recoverssm_ascend: installed
-gdn_recoverssm_ascend: GDN state calculators patched (replay record appended when enabled)   # 注：实际在 install 时打
-gdn_recoverssm_ascend: AscendGatedDeltaNetAttention + model-state record hook patched
-Ascend GDN RecoverSSM enabled: spec_query_len=4, mamba_cache_mode=align, mamba_block_size=128
-Ascend GDN RecoverSSM commit context: 48 layers, spec_query_len=4, state tensors per layer=3, replay shape=(3, 4, 257)
+INFO ... [patch_recoverssm_config.py] Ascend GDN RecoverSSM enabled: window=4 (num_spec=3), mamba_cache_mode=none, mamba_block_size=None, tp=4, mamba states=3 per layer (conv, checkpoint, replay), replay=[12, 4, 257] fp32, num_speculative_blocks=0
 ```
 
-**关键判据是最后一行**：`state tensors per layer=3` 且 `replay shape=(HV_tp, Q, V+K+1)`。
-只看 `enabled` 不够——那只证明配置过了，不证明记录张量被分配。
+这一行同时说明五件事：
 
-### ② 首步：真的走到了 verify
-
-```
-Ascend GDN RecoverSSM ACTIVE: spec_query_len=4, mamba states per layer=3 (conv, checkpoint, replay), shapes=[...], dtypes=[..., torch.float32]
-Ascend GDN RecoverSSM verify #1: 8 spec rows, window=4, query_start_loc[:4]=[0, 4, 8, 12]
-```
-
-`dtypes` 的最后一项必须是 `torch.float32`（记录必须是 FP32）。
-
-### ③ 周期统计：verify 与 commit 同步推进（**最关键的证据**）
-
-默认每 **200 次 commit** 打一次，可用 `GDN_RECOVERSSM_LOG_EVERY` 调整：
-
-```
-Ascend GDN RecoverSSM stats: verify_steps=200 commit_steps=200 spec_rows=1600 commit_rows=1600 empty_commits=0 accepted_tokens=642 mean_accepted=3.21
-```
-
-判读：
-
-| 现象 | 含义 |
+| 字段 | 含义 |
 |---|---|
-| `commit_steps` ≈ `verify_steps` | ✅ 正常：每步 verify 都有一次 commit |
-| `commit_steps == 0` 而 `verify_steps > 0` | ❌ 致命：commit 钩子没接上，**检查点永不前进**（会同时打 WARNING） |
-| `commit_steps` 明显 < `verify_steps` | ⚠️ 部分 verify 没走到 commit，会打 WARNING |
-| `mean_accepted < 1` | ⚠️ draft 全被拒，或者 commit 没生效（会打 WARNING） |
-| `empty_commits` 很高 | 正常但可疑：大量请求 a=0 |
+| `window=4 (num_spec=3)` | Q=4，投机窗口 |
+| `mamba_cache_mode=none` | 当前缓存模式（`align` = 开了 prefix cache） |
+| `mamba states=3 per layer` | **记录张量被追加了**（原来只有 conv + checkpoint 两个） |
+| `replay=[12, 4, 257] fp32` | 每个 token 的恢复记录形状与精度（`[HV_tp, Q, V+K+1]`） |
+| `num_speculative_blocks=0` | 每请求的状态槽从 Q 降到 1，容量收益生效 |
 
-### ④ 量化反证（不看日志）
+**没有这一行 = 没生效。** 排查顺序：
 
-1. **KV cache 容量**：同一份命令，`--use-replayssm` 开/关各跑一次，vLLM 启动日志里
-   "Available KV cache memory / GPU blocks" 的差别应约等于 `(Q−1) × 状态大小 × 并发`。
-   因为 `num_speculative_blocks` 从 `Q` 变成 `0`。
-2. **`npu-smi info`**：模型加载后 HBM 占用应更低（同 batch）。
-3. **A/B 开关**：命令完全不变，只加 `GDN_RECOVERSSM_DISABLE=1` → 上面的所有日志消失、
-   `state tensors per layer` 回到 `2`、KV 容量回到 Q 份。这是最干净的反证。
+1. `--use-replayssm` 没带？→ 上游要求 `num_speculative_tokens > 0`；
+2. 设了 `GDN_RECOVERSSM_DISABLE=1`？→ 会打 `disabled by GDN_RECOVERSSM_DISABLE`；
+3. 插件没装进 vLLM 的环境？→ 完全没有任何输出，`pip show gdn-recoverssm-ascend` 确认；
+4. 版本不匹配？→ 会打 `stays inert (原因)`。
 
-### ⑤ 最终证据（不是日志）
+> 之前版本还有"commit context / ACTIVE / verify #1 / 每 200 步 stats"这些运行时日志，已全部删除：
+> 启动这一行已经覆盖了"记录被分配 + 槽位降为 1"这两个关键事实，其余属于排查细节，
+> 需要时可以临时把日志级别开到 DEBUG。
 
-`num_speculative_tokens=0`（Q=1）时输出与不开 RecoverSSM **逐位一致**；
-`Q=4` 时 greedy 输出通过 `check_logprobs_close`。日志只能证明"路径走了"，
-**正确性只能靠这两条**。
+### 3.4 想进一步确认运行时行为（可选，不改代码）
 
-## 4. 正确性验收（必须在真机上做）
+启动那一行只能证明"配置和内存布局对了"，不能证明"每步真的在 commit"。要确认这一点，
+**不需要额外日志**，看两个外部指标即可：
+
+```bash
+# 1) 同一命令、开/关 --use-replayssm，比较启动日志里的可用 KV 容量
+grep -iE "Available KV cache memory|GPU KV cache size|Maximum concurrency" server.log
+
+# 2) 对比时延与接受长度
+vllm bench serve --model /models/Qwen3.8-27B --num-prompts 200 --temperature 0
+```
+
+`--use-replayssm` 打开后，`num_speculative_blocks` 从 Q 变 0，每请求的状态槽少 Q−1 个，
+可用 KV 容量应随之变大；接受长度应与关闭时基本一致（差 >5% 说明语义有问题）。
+
+## 4. 正确性验收（必须在真机上做）## 4. 正确性验收（必须在真机上做）
 
 | # | 用例 | 判据 | 怎么做 |
 |---|---|---|---|

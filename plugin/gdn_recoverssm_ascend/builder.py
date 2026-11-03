@@ -87,9 +87,6 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
         if commit is None or self.recoverssm_context is None:
             return None
         n = int(commit.state_indices.shape[0])
-        from . import telemetry
-
-        telemetry.bump_commit(num_accepted_tokens, n)
         if n == 0:
             return None
         self.recoverssm_context.commit(
@@ -129,7 +126,6 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._context: Any = None
-        self._logged = False
         self._capturing = False
 
     # ------------------------------------------------------------------ context
@@ -151,14 +147,7 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             )
             first = layers[0]
             kv = getattr(first, "kv_cache", ())
-            logger.info(
-                "Ascend GDN RecoverSSM commit context: %d layers, spec_query_len=%d, "
-                "state tensors per layer=%d, replay shape=%s",
-                len(layers),
-                1 + self.num_spec,
-                len(kv),
-                tuple(kv[2].shape) if len(kv) > 2 else None,
-            )
+
         return self._context
 
     # -------------------------------------------------------------------- build
@@ -263,15 +252,6 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             recoverssm_commit=commit,
             recoverssm_context=self._get_context(),
         )
-        if not self._logged:
-            self._logged = True
-            logger.info(
-                "Ascend GDN RecoverSSM path taken: %d spec rows, align=%s, "
-                "request_indices=%s",
-                n,
-                align,
-                request_indices is not None,
-            )
         return out
 
     def build_for_cudagraph_capture(self, common_attn_metadata: CommonAttentionMetadata):

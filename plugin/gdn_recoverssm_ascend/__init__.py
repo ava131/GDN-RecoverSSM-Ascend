@@ -77,7 +77,7 @@ def install() -> None:
     state_patch.install()
     config_patch.install()
     layer_patch.install()
-    logger.info("gdn_recoverssm_ascend: installed")
+    logger.debug("gdn_recoverssm_ascend: installed")
 
 
 __all__ = ["install"]

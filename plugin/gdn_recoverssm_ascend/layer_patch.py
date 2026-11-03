@@ -161,7 +161,7 @@ def install() -> None:
     state_cls.prepare_attn = prepare_attn
 
     _APPLIED = True
-    logger.info(
+    logger.debug(
         "gdn_recoverssm_ascend: AscendGatedDeltaNetAttention + model-state "
         "record hook patched"
     )
@@ -205,13 +205,6 @@ def _verify(layer, q, k, v, ssm_state, kwargs):
             "GDN_RECOVERSSM_DISABLE unset?"
         )
 
-    from . import telemetry
-
-    telemetry.banner_once(
-        kv_cache=kv_cache,
-        num_spec=layer.num_spec,
-        enabled=True,
-    )
     out = gdn_recoverssm_verify(
         kwargs["g"],
         kwargs["beta"],
@@ -225,12 +218,6 @@ def _verify(layer, q, k, v, ssm_state, kwargs):
         spec_query_len=layer.num_spec + 1,
         scale=kwargs.get("scale"),
         qk_already_normalized=True,
-    )
-    telemetry.bump_verify(
-        rows,
-        q.shape[0],
-        layer.num_spec + 1,
-        query_start_loc,
     )
     # The stock kernel returns [T, HV, V] and the layer adds the batch dim.
     return out.squeeze(0)
