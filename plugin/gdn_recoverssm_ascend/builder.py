@@ -35,6 +35,7 @@ Ascend-specific differences from upstream (see ``docs/FEASIBILITY.md``):
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -330,6 +331,15 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             recoverssm_commit=commit,
             recoverssm_builder=self,
         )
+        # The Ascend builder attaches descriptors that are *not* dataclass
+        # fields (``spec_decode_metadata``, ``non_spec_prefill_metadata``,
+        # ``non_spec_decode_metadata``). Rebuilding from ``fields(meta)`` alone
+        # dropped them, and the layer immediately reads
+        # ``attn_metadata.spec_decode_metadata.spec_causal_conv1d``. Copy every
+        # instance attribute the new object does not already carry.
+        for key, value in vars(meta).items():
+            if key not in base:
+                setattr(out, key, value)
         return out
 
     def build_for_cudagraph_capture(self, common_attn_metadata: CommonAttentionMetadata):

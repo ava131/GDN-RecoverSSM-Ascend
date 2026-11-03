@@ -237,6 +237,21 @@ def _install_gdn_stub():
     sys.modules["vllm_ascend.worker.v2.model_states.mamba_hybrid"] = ms
     sys.modules["vllm_ascend.worker.v2.model_states"].mamba_hybrid = ms
 
+    # real layer class lives in vLLM; the Ascend class is only a donor
+    qg = types.ModuleType("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn")
+
+    class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+        pass
+
+    qg.QwenGatedDeltaNetAttention = QwenGatedDeltaNetAttention
+    for name in ("vllm.model_executor", "vllm.model_executor.layers",
+                 "vllm.model_executor.layers.mamba",
+                 "vllm.model_executor.layers.mamba.gdn"):
+        m = types.ModuleType(name)
+        m.__path__ = []
+        sys.modules[name] = m
+    sys.modules["vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn"] = qg
+
     sys.modules["vllm_ascend.ops.gdn"] = mod
     sys.modules["vllm_ascend.ops.gdn_attn_builder"] = builder_mod
     return mod, GatedDeltaNetAttention
@@ -364,7 +379,7 @@ def test_plugin_wiring():
     layer_patch.install()
 
     layer = cls()
-    assert layer.use_gdn_recoverssm is True
+    assert layer_patch._enabled(layer) is True
 
     from gdn_recoverssm_ascend.builder import AscendGDNRecoverSSMBackend  # noqa: F401
 

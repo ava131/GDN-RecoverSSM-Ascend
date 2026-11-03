@@ -65,8 +65,33 @@ def _pop_layer(depth):
             stack.pop()
 
 
+_GLOBAL_ENABLED = False
+
+
+def enable_runtime() -> None:
+    """Feature switch driven by the plugin, not by each layer's ``__init__``.
+
+    The worker replaces the real layer's ``__init__`` with
+    ``_gdn_init_with_packed_weight`` (which calls the *original* vLLM init), so an
+    ``__init__``-based flag is never set on real layers. Relying on it made the
+    whole feature silently inert.
+    """
+    global _GLOBAL_ENABLED
+    _GLOBAL_ENABLED = True
+
+
 def _enabled(layer) -> bool:
-    return bool(getattr(layer, "use_gdn_recoverssm", False))
+    if not _GLOBAL_ENABLED or _env_flag("GDN_RECOVERSSM_DISABLE"):
+        return False
+    cache_config = getattr(layer, "cache_config", None)
+    if cache_config is not None and not getattr(
+        cache_config, "use_kda_recoverssm", False
+    ):
+        # ``--use-replayssm`` is what shrinks the mamba page to one state slot and
+        # appends the replay record; without it there is nowhere to write.
+        return False
+    # An explicit per-instance opt-out still wins.
+    return getattr(layer, "use_gdn_recoverssm", True) is not False
 
 
 def install() -> None:
@@ -76,46 +101,52 @@ def install() -> None:
 
     from vllm_ascend.ops import gdn as gdn_mod
 
-    cls = gdn_mod.AscendGatedDeltaNetAttention
+    # ``AscendGatedDeltaNetAttention`` is only a method donor: the worker
+    # (vllm_ascend/patch/worker/patch_qwen3_5.py) copies its methods onto the
+    # **vLLM** class and the real layers are instances of that one:
+    #
+    #   _GDN_PATCH_TARGET = QwenGatedDeltaNetAttention
+    #   _GDN_PATCH_TARGET._forward_core = AscendGatedDeltaNetAttention._forward_core
+    #   _GDN_PATCH_TARGET.__init__ = _gdn_init_with_packed_weight   # calls the ORIGINAL init
+    #
+    # Patching only the Ascend subclass therefore patched dead code: the real
+    # layers never got ``use_gdn_recoverssm`` and never entered verify.
+    donor_cls = gdn_mod.AscendGatedDeltaNetAttention
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention as real_cls,
+    )
 
-    # ---------------------------------------------------------------- __init__
-    original_init = cls.__init__
+    # Patching both classes makes the result independent of import order: if the
+    # worker patch runs first we override it, if it runs later it copies our
+    # wrappers from the donor class.
+    for cls in (donor_cls, real_cls):
+        # ------------------------------------------------------------ backend
+        original_backend = cls.get_attn_backend
 
-    @functools.wraps(original_init)
-    def __init__(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        cache_config = getattr(self, "cache_config", None)
-        self.use_gdn_recoverssm = bool(
-            getattr(cache_config, "use_kda_recoverssm", False)
-        ) and getattr(self, "num_spec", 0) > 0
+        @functools.wraps(original_backend)
+        def get_attn_backend(self, _original=original_backend):
+            if _enabled(self):
+                from .builder import AscendGDNRecoverSSMBackend
 
-    cls.__init__ = __init__
+                return AscendGDNRecoverSSMBackend
+            return _original(self)
 
-    # ------------------------------------------------------------- backend
-    original_backend = cls.get_attn_backend
+        cls.get_attn_backend = get_attn_backend
 
-    @functools.wraps(original_backend)
-    def get_attn_backend(self):
-        if _enabled(self):
-            from .builder import AscendGDNRecoverSSMBackend
+        # -------------------------------------------------------- forward hook
+        original_core = cls._forward_core
 
-            return AscendGDNRecoverSSMBackend
-        return original_backend(self)
+        @functools.wraps(original_core)
+        def _forward_core(self, *args, _original=original_core, **kwargs):
+            depth = _push_layer(self)
+            try:
+                return _original(self, *args, **kwargs)
+            finally:
+                _pop_layer(depth)
 
-    cls.get_attn_backend = get_attn_backend
+        cls._forward_core = _forward_core
 
-    # ------------------------------------------------------------- forward hook
-    original_core = cls._forward_core
-
-    @functools.wraps(original_core)
-    def _forward_core(self, *args, **kwargs):
-        depth = _push_layer(self)
-        try:
-            return original_core(self, *args, **kwargs)
-        finally:
-            _pop_layer(depth)
-
-    cls._forward_core = _forward_core
+    real_cls.__name__ = real_cls.__name__  # keep linters quiet about the alias
 
     # ------------------------------------------------- recurrent call redirect
     original_recurrent = gdn_mod.recurrent_gated_delta_rule
@@ -163,6 +194,7 @@ def install() -> None:
 
     state_cls.prepare_attn = prepare_attn
 
+    enable_runtime()
     _APPLIED = True
     logger.debug(
         "gdn_recoverssm_ascend: AscendGatedDeltaNetAttention + model-state "

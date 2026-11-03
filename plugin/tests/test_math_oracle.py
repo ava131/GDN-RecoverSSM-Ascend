@@ -77,11 +77,13 @@ def verify_records(state0, q, k, v, g, beta, scale):
 
 def commit(state0, records, accepted: int):
     """Simulate the Ascend commit kernel (one checkpoint write)."""
-    V = records.shape[1] - (records.shape[1] - 1) // 2  # unused, kept explicit below
-    del V
     h = state0.astype(np.float64).copy()
-    K = (records.shape[1] - 1) - (h.shape[1])  # (V + K + 1) - 1 - K = V
-    Vdim = records.shape[1] - K - 1
+    # Record layout is [correction (V), key (K), decay] and ``h`` is [V, K],
+    # so the dimensions come straight from the state, not from the record width.
+    Vdim, K = h.shape[0], h.shape[1]
+    assert records.shape[1] == Vdim + K + 1, (
+        f"record width {records.shape[1]} != V({Vdim}) + K({K}) + 1"
+    )
     for t in range(accepted):
         corr = records[t, :Vdim]
         key = records[t, Vdim : Vdim + K]
@@ -157,7 +159,11 @@ def commit_plan(num_computed: int, mamba_block_size: int, accepted: int, block_t
     Returns (final_block_col, boundary_block_col_or_None, boundary_len).
     """
     final_num_computed = num_computed + accepted
-    final_col = min(final_num_computed // mamba_block_size, block_table_width - 1)
+    # Must match the kernel: the committed state belongs to the block holding
+    # the last committed token, so the column is (final - 1) // block.
+    final_col = min(
+        max(final_num_computed - 1, 0) // mamba_block_size, block_table_width - 1
+    )
     next_boundary = (num_computed // mamba_block_size + 1) * mamba_block_size
     crosses = final_num_computed >= next_boundary
     boundary_col = None
@@ -172,14 +178,32 @@ def test_commit_plan_boundary_cases():
     block = 128
     # exactly on a boundary: nothing crosses, final lands on the new column
     assert commit_plan(128, block, 3, 8) == (1, None, 0)
-    # one token before the boundary, all accepted -> crosses with len 1
-    assert commit_plan(127, block, 1, 8) == (1, 0, 1)
+    # One token before the boundary, one accepted: the last committed token is
+    # #127 and still lives in column 0, while the window crosses the boundary.
+    # (The kernel computes (final-1)//block, so the column stays 0.)
+    assert commit_plan(127, block, 1, 8) == (0, 0, 1)
     # one token before the boundary, all rejected -> stays
     assert commit_plan(127, block, 0, 8) == (0, None, 0)
     # a full window crossing the boundary
     assert commit_plan(126, block, 4, 8) == (1, 0, 2)
     # clamp at the last block table column
     assert commit_plan(128 * 8, block, 4, 8) == (7, None, 0)
+
+
+def test_commit_non_square():
+    """V != K must work: the record layout is [corr(V), key(K), decay]."""
+    rng = np.random.default_rng(7)
+    V, K = 5, 7
+    h0 = rng.standard_normal((V, K))
+    records = rng.standard_normal((4, V + K + 1))
+    records[:, V + K] = rng.random(4) * 0.5
+    h = h0.copy()
+    for a in range(5):
+        assert commit(h0, records[:a], a).shape == (V, K)
+    ref = h0.copy()
+    for t in range(3):
+        ref = ref * records[t, V + K] + np.outer(records[t, :V], records[t, V : V + K])
+    np.testing.assert_allclose(commit(h0, records, 3), ref, rtol=1e-12, atol=1e-12)
 
 
 if __name__ == "__main__":

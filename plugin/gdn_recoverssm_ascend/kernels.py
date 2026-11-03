@@ -700,6 +700,7 @@ def _compact_conv_state_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_HISTORY: tl.constexpr,
     ALIGN_MODE: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
 ):
     # Upstream `compact_conv_state_kernel`, renamed only. Moves the accepted
     # suffix [commit_len - 1, commit_len - 1 + W) of the extended short-conv
@@ -1140,6 +1141,7 @@ class GDNRecoverSSMCommitContext:
                 BLOCK_D=conv_block_d,
                 BLOCK_HISTORY=block_history,
                 ALIGN_MODE=block_table is not None,
+                NUM_BLOCKS=self.num_blocks,
                 num_warps=4,
             )
         ref = self.checkpoints[0]
