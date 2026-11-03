@@ -263,6 +263,16 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
                 device=state_indices.device,
             )
 
+        # The layer's convolution reads the **nested** descriptor, which the base
+        # builder created before we rewrote the top-level tensor. Rebinding both
+        # is required: patching only the top level left the conv window using the
+        # previous step's accepted count (recorded evidence in
+        # docs/reference/... and in the review on issue #1, item 3).
+        spec_decode = getattr(meta, "spec_decode_metadata", None)
+        conv_spec = getattr(spec_decode, "spec_causal_conv1d", None)
+        if conv_spec is not None and hasattr(conv_spec, "num_accepted_tokens"):
+            conv_spec.num_accepted_tokens = num_accepted
+
         m = common_attn_metadata
         align = self.vllm_config.cache_config.mamba_cache_mode == "align"
         block_table = None
