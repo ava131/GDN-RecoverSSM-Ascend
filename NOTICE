@@ -1,0 +1,35 @@
+# NOTICE
+
+This repository contains **no** modifications to vLLM or vllm-ascend source code.
+The implementation in `plugin/` is a runtime plugin (monkey patches applied through
+the `vllm.general_plugins` entry point).
+
+## Third-party code
+
+| Path | Origin | License |
+|---|---|---|
+| `docs/reference/kda_recoverssm_upstream_0.30.0.py` | [vllm-project/vllm](https://github.com/vllm-project/vllm) v0.30.0, `vllm/models/kimi_k3/nvidia/ops/recoverssm.py` | Apache-2.0 |
+| `docs/reference/kda_recoverssm_ascend.py` | [vllm-project/vllm-ascend](https://github.com/vllm-project/vllm-ascend) `main`, `vllm_ascend/ops/triton/kda/recoverssm.py` | Apache-2.0 |
+| `docs/reference/kda_recoverssm_design.md` | same as above, `vllm_ascend/ops/triton/docs/kda_recoverssm.md` | Apache-2.0 |
+| `docs/reference/recoverssm_gdn_upstream.py` | [vllm-project/vllm](https://github.com/vllm-project/vllm) PR [#61309](https://github.com/vllm-project/vllm/pull/61309) head (`Yuchi017/vllm` @ `bf0219d8`) | Apache-2.0 |
+| `docs/reference/recoverssm_ops_upstream.py` | same PR, `vllm/model_executor/layers/mamba/ops/recoverssm.py` | Apache-2.0 |
+| `docs/reference/recoverssm_utils_upstream.py` | same PR, `vllm/model_executor/layers/mamba/recoverssm_utils.py` | Apache-2.0 |
+| `docs/reference/gdn_recoverssm_backend_upstream.py` | same PR, `vllm/v1/attention/backends/gdn_recoverssm.py` | Apache-2.0 |
+| `docs/reference/gdn_recover*_ascend_mrv1.py` | [vllm-project/vllm-ascend](https://github.com/vllm-project/vllm-ascend) PR [#18765](https://github.com/vllm-project/vllm-ascend/pull/18765) head (`Kaitounb/vllm-ascend` @ `622725cd`) | Apache-2.0 |
+| `docs/reference/glm5next_recoverssm_metadata.py`, `recoverssm_config.py`, `patch_*.py` | vllm-ascend `main` | Apache-2.0 |
+
+These files are kept **as reference material only** — nothing in `plugin/` imports
+them. They are reproduced so the port can be reviewed against its sources without
+network access.
+
+## Papers
+
+| File | License |
+|---|---|
+| `docs/ReplaySSM-2610.13778.pdf` | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) — *ReplaySSM: Cache SSM Inputs, Not State*, Z.-W. Liou et al., arXiv:2610.13778 |
+
+## Upstream references
+
+- GDN RecoverSSM upstream: [vllm-project/vllm#61309](https://github.com/vllm-project/vllm/pull/61309) (open at the time of writing)
+- Ascend RFC: [vllm-project/vllm-ascend#19987](https://github.com/vllm-project/vllm-ascend/issues/19987)
+- KDA RecoverSSM on Ascend (the template this port follows): [#20128](https://github.com/vllm-project/vllm-ascend/pull/20128), [#20131](https://github.com/vllm-project/vllm-ascend/pull/20131)

@@ -1,0 +1,14 @@
+# Baseline source trees are separate checkouts (pinned by tag, not vendored here)
+vllm/
+vllm-ascend/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# runtime
+*.log
+server.log

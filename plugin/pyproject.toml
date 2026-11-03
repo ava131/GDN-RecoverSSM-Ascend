@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gdn-recoverssm-ascend"
+version = "0.1.0"
+description = "RecoverSSM for Gated DeltaNet on Ascend NPU (vLLM plugin, no source changes)"
+requires-python = ">=3.10"
+dependencies = []
+
+# vLLM loads this group in every process (engine core + workers) before the
+# engine is built, which is exactly when the config validator and the GDN layer
+# have to be wrapped.
+[project.entry-points."vllm.general_plugins"]
+gdn_recoverssm_ascend = "gdn_recoverssm_ascend:install"
+
+[tool.setuptools]
+packages = ["gdn_recoverssm_ascend"]
