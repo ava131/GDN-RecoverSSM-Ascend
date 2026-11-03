@@ -169,13 +169,15 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             num_actual_reqs=num_actual_reqs,
         )
 
-        n = int(meta.num_spec_decodes)
-        if n == 0 or meta.spec_state_indices_tensor is None:
+        if meta.spec_state_indices_tensor is None or meta.spec_query_start_loc is None:
+            # Nothing to commit (no speculative rows this step).
             return meta
-        if meta.spec_query_start_loc is None:
-            raise ValueError(
-                "GDN RecoverSSM: spec rows present but spec_query_start_loc is None"
-            )
+        # Authoritative row count: the offset tensor's length. ``num_spec_decodes``
+        # may include graph-padded rows, and the stock Ascend builder derives the
+        # same count as ``spec_query_start_loc.size(0) - 1``.
+        n = int(meta.spec_query_start_loc.shape[0]) - 1
+        if n <= 0:
+            return meta
 
         # Only the checkpoint column is meaningful under RecoverSSM.
         state_indices = meta.spec_state_indices_tensor[:n, 0]

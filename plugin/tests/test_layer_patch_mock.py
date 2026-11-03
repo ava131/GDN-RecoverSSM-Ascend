@@ -50,6 +50,16 @@ class FakeTensor:
             return FakeTensor(self.data[item])
         return FakeTensor(shape=self.shape)
 
+    def clamp(self, min=None, max=None):
+        if self.data is not None:
+            out = self.data
+            if min is not None:
+                out = np.maximum(out, min)
+            if max is not None:
+                out = np.minimum(out, max)
+            return FakeTensor(out)
+        return FakeTensor(shape=self.shape)
+
     def unsqueeze(self, dim):
         return FakeTensor(shape=(1,) + self.shape)
 
@@ -408,6 +418,32 @@ def _install_mamba_utils_stub():
     sys.modules["vllm.model_executor.layers.mamba.mamba_utils"] = mu
     sys.modules["vllm.model_executor.layers.mamba"].mamba_utils = mu
     return mu
+
+
+def test_padded_rows_use_offset_length():
+    """num_spec_decodes may count graph-padded rows; qsl len is authoritative."""
+    _install_torch_stub()
+    _install_vllm_stubs()
+    gdn_mod, cls = _install_gdn_stub()
+    layer_patch = _reset_plugin()
+    captured = _install_kernels_stub()
+
+    layer_patch.install()
+    layer = cls()
+
+    # Pretend the metadata reports 8 spec-decode rows while the offset tensor
+    # only describes 2 windows -- the padding case that used to read out of
+    # bounds ("MTE accesses an invalid GM address").
+    fwd = sys.modules["vllm.forward_context"]
+    meta = fwd.get_forward_context().attn_metadata[layer.prefix]
+    meta.num_spec_decodes = 8
+
+    layer._forward_core()
+
+    idx = captured["kw_state_indices"]
+    np.testing.assert_array_equal(idx.data, np.array([0, 5]))
+    qsl = captured["kw_query_start_loc"]
+    assert tuple(qsl.shape) == (3,), qsl.shape  # rows + 1, not 9
 
 
 def test_state_calculator_patch():

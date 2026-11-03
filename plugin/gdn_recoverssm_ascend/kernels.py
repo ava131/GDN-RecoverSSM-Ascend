@@ -282,6 +282,7 @@ def _gdn_recoverssm_verify_kernel(
     out_ptr,
     query_start_loc_ptr,
     state_indices_ptr,
+    total_tokens,
     scale,
     null_block_id,
     stride_q_token,
@@ -308,6 +309,7 @@ def _gdn_recoverssm_verify_kernel(
     BV: tl.constexpr,
     SPEC_QUERY_LEN: tl.constexpr,
     USE_QK_L2NORM: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
 ):
     # Ascend A2 notes:
     #  * The record layout is upstream's: [corr(V), k_hat(K), decay(1)] per
@@ -332,13 +334,18 @@ def _gdn_recoverssm_verify_kernel(
     mask_k = offs_k < K
     mask_v = offs_v < V
     mask_state = mask_v[:, None] & mask_k[None, :]
-    if state_idx <= null_block_id:
-        # Null rows produce zero output and never touch the replay records.
+    if state_idx <= null_block_id or state_idx >= NUM_BLOCKS:
+        # Null rows (and out-of-range page ids, which a stale block table can
+        # produce) write zero output and never touch the replay records. Without
+        # the upper bound a garbage page id turns into a wild GM address and the
+        # whole process dies in the next synchronize with "MTE accesses an
+        # invalid GM address".
         for t in tl.static_range(SPEC_QUERY_LEN):
+            tok_null = bos + t
             tl.store(
-                out_ptr + (bos + t) * stride_out_token + pid_hv * V + offs_v,
+                out_ptr + tok_null * stride_out_token + pid_hv * V + offs_v,
                 tl.zeros([BV], dtype=tl.float32),
-                mask=(t < query_len) & mask_v,
+                mask=(t < query_len) & (tok_null < total_tokens) & mask_v,
             )
         return
     state = tl.load(
@@ -354,8 +361,11 @@ def _gdn_recoverssm_verify_kernel(
         replay_ptr + state_idx * stride_replay_block + pid_hv * stride_replay_head
     )
     for t in tl.static_range(SPEC_QUERY_LEN):
-        valid = t < query_len
         tok = bos + t
+        # The window may be shorter than the token tensor, but never longer:
+        # ``spec_query_start_loc`` can describe graph-padded rows. Masking on
+        # ``total_tokens`` keeps every load/store inside q/k/v/out/records.
+        valid = (t < query_len) & (tok < total_tokens)
         q = tl.load(
             q_ptr + tok * stride_q_token + pid_h * K + offs_k,
             mask=valid & mask_k,
@@ -530,6 +540,7 @@ def gdn_recoverssm_verify(
         out,
         query_start_loc,
         state_indices,
+        total,
         scale,
         NULL_BLOCK_ID,
         q.stride(1),
@@ -556,6 +567,7 @@ def gdn_recoverssm_verify(
         BV=BV,
         SPEC_QUERY_LEN=spec_query_len,
         USE_QK_L2NORM=not qk_already_normalized,
+        NUM_BLOCKS=nb,
         num_warps=4,
         num_stages=2,
     )
@@ -710,7 +722,7 @@ def _compact_conv_state_kernel(
     boundary_state_idx = tl.load(boundary_state_indices_ptr + pid_b).to(tl.int64)
     boundary_recovery_len = tl.load(boundary_recovery_lens_ptr + pid_b)
 
-    if final_state_idx <= null_block_id:
+    if final_state_idx <= null_block_id or final_state_idx >= NUM_BLOCKS:
         return
 
     base_addr = tl.load(conv_state_base_addrs_ptr + pid_l)
@@ -784,6 +796,7 @@ def _commit_gdn_state_kernel(
     BV: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     BOUNDARY: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
 ):
     # Every program runs one fold and keeps one tile live. In align mode the
     # block-boundary state (the window's first boundary_len tokens) is folded by a
@@ -800,7 +813,9 @@ def _commit_gdn_state_kernel(
     pid_l = pid_lh // NUM_HEADS
     pid_h = pid_lh % NUM_HEADS
     src = tl.load(state_indices_ptr + pid_b * stride_si).to(tl.int64)
-    if src <= null_block_id:
+    # ``>= NUM_BLOCKS`` would be a wild GM address: a stale block table can hand
+    # us a page id that no longer exists. Drop such rows instead of faulting.
+    if src <= null_block_id or src >= NUM_BLOCKS:
         return
     n = tl.load(commit_lens_ptr + pid_b)
     if n == 0:
@@ -878,6 +893,7 @@ class GDNRecoverSSMCommitContext:
     boundary_state_indices: torch.Tensor
     boundary_recovery_lens: torch.Tensor
     spec_query_len: int
+    num_blocks: int
 
     @classmethod
     def from_tensors(
@@ -974,6 +990,7 @@ class GDNRecoverSSMCommitContext:
             z(),
             z(),
             spec_query_len,
+            nb,
         )
 
     @classmethod
@@ -1167,6 +1184,7 @@ class GDNRecoverSSMCommitContext:
                 BV=BV,
                 NUM_HEADS=HV,
                 BOUNDARY=boundary,
+                NUM_BLOCKS=self.num_blocks,
                 num_warps=4,
                 num_stages=2,
             )

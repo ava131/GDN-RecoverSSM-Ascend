@@ -182,17 +182,27 @@ def _verify(layer, q, k, v, ssm_state, kwargs):
     from .kernels import gdn_recoverssm_verify
 
     attn_metadata = get_forward_context().attn_metadata[layer.prefix]
-    rows = int(attn_metadata.num_spec_decodes)
-    if rows == 0:
-        raise RuntimeError(
-            "Ascend GDN RecoverSSM: speculative call without spec-decode rows"
-        )
     if attn_metadata.spec_query_start_loc is None:
         raise RuntimeError(
             "Ascend GDN RecoverSSM: spec_query_start_loc is required"
         )
 
-    query_start_loc = attn_metadata.spec_query_start_loc[: rows + 1]
+    # Authoritative spec-row count: the length of ``spec_query_start_loc``.
+    # ``num_spec_decodes`` can count graph-padded rows, and the stock Ascend code
+    # derives the same number the same way
+    # (``spec_num_rows = spec_query_start_loc.size(0) - 1``). Using the padded
+    # count here reads past both the offset tensor and q/k/v, which shows up as
+    # "MTE accesses an invalid GM address" on a later synchronize.
+    query_start_loc = attn_metadata.spec_query_start_loc
+    rows = int(query_start_loc.shape[0]) - 1
+    if rows <= 0:
+        raise RuntimeError(
+            "Ascend GDN RecoverSSM: speculative call without spec-decode rows"
+        )
+
+    total = int(q.shape[0])
+    # Never let a padded/stale offset describe tokens past the activation tensors.
+    query_start_loc = query_start_loc[: rows + 1].clamp(min=0, max=total)
     # Column 0 is the checkpoint; the per-draft-token slots are unused under
     # RecoverSSM (num_speculative_blocks == 0).
     checkpoint_indices = attn_metadata.spec_state_indices_tensor[:rows, 0]
