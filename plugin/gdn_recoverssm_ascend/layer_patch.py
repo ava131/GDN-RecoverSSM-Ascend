@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import threading
 
 import torch
@@ -167,6 +168,59 @@ def install() -> None:
     )
 
 
+_TRACE = {"steps": 0}
+
+
+def _trace_step(layer, attn_metadata, rows, total, query_start_loc, checkpoint_indices):
+    """One line per speculative step for the first few steps of the process.
+
+    This is the "is RecoverSSM live on this request?" signal, and it also prints
+    the exact window geometry, which is what pins down an out-of-bounds crash.
+    The few ``.item()`` calls are bounded by ``GDN_RECOVERSSM_TRACE_STEPS``
+    (default 3, 0 disables) and never run on the steady-state hot path.
+    """
+    limit = int(os.getenv("GDN_RECOVERSSM_TRACE_STEPS", "3") or "0")
+    if limit <= 0 or _TRACE["steps"] >= limit:
+        return
+    _TRACE["steps"] += 1
+    try:
+        tail = int(query_start_loc[-1].item())
+        lo = int(checkpoint_indices.min().item()) if rows else -1
+        hi = int(checkpoint_indices.max().item()) if rows else -1
+    except Exception:  # telemetry must never break a request
+        return
+    num_prefills = int(getattr(attn_metadata, "num_prefills", 0))
+    num_decodes = int(getattr(attn_metadata, "num_decodes", 0))
+    logger.info(
+        "Ascend GDN RecoverSSM step %d: prefill=%d decode=%d spec_rows=%d "
+        "window=%d tokens=%d qsl_tail=%d state_idx=[%d..%d] cache_mode=%s",
+        _TRACE["steps"],
+        num_prefills,
+        num_decodes,
+        rows,
+        layer.num_spec + 1,
+        total,
+        tail,
+        lo,
+        hi,
+        getattr(layer.cache_config, "mamba_cache_mode", "?"),
+    )
+    if tail != total:
+        # Geometry mismatch is exactly the precondition for an out-of-bounds
+        # kernel access; say it out loud instead of trusting a mask.
+        logger.warning(
+            "Ascend GDN RecoverSSM: spec_query_start_loc ends at %d but the "
+            "activation tensors hold %d tokens (prefill=%d decode=%d rows=%d). "
+            "This mismatch is what turns into 'MTE accesses an invalid GM "
+            "address'.",
+            tail,
+            total,
+            num_prefills,
+            num_decodes,
+            rows,
+        )
+
+
 def _verify(layer, q, k, v, ssm_state, kwargs):
     """Run the RecoverSSM verify for one speculative window.
 
@@ -194,7 +248,14 @@ def _verify(layer, q, k, v, ssm_state, kwargs):
     # count here reads past both the offset tensor and q/k/v, which shows up as
     # "MTE accesses an invalid GM address" on a later synchronize.
     query_start_loc = attn_metadata.spec_query_start_loc
-    rows = int(query_start_loc.shape[0]) - 1
+    # Two counts exist and neither is right on its own:
+    #   * eager: len(qsl) - 1 == num_spec_decodes;
+    #   * full graph: qsl is materialised to graph_request_count + 1 with
+    #     zero-length dummy segments at the back, so len(qsl) - 1 > the logical
+    #     count.
+    # The logical count is the authoritative one whenever it is smaller.
+    qsl_rows = int(query_start_loc.shape[0]) - 1
+    rows = min(int(getattr(attn_metadata, "num_spec_decodes", qsl_rows)), qsl_rows)
     if rows <= 0:
         raise RuntimeError(
             "Ascend GDN RecoverSSM: speculative call without spec-decode rows"
@@ -206,6 +267,8 @@ def _verify(layer, q, k, v, ssm_state, kwargs):
     # Column 0 is the checkpoint; the per-draft-token slots are unused under
     # RecoverSSM (num_speculative_blocks == 0).
     checkpoint_indices = attn_metadata.spec_state_indices_tensor[:rows, 0]
+
+    _trace_step(layer, attn_metadata, rows, total, query_start_loc, checkpoint_indices)
 
     kv_cache = layer.kv_cache
     if len(kv_cache) < 3:

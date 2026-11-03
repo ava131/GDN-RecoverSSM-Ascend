@@ -179,9 +179,29 @@ INFO ... [patch_recoverssm_config.py] Ascend GDN RecoverSSM enabled: window=4 (n
 3. 插件没装进 vLLM 的环境？→ 完全没有任何输出，`pip show gdn-recoverssm-ascend` 确认；
 4. 版本不匹配？→ 会打 `stays inert (原因)`。
 
-> 之前版本还有"commit context / ACTIVE / verify #1 / 每 200 步 stats"这些运行时日志，已全部删除：
-> 启动这一行已经覆盖了"记录被分配 + 槽位降为 1"这两个关键事实，其余属于排查细节，
-> 需要时可以临时把日志级别开到 DEBUG。
+### 3.3b 请求进来时的那一行（前 3 步）
+
+第一个投机步会打一行，默认前 **3 步**，之后不再打（不会刷屏）：
+
+```
+Ascend GDN RecoverSSM step 1: prefill=0 decode=1 spec_rows=1 window=4 tokens=4 qsl_tail=4 state_idx=[12..12] cache_mode=none
+```
+
+| 字段 | 含义 |
+|---|---|
+| `prefill` / `decode` | 本步的 prefill / decode 行数；**prefill>0 就是 chunked-prefill 混合批** |
+| `spec_rows` | 走投机路径的行数 |
+| `tokens` | 本步送入 verify 的 token 数 |
+| **`qsl_tail`** | `spec_query_start_loc` 的末值，**必须等于 `tokens`**；不等就会打 WARNING（这正是越界访程的前置条件） |
+| `state_idx=[lo..hi]` | 本步用到的状态页号范围，应在 `[0, num_blocks)` 内 |
+
+调这个行为：
+
+```bash
+export GDN_RECOVERSSM_TRACE_STEPS=3    # 默认 3；设 0 关闭；排查时可设 50
+```
+
+> 更早的版本还有"commit context / ACTIVE / 每 200 步 stats"等日志，已全部删掉。
 
 ### 3.4 想进一步确认运行时行为（可选，不改代码）
 

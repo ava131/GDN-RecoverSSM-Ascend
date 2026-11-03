@@ -50,6 +50,15 @@ class FakeTensor:
             return FakeTensor(self.data[item])
         return FakeTensor(shape=self.shape)
 
+    def min(self):
+        return FakeTensor(np.array(int(self.data.min()))) if self.data is not None else FakeTensor()
+
+    def max(self):
+        return FakeTensor(np.array(int(self.data.max()))) if self.data is not None else FakeTensor()
+
+    def item(self):
+        return int(self.data) if self.data is not None else 0
+
     def clamp(self, min=None, max=None):
         if self.data is not None:
             out = self.data
@@ -125,11 +134,11 @@ def _install_gdn_stub():
             gdn_mod = sys.modules["vllm_ascend.ops.gdn"]
             # The real one calls the recurrent kernel with num_accepted_tokens
             # for the spec window.
-            q = FakeTensor(shape=(12, 2, 128))
-            k = FakeTensor(shape=(12, 2, 128))
-            v = FakeTensor(shape=(12, 8, 128))
-            g = FakeTensor(shape=(12, 8))
-            beta = FakeTensor(shape=(12, 8))
+            q = FakeTensor(shape=(8, 2, 128))
+            k = FakeTensor(shape=(8, 2, 128))
+            v = FakeTensor(shape=(8, 8, 128))
+            g = FakeTensor(shape=(8, 8))
+            beta = FakeTensor(shape=(8, 8))
             ssm_state = self.kv_cache[1]
             flat_idx = FakeTensor(np.array([0, 0, 0, 0, 5, 5, 5, 5], dtype=np.int32))
             out = gdn_mod.recurrent_gated_delta_rule(
@@ -325,7 +334,7 @@ def _install_kernels_stub():
             v=v,
             **{f"kw_{key}": val for key, val in kwargs.items()},
         )
-        return FakeTensor(shape=(1, 12, 8, 128))
+        return FakeTensor(shape=(1, 8, 8, 128))
 
     mod = types.ModuleType("gdn_recoverssm_ascend.kernels")
     mod.gdn_recoverssm_verify = gdn_recoverssm_verify
@@ -377,7 +386,7 @@ def test_plugin_wiring():
     assert gdn_mod.__dict__["_calls"]["recurrent"] == 1
 
     # 4) the shim returns [T, HV, V] so the layer's .unsqueeze(0) restores the batch dim
-    assert tuple(out.shape) == (12, 8, 128), out.shape
+    assert tuple(out.shape) == (8, 8, 128), out.shape
 
     # 6) Ascend's prepare_attn override is wrapped so record_step still fires
     ms = sys.modules["vllm_ascend.worker.v2.model_states.mamba_hybrid"]

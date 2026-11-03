@@ -140,10 +140,16 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
 
             fc = self.vllm_config.compilation_config.static_forward_context
             layers = [fc[name] for name in self.layer_names]
+            # The plan buffers must cover the graph batch too: a full-graph step
+            # can carry more rows than max_num_seqs.
+            max_rows = max(
+                self.vllm_config.scheduler_config.max_num_seqs,
+                int(getattr(self, "decode_cudagraph_max_bs", 0) or 0),
+            )
             self._context = GDNRecoverSSMCommitContext.create(
                 layers,
                 spec_query_len=1 + self.num_spec,
-                max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
+                max_num_reqs=max_rows,
             )
             first = layers[0]
             kv = getattr(first, "kv_cache", ())
@@ -175,7 +181,10 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         # Authoritative row count: the offset tensor's length. ``num_spec_decodes``
         # may include graph-padded rows, and the stock Ascend builder derives the
         # same count as ``spec_query_start_loc.size(0) - 1``.
-        n = int(meta.spec_query_start_loc.shape[0]) - 1
+        qsl_rows = int(meta.spec_query_start_loc.shape[0]) - 1
+        # Full graph materialises the offsets to graph_request_count + 1 with
+        # zero-length dummy segments; the logical count is the smaller one.
+        n = min(int(meta.num_spec_decodes), qsl_rows)
         if n <= 0:
             return meta
 
