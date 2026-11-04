@@ -98,6 +98,28 @@ if num_decodes > 0 and num_spec_decodes > 0:
 
 ---
 
+## 【更正】507899 不能归因于"capture 守卫失效"
+
+我在提交 `9a01005` 里写过："trace 出现在捕获进度条里，说明 `is_current_stream_capturing()`
+返回 False，捕获被 host 同步污染"。**这个推理是错的**：
+
+vLLM 的捕获循环是「每个尺寸先做一次 **eager warmup**，再进入
+`with torch.cuda.graph(...)` 录制」，Ascend wrapper 也写明 *"In warmup phase,
+capturing=False by default"*。所以 trace 在 `Capturing ... 0%` 之后打印，**完全可能是
+健康的 warmup**，`capturing` 标志没有问题。
+
+保留的修改（trace 只读 Python 整数、不做任何设备访问）本身是对的——它让这条日志在任何阶段都安全；
+但**它不再是 507899 的解释**。507899 目前没有确定的根因。
+
+## 现场版本与官方 tag 不一致（重要）
+
+traceback 里 `vllm_ascend/worker/v2/model_runner.py:517` 是 `super().execute_model`，
+而官方 `v0.30.0`(c09d3e2) 里这一句在 **638**；`releases/v0.30.0rc2` 里在 **517**。
+
+=> 现场跑的**很可能不是 v0.30.0 tag**。我们所有基于 tag 的源码分析都可能对错了代码。
+启动行现在会打印 `vllm=<ver> vllm_at=<dir> vllm_ascend=<ver> vllm_ascend_at=<dir>`，
+请以它为准，而不是仓库 HEAD。
+
 ## align 模式：当前**未验证**，不要当成可用
 
 已确认的两个问题（issue #1 最新一轮审查）：

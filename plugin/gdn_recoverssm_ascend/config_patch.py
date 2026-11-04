@@ -121,6 +121,35 @@ def validate_gdn_recoverssm(config) -> None:
         )
 
 
+def _provenance() -> str:
+    """Which build is actually running.
+
+    The machine traceback did not line up with the v0.30.0 tag
+    (``model_runner.py:517`` vs ``:638``), so the startup line now records the
+    loaded versions and package directories. Host-only, no device access.
+    """
+    parts = []
+    try:
+        import vllm
+
+        parts.append(f"vllm={getattr(vllm, '__version__', '?')}")
+        parts.append(f"vllm_at={os.path.dirname(getattr(vllm, '__file__', '') or '')}")
+    except Exception:
+        parts.append("vllm=?")
+    try:
+        import vllm_ascend
+
+        parts.append(
+            f"vllm_ascend={getattr(vllm_ascend, '__version__', '?')}"
+        )
+        parts.append(
+            f"vllm_ascend_at={os.path.dirname(getattr(vllm_ascend, '__file__', '') or '')}"
+        )
+    except Exception:
+        parts.append("vllm_ascend=?")
+    return " ".join(parts)
+
+
 def _summary(config, query_len: int) -> str:
     """One-line startup summary, shaped like the rest of vLLM's config dump."""
     hf = config.model_config.hf_text_config
@@ -136,6 +165,7 @@ def _summary(config, query_len: int) -> str:
         states = "?"
     cache = config.cache_config
     return (
+        f"{_provenance()}, "
         f"enabled: window={query_len} (num_spec={config.num_speculative_tokens}), "
         f"mamba_cache_mode={cache.mamba_cache_mode}, "
         f"mamba_block_size={cache.mamba_block_size}, tp={tp}, "

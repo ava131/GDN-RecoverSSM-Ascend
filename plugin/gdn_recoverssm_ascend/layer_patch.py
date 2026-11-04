@@ -225,15 +225,17 @@ def _env_flag(name: str) -> bool:
 def _trace_step(layer, attn_metadata, rows, total, query_start_loc, checkpoint_indices):
     """One line per speculative step for the first few steps of the process.
 
-    This is the "is RecoverSSM live on this request?" signal.
+    This is the "is RecoverSSM live on this request?" signal. Every field below is
+    a Python integer already sitting in the metadata, so the line never touches
+    device data and can never force a host synchronisation.
 
-    It deliberately touches **no device data**: every field below is a Python
-    integer already sitting in the metadata. An earlier version printed
-    ``query_start_loc[-1].item()`` and the state-index range, and those forced a
-    host synchronisation inside the model forward. During graph capture that is
-    illegal and produced a captured graph that only failed much later, at replay
-    ("AclmdlRIExecuteAsync ... Build SQ&CQ failed"). ``is_current_stream_capturing``
-    is not a reliable guard on the ACLGraph path, so the sync is simply gone.
+    Why that matters: vLLM runs one **eager warmup forward per capture size**
+    before it starts recording (``create_forward_fn(desc, warmup=True)`` then
+    ``with torch.cuda.graph(...)``), and the Ascend wrapper documents that
+    ``capturing`` is False during that warmup. So these first steps can legitimately
+    print while the "Capturing ... 0%" bar is on screen; ``is_current_stream_capturing``
+    still returns the truth for the recording phase itself. Keeping the trace free of
+    device reads means it is safe in either phase without needing to tell them apart.
     """
     if _is_capturing():
         return
