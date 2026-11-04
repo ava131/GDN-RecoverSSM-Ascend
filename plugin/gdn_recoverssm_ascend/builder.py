@@ -125,12 +125,12 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
             num_computed_tokens=commit.num_computed_tokens,
             mamba_block_size=commit.block_size,
         )
-        # Deliberately no RecoverSSMPostprocessMetadata: it would make the
-        # framework advance the running column to (computed + sampled) // block,
-        # which can be a column the request has not allocated yet and which does
-        # not match the column we just committed into. Align-mode column
-        # bookkeeping therefore stays open (see docs/DEBUG-CRASH.md) and align
-        # must not be claimed as validated.
+        # Deliberately no RecoverSSMPostprocessMetadata: the generic kernel would
+        # advance the running column with (computed + sampled) // block, which is
+        # not the column this commit wrote. The GDN-specific bookkeeping (running
+        # column = commit target, persistent accepted = 1) is staged here and
+        # applied by the postprocess hook after this commit and before the native
+        # align postcopy.
         if commit.block_table is not None:
             _stage_align_update(commit, num_accepted_tokens, n)
         return None
