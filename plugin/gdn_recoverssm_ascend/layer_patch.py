@@ -205,6 +205,17 @@ def install() -> None:
 _TRACE = {"steps": 0}
 
 
+def _is_capturing() -> bool:
+    """Whether the current NPU stream is capturing a graph."""
+    npu = getattr(torch, "npu", None)
+    if npu is None or not hasattr(npu, "is_current_stream_capturing"):
+        return False
+    try:
+        return bool(npu.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
 def _env_flag(name: str) -> bool:
     """Read a diagnostic switch every call: bisecting needs no restart of code."""
     value = os.getenv(name)
@@ -219,6 +230,12 @@ def _trace_step(layer, attn_metadata, rows, total, query_start_loc, checkpoint_i
     The few ``.item()`` calls are bounded by ``GDN_RECOVERSSM_TRACE_STEPS``
     (default 3, 0 disables) and never run on the steady-state hot path.
     """
+    if _is_capturing():
+        # ``.item()`` forces a host sync, which is illegal while a graph is being
+        # captured: it can truncate or corrupt the captured task list, and the
+        # failure only shows up later as a replay error. Stay completely silent
+        # and do not consume a trace slot.
+        return
     limit = int(os.getenv("GDN_RECOVERSSM_TRACE_STEPS", "3") or "0")
     if limit <= 0 or _TRACE["steps"] >= limit:
         return
@@ -302,8 +319,12 @@ def _verify(layer, q, k, v, ssm_state, kwargs):
         )
 
     total = int(q.shape[0])
-    # Never let a padded/stale offset describe tokens past the activation tensors.
-    query_start_loc = query_start_loc[: rows + 1].clamp(min=0, max=total)
+    # Pass the metadata's own buffer (a view starting at offset 0) and let the
+    # kernel mask ``tok < total_tokens``. Creating a clamped copy here cost one
+    # extra device task per layer inside the captured graph, and under graph
+    # replay the replayed kernel would keep reading the capture-time copy instead
+    # of the per-step metadata buffer.
+    query_start_loc = query_start_loc[: rows + 1]
     # Column 0 is the checkpoint; the per-draft-token slots are unused under
     # RecoverSSM (num_speculative_blocks == 0).
     checkpoint_indices = attn_metadata.spec_state_indices_tensor[:rows, 0]

@@ -536,6 +536,31 @@ def test_worker_patch_order_independent():
     assert captured.get("kw_state_indices") is not None, "verify did not run"
 
 
+def test_trace_is_silent_while_capturing():
+    """A .item() during graph capture corrupts the captured task list."""
+    _install_torch_stub()
+    _install_vllm_stubs()
+    gdn_mod, _donor = _install_gdn_stub()
+    cls = sys.modules[
+        "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn"
+    ].QwenGatedDeltaNetAttention
+    layer_patch = _reset_plugin()
+    _install_kernels_stub()
+
+    torch_mod = sys.modules["torch"]
+    torch_mod.npu = types.SimpleNamespace(is_current_stream_capturing=lambda: True)
+    try:
+        layer_patch.install()
+        layer = cls()
+        layer._forward_core()
+        from gdn_recoverssm_ascend import layer_patch as lp
+
+        assert lp._TRACE["steps"] == 0, "trace consumed a slot during capture"
+        assert lp._is_capturing() is True
+    finally:
+        torch_mod.npu = None
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()
