@@ -203,6 +203,13 @@ def install() -> None:
 
 
 _TRACE = {"steps": 0}
+# Host-only counters: how much work our path contributes to the stream.
+_COUNTERS = {"verify_calls": 0, "last_rows": 0, "last_tokens": 0}
+
+
+def counters() -> dict:
+    """Snapshot of the host-side counters (no device access)."""
+    return dict(_COUNTERS)
 
 
 def _is_capturing() -> bool:
@@ -318,6 +325,10 @@ def _verify(layer, q, k, v, ssm_state, kwargs):
             f"replay), got {len(kv_cache)} entries. Is --use-replayssm set and "
             "GDN_RECOVERSSM_DISABLE unset?"
         )
+
+    _COUNTERS["verify_calls"] += 1
+    _COUNTERS["last_rows"] = rows
+    _COUNTERS["last_tokens"] = total
 
     out = gdn_recoverssm_verify(
         kwargs["g"],

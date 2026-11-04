@@ -81,9 +81,23 @@ def _log_replay_attempt(manager, desc) -> None:
     # First few attempts per descriptor, and every 20th afterwards: enough to see
     # accumulation without flooding a serving log.
     if state["count"] <= 3 or state["count"] % 20 == 0:
+        # ``verify_calls`` is how many times our kernel was launched so far
+        # (warmup + capture included). It tells whether our path is what fills
+        # the stream before the first replay.
+        counters = {}
+        try:
+            from . import layer_patch
+
+            counters = layer_patch.counters()
+        except Exception:
+            pass
         logger.info(
-            "Ascend full-graph replay: %s attempt=%d updatable_tasks=%s",
+            "Ascend full-graph replay: %s attempt=%d updatable_tasks=%s "
+            "verify_calls=%s last_rows=%s last_tokens=%s",
             key,
             state["count"],
             state["tasks"],
+            counters.get("verify_calls", "?"),
+            counters.get("last_rows", "?"),
+            counters.get("last_tokens", "?"),
         )
