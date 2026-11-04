@@ -645,6 +645,7 @@ def _prepare_commit_plan_kernel(
     SPEC_QUERY_LEN: tl.constexpr,
     HAS_REQUEST_INDICES: tl.constexpr,
     ALIGN_MODE: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
 ):
     # Upstream `prepare_commit_plan_kernel`, renamed only. Per speculative row it
     # resolves the commit length and the destination state blocks (final and, in
@@ -1193,6 +1194,7 @@ class GDNRecoverSSMCommitContext:
             bt_stride[1],
             0 if num_computed_tokens is None else num_computed_tokens.stride(0),
             SPEC_QUERY_LEN=self.spec_query_len,
+            NUM_BLOCKS=self.num_blocks,
             num_warps=1,
         )
         num_layers = len(self.checkpoints)
