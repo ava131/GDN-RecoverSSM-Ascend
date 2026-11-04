@@ -299,7 +299,37 @@ def _conv_dim_tile(block_history: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-@triton.jit
+# Integer arguments opt out of Triton's value specialisation. Without this every
+# distinct divisibility class of (rows, work, strides) compiles a NEW device
+# kernel at runtime -- i.e. stages a new AICPU/AICore object into the shared
+# aicpu_kernels directory while serving. CANN's own a2a3 fault report links that
+# runtime staging to chip-wide AICPU faults which surface later as 507899 on the
+# next graph replay. One compiled variant per constexpr set keeps every compile
+# inside warmup/capture.
+@triton.jit(
+    do_not_specialize=[
+        "total_tokens",
+        "num_rows",
+        "num_work",
+        "null_block_id",
+        "stride_q_token",
+        "stride_k_token",
+        "stride_v_token",
+        "stride_g_token",
+        "stride_beta_token",
+        "stride_state_block",
+        "stride_state_head",
+        "stride_state_v",
+        "stride_state_k",
+        "stride_replay_block",
+        "stride_replay_head",
+        "stride_replay_pos",
+        "stride_replay_dim",
+        "stride_out_token",
+        "stride_qsl",
+        "stride_si",
+    ],
+)
 def _gdn_recoverssm_verify_kernel(
     q_ptr,
     k_ptr,
@@ -628,7 +658,20 @@ def gdn_recoverssm_verify(
         "ALIGN_MODE": lambda args: args["block_table_ptr"] is not None,
     }
 )
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "null_block_id",
+        "mamba_block_size",
+        "block_table_width",
+        "stride_num_accepted",
+        "stride_request_indices",
+        "stride_state_indices",
+        "stride_query_start_loc",
+        "stride_block_table_row",
+        "stride_block_table_col",
+        "stride_num_computed",
+    ],
+)
 def _prepare_commit_plan_kernel(
     num_accepted_ptr,
     request_indices_ptr,
@@ -755,7 +798,16 @@ def _prepare_commit_plan_kernel(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "null_block_id",
+        "num_rows",
+        "num_work",
+        "conv_dim",
+        "conv_history_len",
+        "stride_state_indices",
+    ],
+)
 def _compact_conv_state_kernel(
     conv_state_ref_ptr,
     conv_state_base_addrs_ptr,
@@ -854,7 +906,20 @@ def _compact_conv_state_kernel(
             )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "null_block_id",
+        "num_rows",
+        "num_work",
+        "stride_state_head",
+        "stride_state_v",
+        "stride_state_k",
+        "stride_replay_head",
+        "stride_replay_pos",
+        "stride_replay_dim",
+        "stride_si",
+    ],
+)
 def _commit_gdn_state_kernel(
     state_ref_ptr,
     state_base_addrs_ptr,

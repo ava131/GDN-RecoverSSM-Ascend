@@ -129,13 +129,61 @@ def check_local_use_before_assignment() -> list[str]:
     return problems
 
 
+FLOAT_ARGS = {"scale"}
+
+
+def check_no_value_specialisation() -> list[str]:
+    """Every integer kernel argument must be listed in ``do_not_specialize``.
+
+    Triton recompiles a kernel for each divisibility class of its integer
+    arguments. During serving that means a brand-new device kernel is built and
+    staged mid-run; CANN's a2a3 fault report ties exactly that runtime staging to
+    chip-wide AICPU faults that only show up later as 507899 on a graph replay.
+    Opting every integer argument out keeps one compiled variant per constexpr
+    set, so all compilation happens during warmup/capture.
+    """
+    tree = ast.parse(KERNELS.read_text())
+    problems: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name.endswith("_kernel")):
+            continue
+        listed: set[str] = set()
+        for dec in node.decorator_list:
+            if not isinstance(dec, ast.Call):
+                continue
+            for kw in dec.keywords:
+                if kw.arg == "do_not_specialize" and isinstance(kw.value, ast.List):
+                    listed = {
+                        e.value
+                        for e in kw.value.elts
+                        if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                    }
+        wanted = {
+            a.arg
+            for a in node.args.args
+            if not (isinstance(a.annotation, ast.Attribute) and a.annotation.attr == "constexpr")
+            and not a.arg.endswith("_ptr")
+            and a.arg not in FLOAT_ARGS
+        }
+        missing = sorted(wanted - listed)
+        if missing:
+            problems.append(f"{node.name}: not opted out of specialisation: {missing}")
+    return problems
+
+
 def test_kernel_launch_contract() -> None:
-    problems = check() + check_local_use_before_assignment()
+    problems = (
+        check()
+        + check_local_use_before_assignment()
+        + check_no_value_specialisation()
+    )
     assert not problems, "\n".join(problems)
 
 
 if __name__ == "__main__":
-    issues = check() + check_local_use_before_assignment()
+    issues = (
+        check() + check_local_use_before_assignment() + check_no_value_specialisation()
+    )
     for issue in issues:
         print("FAIL", issue)
     assert not issues, "kernel launch contract violated"
