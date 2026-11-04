@@ -707,7 +707,30 @@ def _prepare_commit_plan_kernel(
             mask=crosses_boundary,
             other=null_block_id,
         ).to(tl.int64)
-    valid = (source_state_idx > null_block_id) & (commit_len > 0)
+    # Unified validity for this plan row. Everything downstream -- conv
+    # compaction, SSM fold and the bookkeeping -- consumes exactly this, instead
+    # of each kernel re-deciding on its own. Padding and zero-length rows are a
+    # defined no-op; a row that claims work but has an impossible geometry is
+    # dropped rather than partially executed.
+    geometry_ok = (bos >= 0) & (bos <= eos) & (query_len <= SPEC_QUERY_LEN)
+    source_ok = (source_state_idx > null_block_id) & (
+        source_state_idx < NUM_BLOCKS
+    )
+    final_ok = (final_state_idx > null_block_id) & (final_state_idx < NUM_BLOCKS)
+    valid = (
+        source_ok
+        & final_ok
+        & geometry_ok
+        & (commit_len > 0)
+        & (commit_len <= query_len)
+    )
+    if ALIGN_MODE:
+        boundary_ok = (boundary_state_idx > null_block_id) & (
+            boundary_state_idx < NUM_BLOCKS
+        )
+        boundary_recovery_len = tl.where(
+            boundary_ok, boundary_recovery_len, 0
+        )
     tl.store(commit_lens_ptr + spec_idx, tl.where(valid, commit_len, 0))
     tl.store(
         final_state_indices_ptr + spec_idx,

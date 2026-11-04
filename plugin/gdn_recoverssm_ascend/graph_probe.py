@@ -31,6 +31,7 @@ logger = init_logger("vllm.gdn_recoverssm_ascend.graph_probe")
 
 _APPLIED = False
 _SEEN: dict = {}
+_FAILED: dict = {}
 
 
 def install() -> None:
@@ -49,7 +50,24 @@ def install() -> None:
             _log_replay_attempt(self, desc)
         except Exception:  # probing must never break a request
             pass
-        return original(self, desc, attn_metadata)
+        key = _describe(desc)
+        first = _FAILED.get(key)
+        if first is not None:
+            # Replaying a graph that already failed would either mask the first
+            # error or corrupt more state. Refuse and keep the original failure.
+            raise RuntimeError(
+                "Ascend full-graph replay refused: descriptor "
+                f"{key} already failed once ({first}); the graph is treated as "
+                "unusable and must be re-captured"
+            )
+        try:
+            return original(self, desc, attn_metadata)
+        except Exception as exc:
+            _FAILED[key] = f"{type(exc).__name__}: {exc}"
+            logger.error(
+                "Ascend full-graph replay failed: %s (first error kept)", key
+            )
+            raise
 
     cls._updatable_graph_replay = _updatable_graph_replay
 
