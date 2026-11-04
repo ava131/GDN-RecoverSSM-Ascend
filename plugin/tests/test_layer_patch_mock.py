@@ -561,6 +561,49 @@ def test_trace_is_silent_while_capturing():
         torch_mod.npu = None
 
 
+def test_graph_probe_logs_task_count():
+    """The probe must log descriptor + updatable task count before replaying."""
+    _install_torch_stub()
+    _install_vllm_stubs()
+
+    calls = {"replay": 0}
+
+    class _Graph:
+        tasks = (1, 2, 3, 4)
+
+    class ModelAclGraphManager:
+        def __init__(self):
+            self.graphs = {}
+
+        def _updatable_graph_replay(self, desc, attn_metadata):
+            calls["replay"] += 1
+            return "ok"
+
+    class _Desc:
+        num_tokens = 512
+        num_reqs = 128
+
+    acl = types.ModuleType("vllm_ascend.worker.v2.aclgraph_utils")
+    acl.ModelAclGraphManager = ModelAclGraphManager
+    sys.modules["vllm_ascend.worker.v2.aclgraph_utils"] = acl
+
+    from gdn_recoverssm_ascend import graph_probe
+
+    graph_probe._APPLIED = False
+    graph_probe._SEEN.clear()
+    graph_probe.install()
+
+    mgr = ModelAclGraphManager()
+    desc = _Desc()
+    mgr.graphs[desc] = _Graph()
+    assert mgr._updatable_graph_replay(desc, None) == "ok"
+    assert calls["replay"] == 1
+    key = [k for k in graph_probe._SEEN]
+    assert key, graph_probe._SEEN
+    assert graph_probe._SEEN[key[0]]["tasks"] == 4
+    assert graph_probe._SEEN[key[0]]["count"] == 1
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()

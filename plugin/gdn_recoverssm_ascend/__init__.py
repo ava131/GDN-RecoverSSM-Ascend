@@ -73,11 +73,15 @@ def install() -> None:
         )
         return
 
-    from . import config_patch, layer_patch, state_patch
+    from . import config_patch, graph_probe, layer_patch, state_patch
 
     state_patch.install()
     config_patch.install()
     layer_patch.install()
+    try:
+        graph_probe.install()
+    except Exception as exc:  # probing is optional
+        logger.debug("gdn_recoverssm_ascend: graph probe unavailable (%s)", exc)
     logger.debug("gdn_recoverssm_ascend: installed")
 
 
