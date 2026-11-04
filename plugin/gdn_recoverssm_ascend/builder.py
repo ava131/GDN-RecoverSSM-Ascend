@@ -57,6 +57,19 @@ from vllm_ascend.ops.gdn_attn_builder import (
 
 logger = init_logger("vllm.gdn_recoverssm_ascend.builder")
 
+# Pending align bookkeeping for the step being postprocessed. The commit runs
+# inside ``RecoverSSMState.commit_step`` and the native align postcopy runs right
+# after it, so the update has to be applied in between -- the wrapper around
+# ``postprocess_state`` consumes this and clears it.
+_PENDING_ALIGN: dict | None = None
+
+
+def take_pending_align():
+    """Pop the pending align update (consumed once per step)."""
+    global _PENDING_ALIGN
+    pending, _PENDING_ALIGN = _PENDING_ALIGN, None
+    return pending
+
 
 def _env_flag(name: str) -> bool:
     value = os.getenv(name)
@@ -100,11 +113,6 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
                 "Ascend GDN RecoverSSM: commit skipped, the KV cache is not bound yet"
             )
             return None
-        if _env_flag("GDN_RECOVERSSM_NO_COMMIT"):
-            # Bisect switch: verify runs and writes records, but the checkpoint
-            # never advances. Output will be wrong; the point is to see whether
-            # the crash disappears.
-            return None
         n = int(commit.state_indices.shape[0])
         if n == 0:
             return None
@@ -123,7 +131,40 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
         # not match the column we just committed into. Align-mode column
         # bookkeeping therefore stays open (see docs/DEBUG-CRASH.md) and align
         # must not be claimed as validated.
+        if commit.block_table is not None:
+            _stage_align_update(commit, num_accepted_tokens, n)
         return None
+
+
+def _stage_align_update(commit, num_accepted_tokens, n: int) -> None:
+    """Record ``(rows, final_col)`` so postprocess can fix the running column.
+
+    RecoverSSM restores the accepted state itself, so the persistent running
+    column must become the column the commit actually wrote
+    (``floor(max(C + A - 1, 0) / block)``) and the persistent accepted count must
+    go back to the neutral 1. The generic Recover kernel uses a different column
+    formula, so returning its metadata would be wrong; this is the GDN-specific
+    bookkeeping instead.
+    """
+    global _PENDING_ALIGN
+    try:
+        import torch
+
+        rows = commit.request_indices
+        if rows is None:
+            rows = torch.arange(n, device=num_accepted_tokens.device, dtype=torch.int32)
+        computed = commit.num_computed_tokens[rows.long()]
+        qsl = commit.query_start_loc
+        qlen = (qsl[1 : n + 1] - qsl[:n]).clamp(min=0)
+        accepted = num_accepted_tokens[rows.long()].clamp(min=0)
+        accepted = torch.minimum(accepted, qlen)
+        width = int(commit.block_table.shape[1])
+        col = ((computed + accepted - 1).clamp(min=0) // int(commit.block_size)).clamp(
+            max=width - 1
+        )
+        _PENDING_ALIGN = {"rows": rows, "cols": col}
+    except Exception as exc:  # never break the step on bookkeeping
+        logger.warning("Ascend GDN RecoverSSM: align bookkeeping skipped (%s)", exc)
 
 
 class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
@@ -142,7 +183,7 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._context: Any = None
-        self._ctx_key: tuple[int, ...] | None = None
+        self._ctx_key: tuple | None = None
         self._ctx_unbound_logged = False
         self._mapping_logged = False
         self._capturing = False
@@ -191,8 +232,24 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
                 )
             return None
 
-        # Cheap identity of the bound tensors; data_ptr changes on re-bind.
-        key = tuple(t.data_ptr() for t in kv)
+        # Signature of EVERY participating layer's bound state tensors. Keying on
+        # the first layer alone misses a partial re-bind (or a layout change) on
+        # any other layer. Host-only: shape/stride/dtype/data_ptr, no device read.
+        key = tuple(
+            (
+                layer_name,
+                tuple(
+                    (
+                        t.data_ptr(),
+                        tuple(t.shape),
+                        tuple(t.stride()),
+                        str(t.dtype),
+                    )
+                    for t in layer.kv_cache
+                ),
+            )
+            for layer_name, layer in zip(self.layer_names, layers)
+        )
         if self._context is not None and key == self._ctx_key:
             return self._context
         if self._context is not None:
@@ -264,15 +321,22 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         # conv update must start from the compacted window: one accepted token.
         # Allocate from the actual tensor shape: the spec index table can be
         # sized by the graph batch, which may exceed max_num_seqs.
-        # Stable address + in-place neutral value (see __init__). Every row gets
-        # 1: real spec rows because the checkpoint is compacted, padding rows
-        # because the framework's dummy value is 1 as well.
+        # Stable address + in-place neutral value (see __init__). Every row gets 1:
+        # real spec rows because the checkpoint is compacted, padding rows because
+        # the framework's dummy value is 1 as well.
+        #
+        # The capacity is fixed before capture. Growing the buffer afterwards would
+        # hand new addresses to the Python-side launch while the captured graph
+        # keeps replaying the old ones, so an oversized batch is a lifecycle event
+        # (recapture), not something this path may paper over.
         need = int(meta.spec_state_indices_tensor.shape[0])
-        if need > self._accepted_buffer.numel():
-            # Graph batch larger than the configured ceiling: grow once, keep the
-            # new buffer for the rest of the process.
-            self._accepted_buffer = torch.ones(
-                need, dtype=torch.int32, device=self._accepted_buffer.device
+        capacity = self._accepted_buffer.numel()
+        if need > capacity:
+            raise RuntimeError(
+                "Ascend GDN RecoverSSM: speculative batch of "
+                f"{need} rows exceeds the {capacity}-row accepted buffer that was "
+                "sized before graph capture; recapture with a larger "
+                "decode_cudagraph_max_bs instead of growing it here"
             )
         num_accepted = self._accepted_buffer[:need]
         num_accepted.fill_(1)

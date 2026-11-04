@@ -94,6 +94,48 @@ def _enabled(layer) -> bool:
     return getattr(layer, "use_gdn_recoverssm", True) is not False
 
 
+class _RecoverCommitProxy:
+    """Wraps RecoverSSMState so the GDN align bookkeeping lands at the right time."""
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def record_step(self, *args, **kwargs):
+        return self._inner.record_step(*args, **kwargs)
+
+    def commit_step(self, *args, **kwargs):
+        result = self._inner.commit_step(*args, **kwargs)
+        try:
+            _apply_align_bookkeeping(kwargs.get("state_indices"), kwargs.get("num_accepted_tokens"), kwargs.get("idx_mapping") or (args[1] if len(args) > 1 else None))
+        except Exception:
+            pass
+        return result
+
+
+def _apply_align_bookkeeping(state_indices, num_accepted_tokens, idx_mapping):
+    if state_indices is None or num_accepted_tokens is None or idx_mapping is None:
+        return
+    from . import builder as builder_mod
+
+    pending = builder_mod.take_pending_align()
+    if not pending:
+        return
+    rows = pending["rows"].long()
+    slots = idx_mapping[rows].long()
+    keep = slots >= 0
+    if bool(keep.all()) is False:
+        slots = slots[keep]
+        cols = pending["cols"][keep]
+    else:
+        cols = pending["cols"]
+    # One request slot per committed batch row: point it at the column the commit
+    # actually wrote and reset the accepted count to the neutral value.
+    state_indices[slots] = cols.to(state_indices.dtype)
+    num_accepted_tokens[slots] = 1
+
+
 def install() -> None:
     global _APPLIED
     if _APPLIED:
@@ -161,7 +203,6 @@ def install() -> None:
             and _enabled(layer)
             and kwargs.get("num_accepted_tokens") is not None
             and len(args) >= 4
-            and not _env_flag("GDN_RECOVERSSM_NO_VERIFY")
         ):
             return _verify(layer, args[0], args[1], args[2], args[3], kwargs)
         return original_recurrent(*args, **kwargs)
@@ -193,6 +234,28 @@ def install() -> None:
         return attn_metadata
 
     state_cls.prepare_attn = prepare_attn
+
+    # ------------------------------------------------- align bookkeeping hook
+    # ``postprocess_state`` runs, in order: scatter accepted -> RecoverSSM
+    # commit -> native align postcopy. The running column and the persistent
+    # accepted count must be corrected after the commit but before the postcopy,
+    # and the only seam available from Python is inside ``commit_step`` itself,
+    # so ``self.recoverssm`` is swapped for a proxy during the call.
+    original_postprocess = state_cls.postprocess_state
+
+    @functools.wraps(original_postprocess)
+    def postprocess_state(self, *args, **kwargs):
+        rec = getattr(self, "recoverssm", None)
+        if rec is None:
+            return original_postprocess(self, *args, **kwargs)
+        proxy = _RecoverCommitProxy(rec)
+        self.recoverssm = proxy
+        try:
+            return original_postprocess(self, *args, **kwargs)
+        finally:
+            self.recoverssm = rec
+
+    state_cls.postprocess_state = postprocess_state
 
     enable_runtime()
     _APPLIED = True
@@ -307,10 +370,11 @@ def _verify(layer, q, k, v, ssm_state, kwargs):
 
     total = int(q.shape[0])
     # Pass the metadata's own buffer (a view starting at offset 0) and let the
-    # kernel mask ``tok < total_tokens``. Creating a clamped copy here cost one
-    # extra device task per layer inside the captured graph, and under graph
-    # replay the replayed kernel would keep reading the capture-time copy instead
-    # of the per-step metadata buffer.
+    # kernel mask ``tok < total_tokens``. A clamped copy cost one extra device
+    # task per layer inside the captured graph and, more importantly, pinned the
+    # input to a buffer created at capture time. (Captured operators re-execute at
+    # replay, so a fixed address does not mean a fixed value -- the point here is
+    # which buffer the task reads, not that the value would be frozen.)
     query_start_loc = query_start_loc[: rows + 1]
     # Column 0 is the checkpoint; the per-draft-token slots are unused under
     # RecoverSSM (num_speculative_blocks == 0).

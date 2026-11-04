@@ -252,6 +252,84 @@ def test_commit_non_square():
     np.testing.assert_allclose(commit(h0, records, 3), ref, rtol=1e-12, atol=1e-12)
 
 
+def test_bounded_dispatch_covers_every_tile():
+    """The 1-D bounded dispatch must visit every logical tile exactly once.
+
+    Mirrors the decomposition used by the rewritten kernels:
+        work -> (value_tile = work %% NV, row = (work // NV) %% rows,
+                 head_or_layer = work // NV // rows)
+    and checks the multi-tile physical loop `for work in range(pid, M, P)`.
+    """
+    for nv, rows, heads in ((8, 1, 12), (8, 128, 12), (8, 33, 5), (1, 7, 3)):
+        M = nv * rows * heads
+        for cap in (1, 7, 48, 192, M, M + 5):
+            P = min(M, cap)
+            seen = []
+            for pid in range(P):
+                for work in range(pid, M, P):
+                    seen.append(work)
+            assert len(seen) == M, (nv, rows, heads, cap, len(seen))
+            assert sorted(seen) == list(range(M)), (nv, rows, heads, cap)
+            # every (tile, row, head) triple appears exactly once
+            triples = {
+                (w % nv, (w // nv) % rows, w // nv // rows) for w in range(M)
+            }
+            assert len(triples) == M
+
+
+def test_dispatch_keeps_boundary_and_final_semantics():
+    """One physical program must not cancel its remaining tiles on a null row.
+
+    The old kernels `return`ed on a null/zero-length row. With several logical
+    tiles per program that would drop later valid tiles; the rewrite makes each
+    guard per-tile. This models the guard.
+    """
+    M, P = 10, 3
+    invalid = {2, 5}          # rows that must become no-ops
+    executed = []
+    for pid in range(P):
+        for work in range(pid, M, P):
+            if work in invalid:
+                continue      # per-tile no-op, NOT a function return
+            executed.append(work)
+    assert sorted(executed) == [w for w in range(M) if w not in invalid]
+    assert len(executed) == M - len(invalid)
+
+
+def test_align_running_column_after_commit():
+    """GDN-specific align bookkeeping: running column follows the commit target.
+
+    Review counterexample C=126, Q=4, A=1, B=128: the commit writes S127 into
+    column 0, so the persistent running column must become 0 -- otherwise the
+    next round targets column 1 again and reads the stale S126.
+    """
+    block = 128
+    for C, A, expected in ((126, 1, 0), (127, 1, 0), (128, 1, 1), (124, 4, 0), (255, 1, 1)):
+        col = max(C + A - 1, 0) // block
+        assert col == expected, (C, A, col, expected)
+    # the value the generic Recover kernel would use is different at a boundary
+    C, A, block = 127, 1, 128
+    assert max(C + A - 1, 0) // block != (C + A) // block
+
+
+def test_align_bookkeeping_maps_rows_to_slots():
+    """Only committed rows are touched, mapped through idx_mapping."""
+    rows = [0, 2]
+    cols = [0, 1]
+    idx_mapping = [7, -1, 3]        # batch row -> request slot (-1 = inactive)
+    state = [9, 9, 9, 9, 9, 9, 9, 9]
+    accepted = [9] * 8
+    for row, col in zip(rows, cols):
+        slot = idx_mapping[row]
+        if slot < 0:
+            continue
+        state[slot] = col
+        accepted[slot] = 1
+    assert state[7] == 0 and state[3] == 1
+    assert accepted[7] == 1 and accepted[3] == 1
+    assert state[0] == 9          # untouched slots keep their value
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

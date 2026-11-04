@@ -56,6 +56,27 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm_ascend.ops.triton.triton_utils import get_ub_size_bytes
 
+try:  # natural bound for a per-tile loop on this device
+    from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+except ImportError:  # pragma: no cover - older drops
+    get_vectorcore_num = None
+
+
+def _launch_cap() -> int:
+    """Upper bound on physical programs for one launch.
+
+    Triton-Ascend maps a logical grid onto cores itself, but relying on that for
+    very large grids is a version-specific assumption; its own migration guide
+    recommends a bounded 1-D grid with an in-kernel loop. Cap at the vector-core
+    count, which is what vllm-ascend does for its tiled kernels.
+    """
+    if get_vectorcore_num is None:
+        return 48
+    try:
+        return max(1, int(get_vectorcore_num()))
+    except Exception:
+        return 48
+
 # ---------------------------------------------------------------------------
 # Configuration constants (Ascend A2)
 # ---------------------------------------------------------------------------
@@ -284,6 +305,8 @@ def _gdn_recoverssm_verify_kernel(
     state_indices_ptr,
     total_tokens,
     scale,
+    num_rows,
+    num_work,
     null_block_id,
     stride_q_token,
     stride_k_token,
@@ -310,106 +333,111 @@ def _gdn_recoverssm_verify_kernel(
     SPEC_QUERY_LEN: tl.constexpr,
     USE_QK_L2NORM: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
+    NUM_VALUE_TILES: tl.constexpr,
 ):
-    # Ascend A2 notes:
-    #  * The record layout is upstream's: [corr(V), k_hat(K), decay(1)] per
-    #    (block, value head, token), fp32, contiguous on the last axis.
-    #  * `g` is the log-space decay produced by the layer's fused GDN gating and
-    #    `beta` is already sigmoid(b): the softplus/sigmoid arithmetic that
-    #    upstream runs here lives in that operator on Ascend. Everything below
-    #    the gate is upstream's math verbatim.
-    #  * The per-token loop is a `tl.static_range` over the compile-time
-    #    SPEC_QUERY_LEN (<= MAX_SPEC_QUERY_LEN): a fixed window is what makes the
-    #    UB budget of the loop body static.
-    pid_v = tl.program_id(0)
-    pid_b = tl.program_id(1)
-    pid_hv = tl.program_id(2)
-    pid_h = pid_hv // (HV // H)
-    bos = tl.load(query_start_loc_ptr + pid_b * stride_qsl).to(tl.int64)
-    eos = tl.load(query_start_loc_ptr + (pid_b + 1) * stride_qsl).to(tl.int64)
-    query_len = eos - bos
-    state_idx = tl.load(state_indices_ptr + pid_b * stride_si).to(tl.int64)
-    offs_k = tl.arange(0, BK)
-    offs_v = pid_v * BV + tl.arange(0, BV)
-    mask_k = offs_k < K
-    mask_v = offs_v < V
-    mask_state = mask_v[:, None] & mask_k[None, :]
-    if state_idx <= null_block_id or state_idx >= NUM_BLOCKS:
-        # Null rows (and out-of-range page ids, which a stale block table can
-        # produce) write zero output and never touch the replay records. Without
-        # the upper bound a garbage page id turns into a wild GM address and the
-        # whole process dies in the next synchronize with "MTE accesses an
-        # invalid GM address".
-        for t in tl.static_range(SPEC_QUERY_LEN):
-            tok_null = bos + t
-            tl.store(
-                out_ptr + tok_null * stride_out_token + pid_hv * V + offs_v,
-                tl.zeros([BV], dtype=tl.float32),
-                mask=(t < query_len) & (tok_null < total_tokens) & mask_v,
+    # Bounded physical dispatch. Logical work is
+    #   NUM_VALUE_TILES x num_rows x HV
+    # and the launch uses at most min(logical, cores) programs, each looping over
+    # its share. A 3-D grid would ask the runtime for the whole logical product;
+    # this keeps the physical grid bounded for every supported batch while each
+    # valid tile still runs exactly once.
+    pid = tl.program_id(0)
+    grid = tl.num_programs(0)
+    for work in range(pid, num_work, grid):
+        pid_v = work % NUM_VALUE_TILES
+        rest = work // NUM_VALUE_TILES
+        pid_b = rest % num_rows
+        pid_hv = rest // num_rows
+        pid_h = pid_hv // (HV // H)
+        bos = tl.load(query_start_loc_ptr + pid_b * stride_qsl).to(tl.int64)
+        eos = tl.load(query_start_loc_ptr + (pid_b + 1) * stride_qsl).to(tl.int64)
+        query_len = eos - bos
+        state_idx = tl.load(state_indices_ptr + pid_b * stride_si).to(tl.int64)
+        offs_k = tl.arange(0, BK)
+        offs_v = pid_v * BV + tl.arange(0, BV)
+        mask_k = offs_k < K
+        mask_v = offs_v < V
+        mask_state = mask_v[:, None] & mask_k[None, :]
+        if state_idx <= null_block_id or state_idx >= NUM_BLOCKS:
+            # Null rows (and out-of-range page ids from a stale block table) emit
+            # zeros and never touch the replay records. This stays a conditional
+            # block rather than an early return: one physical program owns
+            # several logical tiles.
+            for t in tl.static_range(SPEC_QUERY_LEN):
+                tok_null = bos + t
+                tl.store(
+                    out_ptr + tok_null * stride_out_token + pid_hv * V + offs_v,
+                    tl.zeros([BV], dtype=tl.float32),
+                    mask=(t < query_len) & (tok_null < total_tokens) & mask_v,
+                )
+        else:
+            state = tl.load(
+                state_ptr
+                + state_idx * stride_state_block
+                + pid_hv * stride_state_head
+                + offs_v[:, None] * stride_state_v
+                + offs_k[None, :] * stride_state_k,
+                mask=mask_state,
+                other=0.0,
+            ).to(tl.float32)
+            rec_base = (
+                replay_ptr
+                + state_idx * stride_replay_block
+                + pid_hv * stride_replay_head
             )
-        return
-    state = tl.load(
-        state_ptr
-        + state_idx * stride_state_block
-        + pid_hv * stride_state_head
-        + offs_v[:, None] * stride_state_v
-        + offs_k[None, :] * stride_state_k,
-        mask=mask_state,
-        other=0.0,
-    ).to(tl.float32)
-    rec_base = (
-        replay_ptr + state_idx * stride_replay_block + pid_hv * stride_replay_head
-    )
-    for t in tl.static_range(SPEC_QUERY_LEN):
-        tok = bos + t
-        # The window may be shorter than the token tensor, but never longer:
-        # ``spec_query_start_loc`` can describe graph-padded rows. Masking on
-        # ``total_tokens`` keeps every load/store inside q/k/v/out/records.
-        valid = (t < query_len) & (tok < total_tokens)
-        q = tl.load(
-            q_ptr + tok * stride_q_token + pid_h * K + offs_k,
-            mask=valid & mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        k = tl.load(
-            k_ptr + tok * stride_k_token + pid_h * K + offs_k,
-            mask=valid & mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        v = tl.load(
-            v_ptr + tok * stride_v_token + pid_hv * V + offs_v,
-            mask=valid & mask_v,
-            other=0.0,
-        ).to(tl.float32)
-        g = tl.load(
-            g_ptr + tok * stride_g_token + pid_hv, mask=valid, other=0.0
-        ).to(tl.float32)
-        beta = tl.load(
-            beta_ptr + tok * stride_beta_token + pid_hv, mask=valid, other=0.0
-        ).to(tl.float32)
-        if USE_QK_L2NORM:
-            # Same epsilon as FLA l2norm_fwd, so the pre-normalised path and this
-            # in-kernel path use one and the same epsilon.
-            q = q * tl.rsqrt(tl.sum(q * q) + 1e-6)
-            k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
-        q = q * scale
-        decay = tl.exp(g)
-        new_state = state * decay
-        corr = (v - tl.sum(new_state * k[None, :], 1)) * beta
-        new_state = new_state + corr[:, None] * k[None, :]
-        state = tl.where(valid, new_state, state)
-        o = tl.sum(state * q[None, :], 1)
-        tl.store(
-            out_ptr + tok * stride_out_token + pid_hv * V + offs_v,
-            o.to(out_ptr.dtype.element_ty),
-            mask=valid & mask_v,
-        )
-        rec = rec_base + t * stride_replay_pos
-        tl.store(rec + offs_v * stride_replay_dim, corr, mask=valid & mask_v)
-        if pid_v == 0:
-            tl.store(rec + (V + offs_k) * stride_replay_dim, k, mask=valid & mask_k)
-            # the decay as multiplied here, so the commit replays this exact float
-            tl.store(rec + (V + K) * stride_replay_dim, decay, mask=valid)
+            for t in tl.static_range(SPEC_QUERY_LEN):
+                tok = bos + t
+                # The window may be shorter than the token tensor, never longer:
+                # ``spec_query_start_loc`` can describe graph-padded rows.
+                valid = (t < query_len) & (tok < total_tokens)
+                q = tl.load(
+                    q_ptr + tok * stride_q_token + pid_h * K + offs_k,
+                    mask=valid & mask_k,
+                    other=0.0,
+                ).to(tl.float32)
+                k = tl.load(
+                    k_ptr + tok * stride_k_token + pid_h * K + offs_k,
+                    mask=valid & mask_k,
+                    other=0.0,
+                ).to(tl.float32)
+                v = tl.load(
+                    v_ptr + tok * stride_v_token + pid_hv * V + offs_v,
+                    mask=valid & mask_v,
+                    other=0.0,
+                ).to(tl.float32)
+                g = tl.load(
+                    g_ptr + tok * stride_g_token + pid_hv, mask=valid, other=0.0
+                ).to(tl.float32)
+                beta = tl.load(
+                    beta_ptr + tok * stride_beta_token + pid_hv,
+                    mask=valid,
+                    other=0.0,
+                ).to(tl.float32)
+                if USE_QK_L2NORM:
+                    # Same epsilon as FLA l2norm_fwd so both paths agree.
+                    q = q * tl.rsqrt(tl.sum(q * q) + 1e-6)
+                    k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
+                q = q * scale
+                decay = tl.exp(g)
+                new_state = state * decay
+                corr = (v - tl.sum(new_state * k[None, :], 1)) * beta
+                new_state = new_state + corr[:, None] * k[None, :]
+                state = tl.where(valid, new_state, state)
+                o = tl.sum(state * q[None, :], 1)
+                tl.store(
+                    out_ptr + tok * stride_out_token + pid_hv * V + offs_v,
+                    o.to(out_ptr.dtype.element_ty),
+                    mask=valid & mask_v,
+                )
+                rec = rec_base + t * stride_replay_pos
+                tl.store(rec + offs_v * stride_replay_dim, corr, mask=valid & mask_v)
+                if pid_v == 0:
+                    tl.store(
+                        rec + (V + offs_k) * stride_replay_dim, k, mask=valid & mask_k
+                    )
+                    # the decay exactly as multiplied here, so the commit replays
+                    # this float
+                    tl.store(rec + (V + K) * stride_replay_dim, decay, mask=valid)
 
 
 def gdn_recoverssm_verify(
@@ -528,7 +556,11 @@ def gdn_recoverssm_verify(
     # kept, but the tile is additionally clamped so one program's FP32 tiles fit
     # the UB (see _verify_value_tile / _assert_verify_ub_fit).
     BV = _verify_value_tile(BK, V)
-    grid = (triton.cdiv(V, BV), batch, HV)
+    # Bounded physical dispatch: at most one program per vector core, each
+    # walking several logical tiles.
+    num_value_tiles = triton.cdiv(V, BV)
+    num_work = num_value_tiles * batch * HV
+    grid = (min(num_work, _launch_cap()),)
     _gdn_recoverssm_verify_kernel[grid](
         q,
         k,
@@ -542,6 +574,8 @@ def gdn_recoverssm_verify(
         state_indices,
         total,
         scale,
+        batch,
+        num_work,
         NULL_BLOCK_ID,
         q.stride(1),
         k.stride(1),
@@ -568,6 +602,7 @@ def gdn_recoverssm_verify(
         SPEC_QUERY_LEN=spec_query_len,
         USE_QK_L2NORM=not qk_already_normalized,
         NUM_BLOCKS=nb,
+        NUM_VALUE_TILES=num_value_tiles,
         num_warps=4,
         num_stages=2,
     )
@@ -701,6 +736,8 @@ def _compact_conv_state_kernel(
     boundary_state_indices_ptr,
     boundary_recovery_lens_ptr,
     null_block_id,
+    num_rows,
+    num_work,
     conv_dim,
     conv_history_len,
     stride_state_indices,
@@ -708,73 +745,81 @@ def _compact_conv_state_kernel(
     BLOCK_HISTORY: tl.constexpr,
     ALIGN_MODE: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
+    NUM_D_TILES: tl.constexpr,
 ):
-    # Upstream `compact_conv_state_kernel`, renamed only. Moves the accepted
-    # suffix [commit_len - 1, commit_len - 1 + W) of the extended short-conv
-    # window to the front of the destination block, and writes the boundary
-    # window in align mode. The load/store tile is UB-resident, so BLOCK_D comes
-    # from _conv_dim_tile() (4 B/element budget, two live tiles).
-    pid_d = tl.program_id(0)
-    pid_b = tl.program_id(1)
-    pid_l = tl.program_id(2)
-    source_state_idx = tl.load(state_indices_ptr + pid_b * stride_state_indices).to(
-        tl.int64
-    )
-    if source_state_idx <= null_block_id:
-        return
-
-    commit_len = tl.load(commit_lens_ptr + pid_b)
-    if commit_len == 0:
-        return
-    final_state_idx = tl.load(final_state_indices_ptr + pid_b).to(tl.int64)
-    boundary_state_idx = tl.load(boundary_state_indices_ptr + pid_b).to(tl.int64)
-    boundary_recovery_len = tl.load(boundary_recovery_lens_ptr + pid_b)
-
-    if final_state_idx <= null_block_id or final_state_idx >= NUM_BLOCKS:
-        return
-
-    base_addr = tl.load(conv_state_base_addrs_ptr + pid_l)
-    block_stride = tl.load(conv_state_block_strides_ptr + pid_l)
-    dim_stride = tl.load(conv_state_dim_strides_ptr + pid_l)
-    token_stride = tl.load(conv_state_token_strides_ptr + pid_l)
-    conv_state_ptr = base_addr.to(tl.pointer_type(conv_state_ref_ptr.dtype.element_ty))
-    source_ptr = conv_state_ptr + source_state_idx * block_stride
-    final_ptr = conv_state_ptr + final_state_idx * block_stride
-
-    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-    offs_h = tl.arange(0, BLOCK_HISTORY)
-    mask = (offs_d[:, None] < conv_dim) & (offs_h[None, :] < conv_history_len)
-    final_values = tl.load(
-        source_ptr
-        + offs_d[:, None] * dim_stride
-        + (commit_len - 1 + offs_h[None, :]) * token_stride,
-        mask=mask,
-    )
-    if ALIGN_MODE:
-        boundary_values = tl.load(
-            source_ptr
-            + offs_d[:, None] * dim_stride
-            + (boundary_recovery_len - 1 + offs_h[None, :]) * token_stride,
-            mask=mask & (boundary_state_idx > null_block_id),
+    # Bounded physical dispatch over (dim tile, row, layer). Each program walks
+    # several logical tiles, so every guard below is a per-tile no-op rather than
+    # a function return.
+    pid = tl.program_id(0)
+    grid = tl.num_programs(0)
+    for work in range(pid, num_work, grid):
+        pid_d = work % NUM_D_TILES
+        rest = work // NUM_D_TILES
+        pid_b = rest % num_rows
+        pid_l = rest // num_rows
+        source_state_idx = tl.load(
+            state_indices_ptr + pid_b * stride_state_indices
+        ).to(tl.int64)
+        commit_len = tl.load(commit_lens_ptr + pid_b)
+        final_state_idx = tl.load(final_state_indices_ptr + pid_b).to(tl.int64)
+        row_ok = (
+            (source_state_idx > null_block_id)
+            & (commit_len != 0)
+            & (final_state_idx > null_block_id)
+            & (final_state_idx < NUM_BLOCKS)
         )
-        boundary_ptr = conv_state_ptr + boundary_state_idx * block_stride
-        tl.store(
-            boundary_ptr
-            + offs_d[:, None] * dim_stride
-            + offs_h[None, :] * token_stride,
-            boundary_values,
-            mask=mask & (boundary_state_idx > null_block_id),
-        )
-    tl.store(
-        final_ptr + offs_d[:, None] * dim_stride + offs_h[None, :] * token_stride,
-        final_values,
-        mask=mask,
-    )
+        if row_ok:
+            boundary_state_idx = tl.load(boundary_state_indices_ptr + pid_b).to(
+                tl.int64
+            )
+            boundary_recovery_len = tl.load(boundary_recovery_lens_ptr + pid_b)
 
+            base_addr = tl.load(conv_state_base_addrs_ptr + pid_l)
+            block_stride = tl.load(conv_state_block_strides_ptr + pid_l)
+            dim_stride = tl.load(conv_state_dim_strides_ptr + pid_l)
+            token_stride = tl.load(conv_state_token_strides_ptr + pid_l)
+            conv_state_ptr = base_addr.to(
+                tl.pointer_type(conv_state_ref_ptr.dtype.element_ty)
+            )
+            source_ptr = conv_state_ptr + source_state_idx * block_stride
+            final_ptr = conv_state_ptr + final_state_idx * block_stride
 
-# ---------------------------------------------------------------------------
-# Commit (accepted-state recovery)
-# ---------------------------------------------------------------------------
+            offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+            offs_h = tl.arange(0, BLOCK_HISTORY)
+            mask = (offs_d[:, None] < conv_dim) & (
+                offs_h[None, :] < conv_history_len
+            )
+            final_values = tl.load(
+                source_ptr
+                + offs_d[:, None] * dim_stride
+                + (commit_len - 1 + offs_h[None, :]) * token_stride,
+                mask=mask,
+            )
+            if ALIGN_MODE:
+                boundary_ok = (boundary_state_idx > null_block_id) & (
+                    boundary_state_idx < NUM_BLOCKS
+                )
+                boundary_values = tl.load(
+                    source_ptr
+                    + offs_d[:, None] * dim_stride
+                    + (boundary_recovery_len - 1 + offs_h[None, :]) * token_stride,
+                    mask=mask & boundary_ok,
+                )
+                boundary_ptr = conv_state_ptr + boundary_state_idx * block_stride
+                tl.store(
+                    boundary_ptr
+                    + offs_d[:, None] * dim_stride
+                    + offs_h[None, :] * token_stride,
+                    boundary_values,
+                    mask=mask & boundary_ok,
+                )
+            tl.store(
+                final_ptr
+                + offs_d[:, None] * dim_stride
+                + offs_h[None, :] * token_stride,
+                final_values,
+                mask=mask,
+            )
 
 
 @triton.jit
@@ -791,6 +836,8 @@ def _commit_gdn_state_kernel(
     boundary_state_indices_ptr,
     boundary_recovery_lens_ptr,
     null_block_id,
+    num_rows,
+    num_work,
     stride_state_head,
     stride_state_v,
     stride_state_k,
@@ -804,90 +851,87 @@ def _commit_gdn_state_kernel(
     BV: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
+    NUM_VALUE_TILES: tl.constexpr,
 ):
-    # Every program runs ONE fold and keeps one tile live. In align mode the
-    # block-boundary state (the first boundary_len tokens of the window) is
-    # snapshotted during that same fold, so it always starts from the original
-    # checkpoint even when the final destination aliases the source page.
-    # The commit reads gate/beta out of the replay record, so it needs no gate
-    # parameters (unlike the KDA port, which re-runs its gate here).
-    pid_v = tl.program_id(0)
-    pid_b = tl.program_id(1)
-    pid_lh = tl.program_id(2)
-    pid_l = pid_lh // NUM_HEADS
-    pid_h = pid_lh % NUM_HEADS
-    src = tl.load(state_indices_ptr + pid_b * stride_si).to(tl.int64)
-    # ``>= NUM_BLOCKS`` would be a wild GM address: a stale block table can hand
-    # us a page id that no longer exists. Drop such rows instead of faulting.
-    if src <= null_block_id or src >= NUM_BLOCKS:
-        return
-    n = tl.load(commit_lens_ptr + pid_b)
-    if n == 0:
-        return
-    final_idx = tl.load(final_state_indices_ptr + pid_b).to(tl.int64)
-    if final_idx <= null_block_id:
-        return
-    dst_idx = final_idx
-    # Boundary state is captured DURING the same fold. It must never be a second
-    # pass over the source page: when the final state lands in the window's
-    # source column, a second launch would read the already-overwritten
-    # checkpoint and resurrect the wrong history (C=126, A=3, boundary_len=2
-    # gave 2.25 instead of 4).
-    b_idx = tl.load(boundary_state_indices_ptr + pid_b).to(tl.int64)
-    b_len = tl.load(boundary_recovery_lens_ptr + pid_b).to(tl.int32)
-    # Chained ``and`` is rejected by triton-ascend, so fold into one bitwise term.
-    store_boundary = (b_idx > null_block_id) & (b_idx != final_idx) & (b_len > 0)
-    state_ptr = tl.load(state_base_addrs_ptr + pid_l).to(
-        tl.pointer_type(state_ref_ptr.dtype.element_ty)
-    )
-    sbs = tl.load(state_block_strides_ptr + pid_l)
-    replay_ptr = tl.load(replay_base_addrs_ptr + pid_l).to(
-        tl.pointer_type(replay_ref_ptr.dtype.element_ty)
-    )
-    rbs = tl.load(replay_block_strides_ptr + pid_l)
-    rec_base = replay_ptr + src * rbs + pid_h * stride_replay_head
-    offs_k = tl.arange(0, BK)
-    offs_v = pid_v * BV + tl.arange(0, BV)
-    mask_k = offs_k < K
-    mask_v = offs_v < V
-    mask_state = mask_v[:, None] & mask_k[None, :]
-    sp = offs_v[:, None] * stride_state_v + offs_k[None, :] * stride_state_k
-    s0 = tl.load(
-        state_ptr + src * sbs + pid_h * stride_state_head + sp,
-        mask=mask_state,
-        other=0.0,
-    ).to(tl.float32)
-    # Forward over the accepted tokens with the verify step's own update, so the committed
-    # state is the per-token state bit for bit (the decay and corr stored are the floats
-    # the verify kernel used).
-    #
-    # Ascend A2: the trip count stays a runtime value (upstream `for t in range(n)`).
-    # n <= SPEC_QUERY_LEN <= MAX_SPEC_QUERY_LEN, and runtime iteration keeps the
-    # per-iteration matrices from being expanded into one live set, which is what
-    # the KDA Ascend port had to do on A3 to fit a 192 KiB UB. Static unrolling is
-    # the fallback if Triton-Ascend rejects a runtime bound.
-    h = s0
-    b_dst = state_ptr + b_idx * sbs + pid_h * stride_state_head + sp
-    for t in range(n):
-        rec = rec_base + t * stride_replay_pos
-        c = tl.load(rec + offs_v * stride_replay_dim, mask=mask_v, other=0.0)
-        kk = tl.load(rec + (V + offs_k) * stride_replay_dim, mask=mask_k, other=0.0)
-        decay = tl.load(rec + (V + K) * stride_replay_dim)
-        h = tl.fma(c[:, None], kk[None, :], h * decay)
-        if store_boundary:
-            if t + 1 == b_len:
-                # Snapshot of the state after ``boundary_len`` tokens, taken from
-                # the same starting checkpoint as the final fold.
-                tl.store(
-                    b_dst,
-                    h.to(state_ref_ptr.dtype.element_ty),
-                    mask=mask_state,
+    # One physical program handles several logical (value tile, row, layer*head)
+    # tiles. Every early exit below is a per-tile no-op, never a function return:
+    # a padding tile must not cancel the remaining tiles of the same program.
+    pid = tl.program_id(0)
+    grid = tl.num_programs(0)
+    for work in range(pid, num_work, grid):
+        pid_v = work % NUM_VALUE_TILES
+        rest = work // NUM_VALUE_TILES
+        pid_b = rest % num_rows
+        pid_lh = rest // num_rows
+        pid_l = pid_lh // NUM_HEADS
+        pid_h = pid_lh % NUM_HEADS
+        src = tl.load(state_indices_ptr + pid_b * stride_si).to(tl.int64)
+        n = tl.load(commit_lens_ptr + pid_b).to(tl.int32)
+        final_idx = tl.load(final_state_indices_ptr + pid_b).to(tl.int64)
+        row_ok = (
+            (src > null_block_id)
+            & (src < NUM_BLOCKS)
+            & (n > 0)
+            & (final_idx > null_block_id)
+        )
+        if row_ok:
+            dst_idx = final_idx
+            # Boundary state is captured DURING the same fold. It must never be a
+            # second pass over the source page: when the final state lands in the
+            # window's source column, a second launch would read the overwritten
+            # checkpoint (C=126, A=3, boundary_len=2 gave 2.25 instead of 4).
+            b_idx = tl.load(boundary_state_indices_ptr + pid_b).to(tl.int64)
+            b_len = tl.load(boundary_recovery_lens_ptr + pid_b).to(tl.int32)
+            # Chained ``and`` is rejected by triton-ascend: fold into one term.
+            store_boundary = (
+                (b_idx > null_block_id) & (b_idx != final_idx) & (b_len > 0)
+            )
+            state_ptr = tl.load(state_base_addrs_ptr + pid_l).to(
+                tl.pointer_type(state_ref_ptr.dtype.element_ty)
+            )
+            sbs = tl.load(state_block_strides_ptr + pid_l)
+            replay_ptr = tl.load(replay_base_addrs_ptr + pid_l).to(
+                tl.pointer_type(replay_ref_ptr.dtype.element_ty)
+            )
+            rbs = tl.load(replay_block_strides_ptr + pid_l)
+            rec_base = replay_ptr + src * rbs + pid_h * stride_replay_head
+            offs_k = tl.arange(0, BK)
+            offs_v = pid_v * BV + tl.arange(0, BV)
+            mask_k = offs_k < K
+            mask_v = offs_v < V
+            mask_state = mask_v[:, None] & mask_k[None, :]
+            sp = offs_v[:, None] * stride_state_v + offs_k[None, :] * stride_state_k
+            s0 = tl.load(
+                state_ptr + src * sbs + pid_h * stride_state_head + sp,
+                mask=mask_state,
+                other=0.0,
+            ).to(tl.float32)
+            # Start from the ORIGINAL checkpoint and fold the accepted tokens with
+            # the same arithmetic the verify step used, so the committed state is
+            # bit-for-bit the per-token state. The boundary snapshot and the final
+            # state therefore share one starting point.
+            h = s0
+            b_dst = state_ptr + b_idx * sbs + pid_h * stride_state_head + sp
+            for t in range(n):
+                rec = rec_base + t * stride_replay_pos
+                c = tl.load(rec + offs_v * stride_replay_dim, mask=mask_v, other=0.0)
+                kk = tl.load(
+                    rec + (V + offs_k) * stride_replay_dim, mask=mask_k, other=0.0
                 )
-    tl.store(
-        state_ptr + dst_idx * sbs + pid_h * stride_state_head + sp,
-        h.to(state_ref_ptr.dtype.element_ty),
-        mask=mask_state,
-    )
+                decay = tl.load(rec + (V + K) * stride_replay_dim)
+                h = tl.fma(c[:, None], kk[None, :], h * decay)
+                if store_boundary:
+                    if t + 1 == b_len:
+                        tl.store(
+                            b_dst,
+                            h.to(state_ref_ptr.dtype.element_ty),
+                            mask=mask_state,
+                        )
+            tl.store(
+                state_ptr + dst_idx * sbs + pid_h * stride_state_head + sp,
+                h.to(state_ref_ptr.dtype.element_ty),
+                mask=mask_state,
+            )
 
 
 @dataclass
@@ -1136,9 +1180,9 @@ class GDNRecoverSSMCommitContext:
             # mask is written against it), so only BLOCK_D is UB-sized.
             block_history = triton.next_power_of_2(self.conv_history_len)
             conv_block_d = _conv_dim_tile(block_history)
-            _compact_conv_state_kernel[
-                (triton.cdiv(conv_dim, conv_block_d), batch, num_layers)
-            ](
+            num_d_tiles = triton.cdiv(conv_dim, conv_block_d)
+            conv_work = num_d_tiles * batch * num_layers
+            _compact_conv_state_kernel[(min(conv_work, _launch_cap()),)](
                 conv_ref,
                 self.conv_state_base_addrs,
                 self.conv_state_block_strides,
@@ -1150,6 +1194,8 @@ class GDNRecoverSSMCommitContext:
                 self.boundary_state_indices,
                 self.boundary_recovery_lens,
                 NULL_BLOCK_ID,
+                batch,
+                conv_work,
                 conv_dim,
                 self.conv_history_len,
                 state_indices.stride(0),
@@ -1157,6 +1203,7 @@ class GDNRecoverSSMCommitContext:
                 BLOCK_HISTORY=block_history,
                 ALIGN_MODE=block_table is not None,
                 NUM_BLOCKS=self.num_blocks,
+                NUM_D_TILES=num_d_tiles,
                 num_warps=4,
             )
         ref = self.checkpoints[0]
@@ -1181,6 +1228,8 @@ class GDNRecoverSSMCommitContext:
             self.boundary_state_indices,
             self.boundary_recovery_lens,
             NULL_BLOCK_ID,
+            batch,
+            num_work,
             ref.stride(1),
             ref.stride(2),
             ref.stride(3),
@@ -1189,21 +1238,23 @@ class GDNRecoverSSMCommitContext:
             rr.stride(3),
             state_indices.stride(0),
         )
-        grid = (triton.cdiv(V, BV), batch, num_layers * HV)
-        # One launch per layer set: both the final and the boundary state come
-        # out of a single fold over one checkpoint load.
-        if True:
-            _commit_gdn_state_kernel[grid](
-                *args,
-                K=K,
-                V=V,
-                BK=BK,
-                BV=BV,
-                NUM_HEADS=HV,
-                NUM_BLOCKS=self.num_blocks,
-                num_warps=4,
-                num_stages=2,
-            )
+        num_value_tiles = triton.cdiv(V, BV)
+        num_work = num_value_tiles * batch * (num_layers * HV)
+        # One launch per layer set: the final and the boundary state come out of a
+        # single fold over one checkpoint load. The physical grid stays bounded;
+        # each program walks several logical tiles.
+        _commit_gdn_state_kernel[(min(num_work, _launch_cap()),)](
+            *args,
+            K=K,
+            V=V,
+            BK=BK,
+            BV=BV,
+            NUM_HEADS=HV,
+            NUM_BLOCKS=self.num_blocks,
+            NUM_VALUE_TILES=num_value_tiles,
+            num_warps=4,
+            num_stages=2,
+        )
 
 
 __all__ = ["GDNRecoverSSMCommitContext", "gdn_recoverssm_verify"]

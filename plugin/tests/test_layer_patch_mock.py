@@ -191,6 +191,10 @@ def _install_gdn_stub():
                          for_capture=False, ubatch_idx=0):
             return {"layer.0": "metadata"}
 
+        def postprocess_state(self, idx_mapping, num_sampled,
+                              num_computed_tokens=None):
+            return None
+
     # Faithful three-class topology: base (vLLM), real layer (vLLM subclass),
     # donor (vllm-ascend subclass). The donor is a *sibling* of the real class.
     class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
