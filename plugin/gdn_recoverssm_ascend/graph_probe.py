@@ -52,6 +52,34 @@ def install() -> None:
         return original(self, desc, attn_metadata)
 
     cls._updatable_graph_replay = _updatable_graph_replay
+
+    # Also snapshot the counters right after capture: that is the backlog the
+    # stream carries into the first replay.
+    original_capture = getattr(cls, "capture", None)
+    if original_capture is None:
+        _APPLIED = True
+        return
+
+    @functools.wraps(original_capture)
+    def capture(self, *args, **kwargs):
+        result = original_capture(self, *args, **kwargs)
+        try:
+            from . import layer_patch
+
+            counters = layer_patch.counters()
+            logger.info(
+                "Ascend full-graph capture finished: graphs=%d verify_calls=%d "
+                "last_window=(%d,%d)",
+                len(getattr(self, "graphs", {}) or {}),
+                counters.get("verify_calls", -1),
+                counters.get("last_rows", -1),
+                counters.get("last_tokens", -1),
+            )
+        except Exception:
+            pass
+        return result
+
+    cls.capture = capture
     _APPLIED = True
 
 
