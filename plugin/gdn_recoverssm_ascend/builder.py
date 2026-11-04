@@ -132,11 +132,13 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
         # applied by the postprocess hook after this commit and before the native
         # align postcopy.
         if commit.block_table is not None:
-            _stage_align_update(commit, num_accepted_tokens, n)
+            _stage_align_update(
+                commit, num_accepted_tokens, n, self.spec_query_len
+            )
         return None
 
 
-def _stage_align_update(commit, num_accepted_tokens, n: int) -> None:
+def _stage_align_update(commit, num_accepted_tokens, n: int, self_spec_query_len: int) -> None:
     """Record ``(rows, final_col)`` so postprocess can fix the running column.
 
     RecoverSSM restores the accepted state itself, so the persistent running
@@ -152,12 +154,20 @@ def _stage_align_update(commit, num_accepted_tokens, n: int) -> None:
 
         rows = commit.request_indices
         if rows is None:
-            rows = torch.arange(n, device=num_accepted_tokens.device, dtype=torch.int32)
+            # Without the batch-row mapping we cannot address the persistent
+            # request slots; guessing an identity mapping would write another
+            # request's column. Skip and say so.
+            logger.warning(
+                "Ascend GDN RecoverSSM: align bookkeeping skipped, the spec rows "
+                "have no batch-row mapping"
+            )
+            return
         computed = commit.num_computed_tokens[rows.long()]
         qsl = commit.query_start_loc
         qlen = (qsl[1 : n + 1] - qsl[:n]).clamp(min=0)
+        # Same clamp chain as the plan kernel: max(0) -> query_len -> spec window.
         accepted = num_accepted_tokens[rows.long()].clamp(min=0)
-        accepted = torch.minimum(accepted, qlen)
+        accepted = torch.minimum(accepted, qlen).clamp(max=self_spec_query_len)
         width = int(commit.block_table.shape[1])
         col = ((computed + accepted - 1).clamp(min=0) // int(commit.block_size)).clamp(
             max=width - 1

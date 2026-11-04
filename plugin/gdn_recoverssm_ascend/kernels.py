@@ -62,6 +62,9 @@ except ImportError:  # pragma: no cover - older drops
     get_vectorcore_num = None
 
 
+_LAUNCH_CAP: int | None = None
+
+
 def _launch_cap() -> int:
     """Upper bound on physical programs for one launch.
 
@@ -70,12 +73,17 @@ def _launch_cap() -> int:
     recommends a bounded 1-D grid with an in-kernel loop. Cap at the vector-core
     count, which is what vllm-ascend does for its tiled kernels.
     """
+    global _LAUNCH_CAP
+    if _LAUNCH_CAP is not None:
+        return _LAUNCH_CAP
     if get_vectorcore_num is None:
-        return 48
+        _LAUNCH_CAP = 48
+        return _LAUNCH_CAP
     try:
-        return max(1, int(get_vectorcore_num()))
+        _LAUNCH_CAP = max(1, int(get_vectorcore_num()))
     except Exception:
-        return 48
+        _LAUNCH_CAP = 48
+    return _LAUNCH_CAP
 
 # ---------------------------------------------------------------------------
 # Configuration constants (Ascend A2)

@@ -124,12 +124,11 @@ def _apply_align_bookkeeping(state_indices, num_accepted_tokens, idx_mapping):
         return
     rows = pending["rows"].long()
     slots = idx_mapping[rows].long()
+    # Mask instead of branching: a `bool(tensor)` here would force a device
+    # synchronisation on every step.
     keep = slots >= 0
-    if bool(keep.all()) is False:
-        slots = slots[keep]
-        cols = pending["cols"][keep]
-    else:
-        cols = pending["cols"]
+    slots = slots[keep]
+    cols = pending["cols"][keep]
     # One request slot per committed batch row: point it at the column the commit
     # actually wrote and reset the accepted count to the neutral value.
     state_indices[slots] = cols.to(state_indices.dtype)
