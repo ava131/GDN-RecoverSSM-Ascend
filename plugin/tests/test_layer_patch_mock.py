@@ -608,6 +608,63 @@ def test_graph_probe_logs_task_count():
     assert graph_probe._SEEN[key[0]]["count"] == 1
 
 
+def test_startup_preparation_runs_before_warmup():
+    """The commit variants must be compiled before vLLM's warmup/capture."""
+    _install_torch_stub()
+    _install_vllm_stubs()
+
+    events = []
+
+    class _Ctx:
+        checkpoints = [types.SimpleNamespace(device="npu")] * 2
+        commit_lens = FakeTensor(np.zeros(8, dtype=np.int32))
+
+        def prepare(self, *, capacity, state_table_width, request_mapping, device):
+            events.append(("prepare", capacity, state_table_width, request_mapping))
+            return list(range(capacity))
+
+    class _Builder:
+        num_spec = 3
+        _accepted_buffer = FakeTensor(np.zeros(8, dtype=np.int32))
+
+        def __init__(self):
+            self._ctx = _Ctx()
+
+        def _get_context(self):
+            return self._ctx
+
+    builder = _Builder()
+
+    class _Group:
+        def get_metadata_builder(self):
+            return builder
+
+    runner = types.SimpleNamespace(attn_groups=[[_Group()]])
+    worker = types.SimpleNamespace(model_runner=runner)
+
+    from gdn_recoverssm_ascend import startup_patch
+
+    startup_patch._prepare(worker)
+    assert events == [("prepare", 8, 4, True)], events
+
+    # unbound KV cache must fail the startup, not silently defer to the first request
+    class _Lazy(_Builder):
+        def _get_context(self):
+            return None
+
+    lazy = _Lazy()
+    group = types.SimpleNamespace(get_metadata_builder=lambda: lazy)
+    worker2 = types.SimpleNamespace(
+        model_runner=types.SimpleNamespace(attn_groups=[[group]])
+    )
+    try:
+        startup_patch._prepare(worker2)
+    except RuntimeError as exc:
+        assert "not bound" in str(exc), exc
+    else:
+        raise AssertionError("unbound KV cache must fail startup")
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()

@@ -73,11 +73,15 @@ def install() -> None:
         )
         return
 
-    from . import config_patch, graph_probe, layer_patch, state_patch
+    from . import config_patch, graph_probe, layer_patch, state_patch, startup_patch
 
     state_patch.install()
     config_patch.install()
     layer_patch.install()
+    try:
+        startup_patch.install()
+    except Exception as exc:  # no Recover builder on this build
+        logger.debug("gdn_recoverssm_ascend: startup preparation unavailable (%s)", exc)
     try:
         graph_probe.install()
     except Exception as exc:  # probing is optional

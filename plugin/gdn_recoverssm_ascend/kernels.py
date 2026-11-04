@@ -967,6 +967,67 @@ def _commit_gdn_state_kernel(
 
 
 @dataclass
+class _LaunchSpec:
+    """One kernel launch, shared by the serving path and startup preparation.
+
+    Both paths must use the identical kernel object, argument tuple, constexpr
+    inputs and options: the startup preparation exists to compile exactly what a
+    real step will launch, so any divergence would prepare a different variant.
+    """
+
+    kernel: Any
+    args: tuple
+    kwargs: dict
+    grid: tuple
+
+    def launch(self) -> None:
+        self.kernel[self.grid](*self.args, **self.kwargs)
+
+    def compile_only(self) -> Any:
+        """Compile + load this variant without launching it.
+
+        ``warmup=True`` builds and caches the CompiledKernel but skips the device
+        launch; ``_init_handles`` then performs the per-process binary/function
+        registration. A disk cache hit does not mean this worker has registered
+        the binary, and a failed registration can surface as zero handles rather
+        than an exception, so the handles are checked explicitly.
+        """
+        compiled = self.kernel.run(
+            *self.args, grid=self.grid, warmup=True, **self.kwargs
+        )
+        resolve = getattr(compiled, "result", None)
+        if callable(resolve):  # Future-like
+            compiled = resolve()
+        _init_handles(compiled)
+        _require_nonzero_handles(compiled, self.kernel)
+        return compiled
+
+
+def _init_handles(compiled: Any) -> None:
+    init = getattr(compiled, "_init_handles", None)
+    if init is None:
+        raise RuntimeError(
+            "This Triton build does not expose CompiledKernel._init_handles; "
+            "cannot verify that the commit kernel was registered on the device. "
+            "Refusing to report the RecoverSSM runtime as ready."
+        )
+    init()
+
+
+def _require_nonzero_handles(compiled: Any, kernel: Any) -> None:
+    # rtDevBinaryRegister / rtFunctionRegister can fail and hand back a null
+    # handle instead of raising, so "no exception" is not proof of success.
+    for name in ("module", "function"):
+        value = getattr(compiled, name, None)
+        if value is None or value == 0:
+            raise RuntimeError(
+                f"Triton kernel {getattr(kernel, '__name__', kernel)} did not "
+                f"register on the device ({name}={value!r}); refusing to report "
+                "the RecoverSSM runtime as ready"
+            )
+
+
+@dataclass
 class GDNRecoverSSMCommitContext:
     conv_states: tuple[torch.Tensor, ...]
     conv_state_base_addrs: torch.Tensor
@@ -1119,6 +1180,76 @@ class GDNRecoverSSMCommitContext:
             conv_dim_first=is_conv_state_dim_first(),
         )
 
+    def make_commit_specs(
+        self,
+        num_accepted_tokens: torch.Tensor,
+        state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        request_indices: torch.Tensor | None = None,
+        block_table: torch.Tensor | None = None,
+        num_computed_tokens: torch.Tensor | None = None,
+        mamba_block_size: int | None = None,
+        commit_conv: bool = True,
+    ) -> tuple:
+        """Build the launch specs for one step, without launching them.
+
+        The serving path and the startup preparation both call this, so the
+        prepared variants are exactly the ones a real step will use.
+        """
+        specs: list[_LaunchSpec] = []
+        self.commit(
+            num_accepted_tokens,
+            state_indices,
+            query_start_loc,
+            request_indices=request_indices,
+            block_table=block_table,
+            num_computed_tokens=num_computed_tokens,
+            mamba_block_size=mamba_block_size,
+            commit_conv=commit_conv,
+            _collect=specs,
+        )
+        return tuple(specs)
+
+    def prepare(
+        self,
+        *,
+        capacity: int,
+        state_table_width: int,
+        request_mapping: bool,
+        device: torch.device,
+    ) -> list[int]:
+        """Compile + register every commit variant the serving path can launch.
+
+        ``capacity`` is the largest speculative row count (the plan buffer size).
+        The dummy inputs mirror the real sources' dtype/stride/layout -- notably
+        ``state_indices`` is a column view of a two-dimensional table, so its
+        stride is the table width, not 1. Nothing is launched: only compilation
+        and device registration happen here.
+        """
+        compiled_rows: list[int] = []
+        for rows in range(1, capacity + 1):
+            table = torch.zeros(
+                (rows, state_table_width), dtype=torch.int32, device=device
+            )
+            state_indices = table[:, 0]
+            qsl = torch.zeros(rows + 1, dtype=torch.int32, device=device)
+            accepted = torch.zeros(rows, dtype=torch.int32, device=device)
+            mapping = (
+                torch.arange(rows, dtype=torch.int32, device=device)
+                if request_mapping
+                else None
+            )
+            specs = self.make_commit_specs(
+                accepted,
+                state_indices,
+                qsl,
+                request_indices=mapping,
+            )
+            for spec in specs:
+                spec.compile_only()
+            compiled_rows.append(rows)
+        return compiled_rows
+
     def commit(
         self,
         num_accepted_tokens: torch.Tensor,
@@ -1129,8 +1260,16 @@ class GDNRecoverSSMCommitContext:
         num_computed_tokens: torch.Tensor | None = None,
         mamba_block_size: int | None = None,
         commit_conv: bool = True,
+        _collect: list | None = None,
     ) -> None:
-        """Fold accepted GDN and convolution inputs into every layer's checkpoint."""
+        """Fold accepted GDN and convolution inputs into every layer's checkpoint.
+
+        ``_collect`` is startup-preparation only: when a list is passed, the exact
+        same launch specs are appended to it instead of being launched. That keeps
+        one construction path for serving and for compilation, which is the whole
+        point -- a separately written "prepare" path would compile a different
+        variant as soon as the two drift apart.
+        """
         batch = state_indices.shape[0]
         if batch == 0:
             return
@@ -1180,32 +1319,47 @@ class GDNRecoverSSMCommitContext:
             "commit inputs must be on the same device",
         )
         bt_stride = (0, 0) if block_table is None else block_table.stride()
-        _prepare_commit_plan_kernel[(batch,)](
-            num_accepted_tokens,
-            request_indices,
-            state_indices,
-            query_start_loc,
-            block_table,
-            num_computed_tokens,
-            self.commit_lens,
-            self.final_state_indices,
-            self.boundary_state_indices,
-            self.boundary_recovery_lens,
-            NULL_BLOCK_ID,
-            mamba_block_size or 1,
-            block_table.shape[1] if block_table is not None else 1,
-            num_accepted_tokens.stride(0),
-            request_indices.stride(0) if request_indices is not None else 0,
-            state_indices.stride(0),
-            query_start_loc.stride(0),
-            bt_stride[0],
-            bt_stride[1],
-            0 if num_computed_tokens is None else num_computed_tokens.stride(0),
-            SPEC_QUERY_LEN=self.spec_query_len,
-            NUM_BLOCKS=self.num_blocks,
-            num_warps=1,
+        plan_spec = _LaunchSpec(
+            kernel=_prepare_commit_plan_kernel,
+            args=(
+                num_accepted_tokens,
+                request_indices,
+                state_indices,
+                query_start_loc,
+                block_table,
+                num_computed_tokens,
+                self.commit_lens,
+                self.final_state_indices,
+                self.boundary_state_indices,
+                self.boundary_recovery_lens,
+                NULL_BLOCK_ID,
+                mamba_block_size or 1,
+                block_table.shape[1] if block_table is not None else 1,
+                num_accepted_tokens.stride(0),
+                request_indices.stride(0) if request_indices is not None else 0,
+                state_indices.stride(0),
+                query_start_loc.stride(0),
+                bt_stride[0],
+                bt_stride[1],
+                (
+                    0
+                    if num_computed_tokens is None
+                    else num_computed_tokens.stride(0)
+                ),
+            ),
+            kwargs={
+                "SPEC_QUERY_LEN": self.spec_query_len,
+                "NUM_BLOCKS": self.num_blocks,
+                "num_warps": 1,
+            },
+            grid=(batch,),
         )
+        if _collect is not None:
+            _collect.append(plan_spec)
+        else:
+            plan_spec.launch()
         num_layers = len(self.checkpoints)
+        conv_spec = None
         if commit_conv:
             conv_ref = self.conv_states[0]
             conv_dim = conv_ref.shape[1]
@@ -1215,30 +1369,40 @@ class GDNRecoverSSMCommitContext:
             conv_block_d = _conv_dim_tile(block_history)
             num_d_tiles = triton.cdiv(conv_dim, conv_block_d)
             conv_work = num_d_tiles * batch * num_layers
-            _compact_conv_state_kernel[(min(conv_work, _launch_cap()),)](
+            conv_spec = _LaunchSpec(
+                kernel=_compact_conv_state_kernel,
+                grid=(min(conv_work, _launch_cap()),),
+                args=(
                 conv_ref,
                 self.conv_state_base_addrs,
                 self.conv_state_block_strides,
                 self.conv_state_dim_strides,
                 self.conv_state_token_strides,
-                state_indices,
-                self.commit_lens,
-                self.final_state_indices,
-                self.boundary_state_indices,
-                self.boundary_recovery_lens,
-                NULL_BLOCK_ID,
-                batch,
-                conv_work,
-                conv_dim,
-                self.conv_history_len,
-                state_indices.stride(0),
-                BLOCK_D=conv_block_d,
-                BLOCK_HISTORY=block_history,
-                ALIGN_MODE=block_table is not None,
-                NUM_BLOCKS=self.num_blocks,
-                NUM_D_TILES=num_d_tiles,
-                num_warps=4,
+                    state_indices,
+                    self.commit_lens,
+                    self.final_state_indices,
+                    self.boundary_state_indices,
+                    self.boundary_recovery_lens,
+                    NULL_BLOCK_ID,
+                    batch,
+                    conv_work,
+                    conv_dim,
+                    self.conv_history_len,
+                    state_indices.stride(0),
+                ),
+                kwargs={
+                    "BLOCK_D": conv_block_d,
+                    "BLOCK_HISTORY": block_history,
+                    "ALIGN_MODE": block_table is not None,
+                    "NUM_BLOCKS": self.num_blocks,
+                    "NUM_D_TILES": num_d_tiles,
+                    "num_warps": 4,
+                },
             )
+            if _collect is not None:
+                _collect.append(conv_spec)
+            else:
+                conv_spec.launch()
         ref = self.checkpoints[0]
         _, HV, V, K = ref.shape
         BK = triton.next_power_of_2(K)
@@ -1277,17 +1441,30 @@ class GDNRecoverSSMCommitContext:
         # One launch per layer set: the final and the boundary state come out of a
         # single fold over one checkpoint load. The physical grid stays bounded;
         # each program walks several logical tiles.
-        _commit_gdn_state_kernel[(min(num_work, _launch_cap()),)](
-            *args,
-            K=K,
-            V=V,
-            BK=BK,
-            BV=BV,
-            NUM_HEADS=HV,
-            NUM_BLOCKS=self.num_blocks,
-            NUM_VALUE_TILES=num_value_tiles,
-            num_warps=4,
-            num_stages=2,
+        commit_spec = _LaunchSpec(
+            kernel=_commit_gdn_state_kernel,
+            grid=(min(num_work, _launch_cap()),),
+            args=args,
+            kwargs={
+                "K": K,
+                "V": V,
+                "BK": BK,
+                "BV": BV,
+                "NUM_HEADS": HV,
+                "NUM_BLOCKS": self.num_blocks,
+                "NUM_VALUE_TILES": num_value_tiles,
+                "num_warps": 4,
+                "num_stages": 2,
+            },
+        )
+        if _collect is not None:
+            _collect.append(commit_spec)
+        else:
+            commit_spec.launch()
+        self._last_specs = (
+            (plan_spec,)
+            + ((conv_spec,) if conv_spec is not None else ())
+            + (commit_spec,)
         )
 
 
