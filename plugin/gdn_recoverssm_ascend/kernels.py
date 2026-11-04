@@ -1240,6 +1240,9 @@ class GDNRecoverSSMCommitContext:
         BV = _commit_value_tile(BK, V)
         rr = self.replays[0]
         align = block_table is not None
+        # Must be computed before the argument tuple that consumes them.
+        num_value_tiles = triton.cdiv(V, BV)
+        num_work = num_value_tiles * batch * (num_layers * HV)
         args = (
             ref,
             self.state_base_addrs,
@@ -1263,8 +1266,6 @@ class GDNRecoverSSMCommitContext:
             rr.stride(3),
             state_indices.stride(0),
         )
-        num_value_tiles = triton.cdiv(V, BV)
-        num_work = num_value_tiles * batch * (num_layers * HV)
         # One launch per layer set: the final and the boundary state come out of a
         # single fold over one checkpoint load. The physical grid stays bounded;
         # each program walks several logical tiles.

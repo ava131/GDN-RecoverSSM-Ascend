@@ -88,13 +88,54 @@ def check() -> list[str]:
     return problems
 
 
+def check_local_use_before_assignment() -> list[str]:
+    """Catch ``UnboundLocalError`` patterns statically.
+
+    A name that is assigned somewhere in a function is local for the whole
+    function, so reading it before the first assignment raises at runtime. That
+    is exactly how ``num_work`` crashed the commit path. Only names that are
+    assigned *inside* the same function are considered, so outer-scope and
+    imported names are ignored.
+    """
+    tree = ast.parse(KERNELS.read_text())
+    problems: list[str] = []
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        assigned: dict[str, int] = {}
+        for node in ast.walk(fn):
+            targets = []
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                targets = [node.target]
+            for target in targets:
+                for leaf in ast.walk(target):
+                    if isinstance(leaf, ast.Name) and leaf.id not in assigned:
+                        assigned[leaf.id] = node.lineno
+            # ``for`` / comprehension targets bind in their own scope, so they
+            # are not function-local in the sense that matters here.
+        params = {a.arg for a in fn.args.args} | {a.arg for a in fn.args.kwonlyargs}
+        loads: dict[str, int] = {}
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                loads.setdefault(node.id, node.lineno)
+        for name, load_line in loads.items():
+            if name in params or name not in assigned:
+                continue
+            if load_line < assigned[name]:
+                problems.append(
+                    f"{fn.name}: '{name}' read at line {load_line} but first "
+                    f"assigned at line {assigned[name]} (UnboundLocalError)"
+                )
+    return problems
+
+
 def test_kernel_launch_contract() -> None:
-    problems = check()
+    problems = check() + check_local_use_before_assignment()
     assert not problems, "\n".join(problems)
 
 
 if __name__ == "__main__":
-    issues = check()
+    issues = check() + check_local_use_before_assignment()
     for issue in issues:
         print("FAIL", issue)
     assert not issues, "kernel launch contract violated"
