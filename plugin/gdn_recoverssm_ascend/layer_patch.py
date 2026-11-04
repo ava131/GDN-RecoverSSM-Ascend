@@ -225,57 +225,35 @@ def _env_flag(name: str) -> bool:
 def _trace_step(layer, attn_metadata, rows, total, query_start_loc, checkpoint_indices):
     """One line per speculative step for the first few steps of the process.
 
-    This is the "is RecoverSSM live on this request?" signal, and it also prints
-    the exact window geometry, which is what pins down an out-of-bounds crash.
-    The few ``.item()`` calls are bounded by ``GDN_RECOVERSSM_TRACE_STEPS``
-    (default 3, 0 disables) and never run on the steady-state hot path.
+    This is the "is RecoverSSM live on this request?" signal.
+
+    It deliberately touches **no device data**: every field below is a Python
+    integer already sitting in the metadata. An earlier version printed
+    ``query_start_loc[-1].item()`` and the state-index range, and those forced a
+    host synchronisation inside the model forward. During graph capture that is
+    illegal and produced a captured graph that only failed much later, at replay
+    ("AclmdlRIExecuteAsync ... Build SQ&CQ failed"). ``is_current_stream_capturing``
+    is not a reliable guard on the ACLGraph path, so the sync is simply gone.
     """
     if _is_capturing():
-        # ``.item()`` forces a host sync, which is illegal while a graph is being
-        # captured: it can truncate or corrupt the captured task list, and the
-        # failure only shows up later as a replay error. Stay completely silent
-        # and do not consume a trace slot.
         return
     limit = int(os.getenv("GDN_RECOVERSSM_TRACE_STEPS", "3") or "0")
     if limit <= 0 or _TRACE["steps"] >= limit:
         return
     _TRACE["steps"] += 1
-    try:
-        tail = int(query_start_loc[-1].item())
-        lo = int(checkpoint_indices.min().item()) if rows else -1
-        hi = int(checkpoint_indices.max().item()) if rows else -1
-    except Exception:  # telemetry must never break a request
-        return
     num_prefills = int(getattr(attn_metadata, "num_prefills", 0))
     num_decodes = int(getattr(attn_metadata, "num_decodes", 0))
     logger.info(
         "Ascend GDN RecoverSSM step %d: prefill=%d decode=%d spec_rows=%d "
-        "window=%d tokens=%d qsl_tail=%d state_idx=[%d..%d] cache_mode=%s",
+        "window=%d tokens=%d cache_mode=%s",
         _TRACE["steps"],
         num_prefills,
         num_decodes,
         rows,
         layer.num_spec + 1,
         total,
-        tail,
-        lo,
-        hi,
-        getattr(layer.cache_config, "mamba_cache_mode", "?"),
+        getattr(getattr(layer, "cache_config", None), "mamba_cache_mode", "?"),
     )
-    if tail != total:
-        # Geometry mismatch is exactly the precondition for an out-of-bounds
-        # kernel access; say it out loud instead of trusting a mask.
-        logger.warning(
-            "Ascend GDN RecoverSSM: spec_query_start_loc ends at %d but the "
-            "activation tensors hold %d tokens (prefill=%d decode=%d rows=%d). "
-            "This mismatch is what turns into 'MTE accesses an invalid GM "
-            "address'.",
-            tail,
-            total,
-            num_prefills,
-            num_decodes,
-            rows,
-        )
 
 
 def _verify(layer, q, k, v, ssm_state, kwargs):
