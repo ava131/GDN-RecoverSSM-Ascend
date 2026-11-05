@@ -71,6 +71,9 @@ Notes:
 ## Kill switch
 
 ```bash
+# 必须关掉异步调度（注意：删掉 --async-scheduling 不等于关，值会是 None 并被自动解析成 True）
+#   --no-async-scheduling
+
 # 真正的原生基线必须**同时**去掉 --use-replayssm：
 # 只设这个变量时插件入口直接返回，上游 validator 随后会因 Qwen 架构
 # 不支持而拒绝启动（ValueError）。
