@@ -100,19 +100,12 @@ def _log_runtime_flags(worker) -> None:
         cls_name,
     )
     if enabled:
-        # Observed on A2 / CANN 9.1: with async scheduling the host runs ahead and
-        # a graph that is executed for the FIRST time fails inside
-        # CaptureModel::BuildSqCq -> SendSqe -> halStreamTaskFill (drvRetCode=17,
-        # surfaced as 507899 by the next synchronize). The same workload with
-        # --no-async-scheduling replays that very graph without error and at the
-        # same throughput, so the asynchronous host run-ahead is the trigger.
-        # Failing at startup is much better than failing mid-serving.
-        raise RuntimeError(
-            "Ascend GDN RecoverSSM requires synchronous scheduling: run with "
-            "--no-async-scheduling. With async scheduling enabled a first-use "
-            "full-graph replay fails in BuildSqCq (507899), and deleting the "
-            "--async-scheduling flag does NOT disable it (the value stays None "
-            "and vLLM resolves it to True)."
+        # Async scheduling is supported: the plugin drains the device once before a
+        # graph's first execute (see graph_probe), which is where BuildSqCq used to
+        # fail. Kept as an INFO so the effective setting is never a mystery.
+        logger.info(
+            "Ascend GDN RecoverSSM: async scheduling is enabled; the first "
+            "execute of each captured graph is preceded by one device drain"
         )
 
 

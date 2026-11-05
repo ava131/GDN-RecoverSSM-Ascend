@@ -665,6 +665,60 @@ def test_startup_preparation_runs_before_warmup():
         raise AssertionError("unbound KV cache must fail startup")
 
 
+def test_first_execute_drains_device_once():
+    """A graph's first execute must be preceded by exactly one device drain."""
+    _install_torch_stub()
+    _install_vllm_stubs()
+
+    synced = {"n": 0}
+    torch_mod = sys.modules["torch"]
+    torch_mod.npu = types.SimpleNamespace(
+        synchronize=lambda: synced.__setitem__("n", synced["n"] + 1),
+        current_stream=lambda: types.SimpleNamespace(synchronize=lambda: None),
+    )
+    try:
+        calls = {"replay": 0}
+
+        class _Graph:
+            tasks = (1, 2)
+
+        class ModelAclGraphManager:
+            def __init__(self):
+                self.graphs = {}
+
+            def _updatable_graph_replay(self, desc, attn_metadata):
+                calls["replay"] += 1
+                return "ok"
+
+        acl = types.ModuleType("vllm_ascend.worker.v2.aclgraph_utils")
+        acl.ModelAclGraphManager = ModelAclGraphManager
+        sys.modules["vllm_ascend.worker.v2.aclgraph_utils"] = acl
+
+        from gdn_recoverssm_ascend import graph_probe
+
+        graph_probe._APPLIED = False
+        graph_probe._SEEN.clear()
+        graph_probe._FAILED.clear()
+        graph_probe.install()
+
+        class _Desc:
+            num_tokens = 8
+            num_reqs = 2
+
+        desc = _Desc()
+        mgr = ModelAclGraphManager()
+        mgr.graphs[desc] = _Graph()
+
+        for _ in range(4):
+            assert mgr._updatable_graph_replay(desc, None) == "ok"
+
+        assert calls["replay"] == 4
+        # exactly one drain, on the first execute only
+        assert synced["n"] == 1, synced
+    finally:
+        torch_mod.npu = None
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()
