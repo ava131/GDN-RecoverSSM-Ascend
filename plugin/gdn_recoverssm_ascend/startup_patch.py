@@ -75,7 +75,33 @@ def _iter_builders(model_runner):
             yield builder
 
 
+def _log_runtime_flags(worker) -> None:
+    """Record the FINAL config values, not what the command line looked like.
+
+    ``--async-scheduling`` is a BooleanOptionalAction: omitting it leaves the
+    value at ``None``, which VllmConfig may resolve to ``True``. Deleting the flag
+    is therefore not a way to disable it, and ``--async-scheduling false`` is
+    rejected by argparse. Logging the resolved value (and the scheduler class it
+    selected) is the only reliable record.
+    """
+    config = getattr(worker, "vllm_config", None)
+    scheduler = getattr(config, "scheduler_config", None)
+    if scheduler is None:
+        return
+    try:
+        cls_name = scheduler.get_scheduler_cls().__name__
+    except Exception as exc:  # pragma: no cover - defensive
+        cls_name = f"<unavailable: {exc}>"
+    logger.info(
+        "Ascend GDN RecoverSSM: async_scheduling=%s (raw=%s) scheduler_cls=%s",
+        bool(scheduler.async_scheduling),
+        scheduler.async_scheduling,
+        cls_name,
+    )
+
+
 def _prepare(worker) -> None:
+    _log_runtime_flags(worker)
     model_runner = getattr(worker, "model_runner", None)
     if model_runner is None:
         return
