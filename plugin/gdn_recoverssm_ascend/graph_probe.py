@@ -47,9 +47,9 @@ def install() -> None:
     @functools.wraps(original)
     def _updatable_graph_replay(self, desc, attn_metadata):
         try:
-            first_time = _log_replay_attempt(self, desc)
+            _log_replay_attempt(self, desc)
         except Exception:  # probing must never break a request
-            first_time = False
+            pass
         key = _describe(desc)
         first = _FAILED.get(key)
         if first is not None:
@@ -60,8 +60,6 @@ def install() -> None:
                 f"{key} already failed once ({first}); the graph is treated as "
                 "unusable and must be re-captured"
             )
-        if first_time:
-            _drain_before_first_execute(desc)
         try:
             return original(self, desc, attn_metadata)
         except Exception as exc:
@@ -112,31 +110,7 @@ def _describe(desc) -> str:
     return ",".join(parts) if parts else repr(desc)
 
 
-def _drain_before_first_execute(desc) -> None:
-    """Let the device finish before a graph is executed for the first time.
-
-    ``CaptureModel::BuildSqCq`` builds the queue pair **lazily, on a model's first
-    execute**, and fills the model's task list into it in one go. When the host
-    has run ahead (async scheduling) that queue is already busy, and the fill
-    fails with ``drvRetCode=17`` / ``halStreamTaskFill``; the next synchronize then
-    surfaces it as 507899. Draining once, on the first execute of each captured
-    graph only, removes that precondition while leaving every steady-state step
-    fully asynchronous.
-    """
-    try:
-        import torch
-
-        npu = getattr(torch, "npu", None)
-        if npu is not None and hasattr(npu, "synchronize"):
-            npu.synchronize()
-        else:  # pragma: no cover - defensive
-            torch.npu.current_stream().synchronize()
-        logger.info("Ascend full-graph replay: drained device before first execute of %s", _describe(desc))
-    except Exception as exc:  # never break a request on a diagnostic
-        logger.warning("Ascend full-graph replay: pre-drain skipped (%s)", exc)
-
-
-def _log_replay_attempt(manager, desc) -> bool:
+def _log_replay_attempt(manager, desc) -> None:
     key = _describe(desc)
     state = _SEEN.get(key)
     if state is None:
@@ -149,7 +123,6 @@ def _log_replay_attempt(manager, desc) -> bool:
             state["tasks"] = len(tasks) if tasks is not None else None
         except Exception:
             pass
-    first_time = state["count"] == 0
     state["count"] += 1
     # First few attempts per descriptor, and every 20th afterwards: enough to see
     # accumulation without flooding a serving log.
@@ -174,4 +147,3 @@ def _log_replay_attempt(manager, desc) -> bool:
             counters.get("last_rows", "?"),
             counters.get("last_tokens", "?"),
         )
-    return first_time

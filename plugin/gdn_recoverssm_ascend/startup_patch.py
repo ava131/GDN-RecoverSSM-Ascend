@@ -100,12 +100,27 @@ def _log_runtime_flags(worker) -> None:
         cls_name,
     )
     if enabled:
-        # Async scheduling is supported: the plugin drains the device once before a
-        # graph's first execute (see graph_probe), which is where BuildSqCq used to
-        # fail. Kept as an INFO so the effective setting is never a mystery.
-        logger.info(
-            "Ascend GDN RecoverSSM: async scheduling is enabled; the first "
-            "execute of each captured graph is preceded by one device drain"
+        # Honest state of affairs: asynchronous scheduling is NOT validated for
+        # this plugin. With it on, a full-graph replay that builds its queue pair
+        # for the first time fails inside CaptureModel::BuildSqCq ->
+        # SendSqe -> halStreamTaskFill (driver 17, surfaced as 507899 by the next
+        # synchronize). Two candidate explanations have already been tested and
+        # disproven on the machine:
+        #   * queue backlog -- an explicit device synchronise right before that
+        #     first execute did not help;
+        #   * a per-batch execution stream -- the worker processes model RPCs
+        #     FIFO on one runner, and NPUGraph documents that a model RI may be
+        #     replayed on any stream.
+        # The driver error we can see is a wrapped ioctl failure, so the failing
+        # inner condition is still unknown. Refusing to start beats crashing in
+        # the middle of a request, and keeps us from presenting "disable async"
+        # as if asynchronous support existed.
+        raise RuntimeError(
+            "Ascend GDN RecoverSSM does not support asynchronous scheduling yet; "
+            "start the server with --no-async-scheduling. (Omitting the flag is "
+            "not enough: SchedulerConfig.async_scheduling stays None and vLLM "
+            "resolves it to True, and '--async-scheduling false' is rejected by "
+            "argparse because the option is a BooleanOptionalAction.)"
         )
 
 

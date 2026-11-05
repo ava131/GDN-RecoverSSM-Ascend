@@ -665,8 +665,12 @@ def test_startup_preparation_runs_before_warmup():
         raise AssertionError("unbound KV cache must fail startup")
 
 
-def test_first_execute_drains_device_once():
-    """A graph's first execute must be preceded by exactly one device drain."""
+def test_replay_probe_does_not_touch_the_device():
+    """The probe must stay host-only: it once added a drain that changed nothing.
+
+    A device synchronise before a graph's first execute was tried on the machine
+    and did not prevent the BuildSqCq failure, so the probe must not call one.
+    """
     _install_torch_stub()
     _install_vllm_stubs()
 
@@ -674,7 +678,6 @@ def test_first_execute_drains_device_once():
     torch_mod = sys.modules["torch"]
     torch_mod.npu = types.SimpleNamespace(
         synchronize=lambda: synced.__setitem__("n", synced["n"] + 1),
-        current_stream=lambda: types.SimpleNamespace(synchronize=lambda: None),
     )
     try:
         calls = {"replay": 0}
@@ -709,12 +712,11 @@ def test_first_execute_drains_device_once():
         mgr = ModelAclGraphManager()
         mgr.graphs[desc] = _Graph()
 
-        for _ in range(4):
+        for _ in range(3):
             assert mgr._updatable_graph_replay(desc, None) == "ok"
 
-        assert calls["replay"] == 4
-        # exactly one drain, on the first execute only
-        assert synced["n"] == 1, synced
+        assert calls["replay"] == 3
+        assert synced["n"] == 0, synced
     finally:
         torch_mod.npu = None
 
