@@ -220,6 +220,12 @@ def install() -> None:
     @functools.wraps(original_prepare_attn)
     def prepare_attn(self, *args, **kwargs):
         attn_metadata = original_prepare_attn(self, *args, **kwargs)
+        try:
+            from . import graph_probe
+
+            graph_probe.remember_metadata(self, args, kwargs, attn_metadata)
+        except Exception:
+            pass
         recoverssm = getattr(self, "recoverssm", None)
         if recoverssm is None:
             return attn_metadata

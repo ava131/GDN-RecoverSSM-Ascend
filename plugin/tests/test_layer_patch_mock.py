@@ -792,6 +792,64 @@ def test_first_execute_failure_is_retried_once():
         torch_mod.npu = None
 
 
+def test_warmup_uses_the_normal_path_with_recorded_metadata():
+    """Each captured graph is executed once via run_fullgraph, with its metadata.
+
+    A raw graph.replay() deadlocks (cross-rank work driven by external events), so
+    the warmup must go through run_fullgraph and must restore attn_metadata.
+    """
+    _install_torch_stub()
+    _install_vllm_stubs()
+    torch_mod = sys.modules["torch"]
+    torch_mod.npu = types.SimpleNamespace(synchronize=lambda: None)
+    try:
+        from gdn_recoverssm_ascend import graph_probe
+
+        graph_probe._CAPTURE_META.clear()
+
+        class _Desc:
+            def __init__(self, tokens, reqs):
+                self.num_tokens = tokens
+                self.num_reqs = reqs
+
+        class _State:
+            attn_metadata = "original"
+
+        replayed = []
+
+        class _Manager:
+            def __init__(self):
+                self.model_runner = types.SimpleNamespace(model_state=_State())
+                self.graphs = {}
+
+            def run_fullgraph(self, desc):
+                replayed.append((desc.num_tokens, desc.num_reqs))
+                assert self.model_runner.model_state.attn_metadata == (
+                    "meta-%d-%d" % (desc.num_tokens, desc.num_reqs)
+                )
+                return "ok"
+
+        mgr = _Manager()
+        d4, d8, d64 = _Desc(4, 1), _Desc(8, 2), _Desc(64, 16)
+        for d in (d4, d8, d64):
+            mgr.graphs[d] = object()
+            graph_probe._CAPTURE_META[(d.num_tokens, d.num_reqs)] = (
+                "meta-%d-%d" % (d.num_tokens, d.num_reqs)
+            )
+
+        graph_probe._warm_captured_graphs(mgr)
+        assert replayed == [(4, 1), (8, 2), (64, 16)], replayed
+        assert mgr.model_runner.model_state.attn_metadata == "original"
+
+        # a shape without recorded metadata is skipped, never guessed
+        replayed.clear()
+        mgr.graphs[_Desc(12, 3)] = object()
+        graph_probe._warm_captured_graphs(mgr)
+        assert replayed == [(4, 1), (8, 2), (64, 16)], replayed
+    finally:
+        torch_mod.npu = None
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()

@@ -33,6 +33,22 @@ _APPLIED = False
 _SEEN: dict = {}
 _FAILED: dict = {}
 _RETRIED: set = set()
+# (num_tokens, num_reqs) -> the attention metadata that was live for that batch
+# shape. ``prepare_attn`` sees every capture-time metadata, so the shapes captured
+# for FULL replay are all recorded here; replaying a graph needs exactly this.
+_CAPTURE_META: dict = {}
+
+
+def remember_metadata(state, args, kwargs, attn_metadata) -> None:
+    """Remember the metadata a capture-time forward was built with."""
+    batch = args[0] if args else kwargs.get("input_batch")
+    if batch is None or attn_metadata is None:
+        return
+    tokens = getattr(batch, "num_tokens", None)
+    reqs = getattr(batch, "num_reqs", None)
+    if tokens is None or reqs is None:
+        return
+    _CAPTURE_META[(int(tokens), int(reqs))] = attn_metadata
 
 
 def _drain_device() -> None:
@@ -129,10 +145,65 @@ def install() -> None:
             )
         except Exception:
             pass
+        try:
+            _warm_captured_graphs(self)
+        except Exception as exc:  # a warmup problem must not kill startup
+            logger.warning("Ascend full-graph warmup incomplete (%s)", exc)
         return result
 
     cls.capture = capture
     _APPLIED = True
+
+
+def _warm_captured_graphs(manager) -> None:
+    """Execute every captured graph once, before serving, through the normal path.
+
+    ``CaptureModel::BuildSqCq`` builds a model's queue pair lazily on its FIRST
+    execute and fills the whole task list in that same call. Once the pair exists
+    the branch is never taken again, which is why only first executes ever failed.
+    Under asynchronous scheduling that first execute overlaps the next batch's
+    submission and the fill is refused; with a slow host (INFO logging) it lands
+    in an idle moment and succeeds.
+
+    A raw ``graph.replay()`` is NOT usable here: the captured task list contains
+    cross-rank work driven by external events that only the normal path resolves,
+    and replaying it directly deadlocks (observed on the machine). Going through
+    ``run_fullgraph`` keeps resolve_tasks/update in the loop, and ``prepare_attn``
+    recorded the exact metadata each of these shapes was captured with.
+    """
+    graphs = getattr(manager, "graphs", None)
+    model_state = getattr(getattr(manager, "model_runner", None), "model_state", None)
+    if not graphs or model_state is None:
+        return
+    done = skipped = 0
+    for desc, _graph in list(graphs.items()):
+        key = (
+            int(getattr(desc, "num_tokens", -1)),
+            int(getattr(desc, "num_reqs", -1)),
+        )
+        meta = _CAPTURE_META.get(key)
+        if meta is None:
+            skipped += 1
+            continue
+        saved = getattr(model_state, "attn_metadata", None)
+        model_state.attn_metadata = meta
+        try:
+            manager.run_fullgraph(desc)
+        finally:
+            model_state.attn_metadata = saved
+        done += 1
+    try:
+        import torch
+
+        torch.npu.synchronize()
+    except Exception:
+        pass
+    logger.info(
+        "Ascend full-graph warmup: executed %d captured graphs before serving "
+        "(%d without recorded metadata); queue construction is done",
+        done,
+        skipped,
+    )
 
 
 def _describe(desc) -> str:
