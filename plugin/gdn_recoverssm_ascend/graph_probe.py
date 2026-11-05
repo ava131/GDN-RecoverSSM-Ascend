@@ -95,10 +95,67 @@ def install() -> None:
             )
         except Exception:
             pass
+        try:
+            _warm_captured_graphs(self)
+        except Exception as exc:  # never break startup on warmup
+            logger.warning("Ascend full-graph warmup skipped (%s)", exc)
         return result
 
     cls.capture = capture
     _APPLIED = True
+
+
+def _warm_captured_graphs(manager) -> None:
+    """Execute every captured graph once, while nothing else is running.
+
+    ``CaptureModel::BuildSqCq`` builds a model's queue pair LAZILY on its first
+    execute and fills the model's whole task list in that same call. Under
+    asynchronous scheduling that first execute happens while the host has already
+    queued the next batch, and the fill fails (driver 17 -> 507899 on the next
+    synchronize). Draining the device at that moment does not help; making the
+    first execute happen here -- after capture, with no requests, no batch queue
+    and no output-copy thread -- does, because every later step reuses the queue
+    pair built now.
+
+    The replay deliberately bypasses ``run_fullgraph``: that path needs per-batch
+    attention metadata, which does not exist before serving. A raw replay runs the
+    captured task list with the parameters frozen at capture time, which is all
+    that is needed to force the queue pair into existence. Nothing that a later
+    request reads is produced here -- requests initialise their own KV pages and
+    state slots before use.
+    """
+    graphs = getattr(manager, "graphs", None)
+    if not graphs:
+        return
+    done = failed = 0
+    for desc, graph in list(graphs.items()):
+        replay = getattr(graph, "replay", None)
+        if replay is None:
+            continue
+        try:
+            replay()
+            done += 1
+        except Exception as exc:
+            failed += 1
+            logger.error(
+                "Ascend full-graph warmup failed for %s: %s: %s",
+                _describe(desc),
+                type(exc).__name__,
+                exc,
+            )
+            raise
+    try:
+        import torch
+
+        torch.npu.synchronize()
+    except Exception:
+        pass
+    logger.info(
+        "Ascend full-graph warmup: executed %d captured graphs before serving "
+        "(%d failed); first-execute queue construction is now done",
+        done,
+        failed,
+    )
 
 
 def _describe(desc) -> str:

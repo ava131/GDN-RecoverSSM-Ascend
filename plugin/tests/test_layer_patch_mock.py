@@ -721,6 +721,74 @@ def test_replay_probe_does_not_touch_the_device():
         torch_mod.npu = None
 
 
+def test_captured_graphs_are_executed_before_serving():
+    """Every captured graph must be executed once, right after capture.
+
+    ``BuildSqCq`` builds a model's queue pair on its first execute; doing that
+    while serving (async scheduling queues the next batch already) is what failed
+    on the machine. Executing each graph once after capture moves that setup into
+    startup.
+    """
+    _install_torch_stub()
+    _install_vllm_stubs()
+
+    synced = {"n": 0}
+    torch_mod = sys.modules["torch"]
+    torch_mod.npu = types.SimpleNamespace(
+        synchronize=lambda: synced.__setitem__("n", synced["n"] + 1),
+    )
+    try:
+        replayed = []
+
+        class _Graph:
+            def __init__(self, name):
+                self.name = name
+
+            def replay(self):
+                replayed.append(self.name)
+
+        class _Desc:
+            def __init__(self, tokens, reqs):
+                self.num_tokens = tokens
+                self.num_reqs = reqs
+
+        class ModelAclGraphManager:
+            def __init__(self):
+                self.graphs = {}
+
+        acl = types.ModuleType("vllm_ascend.worker.v2.aclgraph_utils")
+        acl.ModelAclGraphManager = ModelAclGraphManager
+        sys.modules["vllm_ascend.worker.v2.aclgraph_utils"] = acl
+
+        from gdn_recoverssm_ascend import graph_probe
+
+        mgr = ModelAclGraphManager()
+        mgr.graphs[_Desc(4, 1)] = _Graph("g4")
+        mgr.graphs[_Desc(8, 2)] = _Graph("g8")
+        mgr.graphs[_Desc(64, 16)] = _Graph("g64")
+
+        graph_probe._APPLY_OFF = False
+        graph_probe._warm_captured_graphs(mgr)
+
+        assert replayed == ["g4", "g8", "g64"], replayed
+        assert synced["n"] == 1, synced
+
+        # a failure must not be swallowed: it means one graph cannot be executed
+        class _Bad:
+            def replay(self):
+                raise RuntimeError("boom")
+
+        mgr.graphs[_Desc(12, 3)] = _Bad()
+        try:
+            graph_probe._warm_captured_graphs(mgr)
+        except RuntimeError as exc:
+            assert "boom" in str(exc)
+        else:
+            raise AssertionError("a graph that cannot be executed must be reported")
+    finally:
+        torch_mod.npu = None
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()

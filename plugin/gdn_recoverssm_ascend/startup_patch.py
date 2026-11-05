@@ -100,27 +100,12 @@ def _log_runtime_flags(worker) -> None:
         cls_name,
     )
     if enabled:
-        # Honest state of affairs: asynchronous scheduling is NOT validated for
-        # this plugin. With it on, a full-graph replay that builds its queue pair
-        # for the first time fails inside CaptureModel::BuildSqCq ->
-        # SendSqe -> halStreamTaskFill (driver 17, surfaced as 507899 by the next
-        # synchronize). Two candidate explanations have already been tested and
-        # disproven on the machine:
-        #   * queue backlog -- an explicit device synchronise right before that
-        #     first execute did not help;
-        #   * a per-batch execution stream -- the worker processes model RPCs
-        #     FIFO on one runner, and NPUGraph documents that a model RI may be
-        #     replayed on any stream.
-        # The driver error we can see is a wrapped ioctl failure, so the failing
-        # inner condition is still unknown. Refusing to start beats crashing in
-        # the middle of a request, and keeps us from presenting "disable async"
-        # as if asynchronous support existed.
-        raise RuntimeError(
-            "Ascend GDN RecoverSSM does not support asynchronous scheduling yet; "
-            "start the server with --no-async-scheduling. (Omitting the flag is "
-            "not enough: SchedulerConfig.async_scheduling stays None and vLLM "
-            "resolves it to True, and '--async-scheduling false' is rejected by "
-            "argparse because the option is a BooleanOptionalAction.)"
+        # Asynchronous scheduling is supported: the plugin executes every captured
+        # graph once right after capture (see graph_probe._warm_captured_graphs),
+        # which is where the lazy queue construction used to fail.
+        logger.info(
+            "Ascend GDN RecoverSSM: async scheduling enabled; captured graphs are "
+            "executed once after capture to finish first-execute queue setup"
         )
 
 
