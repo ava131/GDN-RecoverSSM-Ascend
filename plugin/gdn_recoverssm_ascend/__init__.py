@@ -78,10 +78,10 @@ def install() -> None:
     state_patch.install()
     config_patch.install()
     layer_patch.install()
-    try:
-        startup_patch.install()
-    except Exception as exc:  # no Recover builder on this build
-        logger.debug("gdn_recoverssm_ascend: startup preparation unavailable (%s)", exc)
+    # The preparation is part of the feature contract, not an optional extra: if
+    # it cannot be installed, the commit path would silently fall back to being
+    # cold-initialised on the first request. Fail loudly instead.
+    startup_patch.install()
     try:
         graph_probe.install()
     except Exception as exc:  # probing is optional
