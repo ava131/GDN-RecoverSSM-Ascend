@@ -104,8 +104,8 @@ def _log_runtime_flags(worker) -> None:
         # graph once right after capture (see graph_probe._warm_captured_graphs),
         # which is where the lazy queue construction used to fail.
         logger.info(
-            "Ascend GDN RecoverSSM: async scheduling enabled; captured graphs are "
-            "executed once after capture to finish first-execute queue setup"
+            "Ascend GDN RecoverSSM: async scheduling enabled; a graph's first "
+            "execute is retried once after a device drain if it fails"
         )
 
 

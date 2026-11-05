@@ -32,6 +32,16 @@ logger = init_logger("vllm.gdn_recoverssm_ascend.graph_probe")
 _APPLIED = False
 _SEEN: dict = {}
 _FAILED: dict = {}
+_RETRIED: set = set()
+
+
+def _drain_device() -> None:
+    try:
+        import torch
+
+        torch.npu.synchronize()
+    except Exception as exc:  # never mask the original failure
+        logger.warning("Ascend full-graph replay: drain before retry failed (%s)", exc)
 
 
 def install() -> None:
@@ -63,11 +73,35 @@ def install() -> None:
         try:
             return original(self, desc, attn_metadata)
         except Exception as exc:
-            _FAILED[key] = f"{type(exc).__name__}: {exc}"
-            logger.error(
-                "Ascend full-graph replay failed: %s (first error kept)", key
+            # CaptureModel::AllocSqCqAndBindInternal cleans up after itself on
+            # failure (``DELETE_A(sqCqArray_); sqCqNum_ = 0U;``), so the next
+            # execute retries the whole allocation. The first execute of a graph
+            # fails here when the host has already queued the next batch (async
+            # scheduling); draining the device and retrying once turns that into a
+            # one-off hiccup instead of a killed engine.
+            if key in _RETRIED:
+                _FAILED[key] = f"{type(exc).__name__}: {exc}"
+                logger.error(
+                    "Ascend full-graph replay failed again after a retry: %s", key
+                )
+                raise
+            _RETRIED.add(key)
+            logger.warning(
+                "Ascend full-graph replay failed on first execute (%s): %s: %s -- "
+                "draining the device and retrying once",
+                key,
+                type(exc).__name__,
+                exc,
             )
-            raise
+            _drain_device()
+            try:
+                return original(self, desc, attn_metadata)
+            except Exception as retry_exc:
+                _FAILED[key] = f"{type(retry_exc).__name__}: {retry_exc}"
+                logger.error(
+                    "Ascend full-graph replay failed again after a retry: %s", key
+                )
+                raise
 
     cls._updatable_graph_replay = _updatable_graph_replay
 
@@ -95,67 +129,10 @@ def install() -> None:
             )
         except Exception:
             pass
-        try:
-            _warm_captured_graphs(self)
-        except Exception as exc:  # never break startup on warmup
-            logger.warning("Ascend full-graph warmup skipped (%s)", exc)
         return result
 
     cls.capture = capture
     _APPLIED = True
-
-
-def _warm_captured_graphs(manager) -> None:
-    """Execute every captured graph once, while nothing else is running.
-
-    ``CaptureModel::BuildSqCq`` builds a model's queue pair LAZILY on its first
-    execute and fills the model's whole task list in that same call. Under
-    asynchronous scheduling that first execute happens while the host has already
-    queued the next batch, and the fill fails (driver 17 -> 507899 on the next
-    synchronize). Draining the device at that moment does not help; making the
-    first execute happen here -- after capture, with no requests, no batch queue
-    and no output-copy thread -- does, because every later step reuses the queue
-    pair built now.
-
-    The replay deliberately bypasses ``run_fullgraph``: that path needs per-batch
-    attention metadata, which does not exist before serving. A raw replay runs the
-    captured task list with the parameters frozen at capture time, which is all
-    that is needed to force the queue pair into existence. Nothing that a later
-    request reads is produced here -- requests initialise their own KV pages and
-    state slots before use.
-    """
-    graphs = getattr(manager, "graphs", None)
-    if not graphs:
-        return
-    done = failed = 0
-    for desc, graph in list(graphs.items()):
-        replay = getattr(graph, "replay", None)
-        if replay is None:
-            continue
-        try:
-            replay()
-            done += 1
-        except Exception as exc:
-            failed += 1
-            logger.error(
-                "Ascend full-graph warmup failed for %s: %s: %s",
-                _describe(desc),
-                type(exc).__name__,
-                exc,
-            )
-            raise
-    try:
-        import torch
-
-        torch.npu.synchronize()
-    except Exception:
-        pass
-    logger.info(
-        "Ascend full-graph warmup: executed %d captured graphs before serving "
-        "(%d failed); first-execute queue construction is now done",
-        done,
-        failed,
-    )
 
 
 def _describe(desc) -> str:

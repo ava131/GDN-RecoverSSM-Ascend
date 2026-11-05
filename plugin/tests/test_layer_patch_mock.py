@@ -721,13 +721,12 @@ def test_replay_probe_does_not_touch_the_device():
         torch_mod.npu = None
 
 
-def test_captured_graphs_are_executed_before_serving():
-    """Every captured graph must be executed once, right after capture.
+def test_first_execute_failure_is_retried_once():
+    """A first-execute failure drains the device and retries exactly once.
 
-    ``BuildSqCq`` builds a model's queue pair on its first execute; doing that
-    while serving (async scheduling queues the next batch already) is what failed
-    on the machine. Executing each graph once after capture moves that setup into
-    startup.
+    CaptureModel::AllocSqCqAndBindInternal resets its own state on failure, so the
+    next execute re-attempts the allocation. That turns the async-scheduling
+    first-execute failure into a one-off hiccup instead of a dead engine.
     """
     _install_torch_stub()
     _install_vllm_stubs()
@@ -738,23 +737,21 @@ def test_captured_graphs_are_executed_before_serving():
         synchronize=lambda: synced.__setitem__("n", synced["n"] + 1),
     )
     try:
-        replayed = []
+        state = {"fail": 1, "calls": 0}
 
         class _Graph:
-            def __init__(self, name):
-                self.name = name
-
-            def replay(self):
-                replayed.append(self.name)
-
-        class _Desc:
-            def __init__(self, tokens, reqs):
-                self.num_tokens = tokens
-                self.num_reqs = reqs
+            tasks = (1, 2)
 
         class ModelAclGraphManager:
             def __init__(self):
                 self.graphs = {}
+
+            def _updatable_graph_replay(self, desc, attn_metadata):
+                state["calls"] += 1
+                if state["fail"] > 0:
+                    state["fail"] -= 1
+                    raise RuntimeError("Send sqe failed, model_id=17")
+                return "ok"
 
         acl = types.ModuleType("vllm_ascend.worker.v2.aclgraph_utils")
         acl.ModelAclGraphManager = ModelAclGraphManager
@@ -762,29 +759,35 @@ def test_captured_graphs_are_executed_before_serving():
 
         from gdn_recoverssm_ascend import graph_probe
 
+        graph_probe._APPLIED = False
+        graph_probe._SEEN.clear()
+        graph_probe._FAILED.clear()
+        graph_probe._RETRIED.clear()
+        graph_probe.install()
+
+        class _Desc:
+            num_tokens = 8
+            num_reqs = 2
+
+        desc = _Desc()
         mgr = ModelAclGraphManager()
-        mgr.graphs[_Desc(4, 1)] = _Graph("g4")
-        mgr.graphs[_Desc(8, 2)] = _Graph("g8")
-        mgr.graphs[_Desc(64, 16)] = _Graph("g64")
+        mgr.graphs[desc] = _Graph()
 
-        graph_probe._APPLY_OFF = False
-        graph_probe._warm_captured_graphs(mgr)
+        assert mgr._updatable_graph_replay(desc, None) == "ok"
+        assert state["calls"] == 2, state          # failed once, retried once
+        assert synced["n"] == 1, synced            # one drain, between the two
 
-        assert replayed == ["g4", "g8", "g64"], replayed
-        assert synced["n"] == 1, synced
-
-        # a failure must not be swallowed: it means one graph cannot be executed
-        class _Bad:
-            def replay(self):
-                raise RuntimeError("boom")
-
-        mgr.graphs[_Desc(12, 3)] = _Bad()
+        # a descriptor that keeps failing must propagate after ONE retry, not loop
+        state.update(fail=99, calls=0)
+        graph_probe._FAILED.clear()
+        graph_probe._RETRIED.discard(graph_probe._describe(desc))
         try:
-            graph_probe._warm_captured_graphs(mgr)
+            mgr._updatable_graph_replay(desc, None)
         except RuntimeError as exc:
-            assert "boom" in str(exc)
+            assert "Send sqe" in str(exc)
         else:
-            raise AssertionError("a graph that cannot be executed must be reported")
+            raise AssertionError("a descriptor that keeps failing must propagate")
+        assert state["calls"] == 2, state          # one retry only, never a loop
     finally:
         torch_mod.npu = None
 
