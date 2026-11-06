@@ -1220,6 +1220,12 @@ class GDNRecoverSSMCommitContext:
         # pointers, and a collected scratch would leave the kernels writing into
         # freed device memory.
         context.records = records
+        # Hand each layer its own record buffer. The layer's forward runs the
+        # verify kernel and must write to the same scratch the commit context
+        # reads; binding it here means a context rebuild (KV re-bind, re-profile)
+        # refreshes the layer automatically instead of leaving a stale tensor.
+        for layer, record in zip(layers, records):
+            layer._gdn_recoverssm_records = record
         return context
 
     def make_commit_specs(

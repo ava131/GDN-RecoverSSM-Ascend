@@ -103,11 +103,13 @@ def _install_gdn_stub():
             self.num_k_heads = 2
             self.head_v_dim = 128
             self.head_k_dim = 128
+            # Pages are (conv, checkpoint); the records are scratch bound by the
+            # commit context, indexed by request row.
             self.kv_cache = (
                 FakeTensor(shape=(4, 64, 7)),
                 FakeTensor(shape=(4, 4, 128, 128)),
-                FakeTensor(shape=(4, 4, 4, 257)),
             )
+            self._gdn_recoverssm_records = FakeTensor(shape=(8, 4, 4, 257))
             self.prefix = "model.layers.0.linear_attn"
             # Metadata the stock path would read for this window.
             meta = types.SimpleNamespace(
@@ -937,6 +939,32 @@ def test_record_scratch_validation_is_row_based():
     assert "_rec = (nb, HV, spec_query_len, V + K + 1)" not in src
     assert "layers need matching float32 replay buffers of shape" in src
     assert "replay buffer has fewer rows than the batch" in src
+
+
+def test_no_code_path_still_reads_a_third_cache_page():
+    """Moving the records out of the cache must leave no page-2 access behind.
+
+    Two of them survived the first attempt: the context log line and the verify
+    call site. Both failed only on the machine, at startup, because that is the
+    first time the real page layout is visible -- so the check is static here.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend"
+    offenders = []
+    for path in sorted(root.glob("*.py")):
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            code = line.split("#", 1)[0]
+            if "kv[2]" in code or "kv_cache[2]" in code:
+                offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+    assert not offenders, offenders
+
+    # The verify call site must take the scratch from the context binding.
+    layer_src = (root / "layer_patch.py").read_text()
+    assert "replay_cache=records" in layer_src
+    assert "_gdn_recoverssm_records" in layer_src
+    kernels_src = (root / "kernels.py").read_text()
+    assert "layer._gdn_recoverssm_records = record" in kernels_src
 
 
 def test_state_calculator_patch():

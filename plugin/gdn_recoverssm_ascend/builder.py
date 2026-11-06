@@ -286,7 +286,7 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             len(layers),
             1 + self.num_spec,
             len(kv),
-            tuple(kv[2].shape),
+            tuple(self._context.records[0].shape),
             max_rows,
         )
         return self._context

@@ -41,7 +41,8 @@ logger = init_logger("vllm.gdn_recoverssm_ascend." + __name__.rsplit(".", 1)[-1]
 _APPLIED = False
 
 # The layer whose ``_forward_core`` is currently executing. The shim needs it to
-# reach ``layer.kv_cache[2]`` (the replay record) and ``layer.num_spec``.
+# receive the record scratch through ``layer._gdn_recoverssm_records`` (the
+# records are no longer a cache page) and ``layer.num_spec``.
 _local = threading.local()
 
 
@@ -297,6 +298,22 @@ def _env_flag(name: str) -> bool:
     return value is not None and value.strip() not in ("", "0", "false", "False")
 
 
+def _records_for(layer) -> torch.Tensor:
+    """The row-indexed record scratch this layer writes during verify.
+
+    ``GDNRecoverSSMCommitContext.create`` binds it onto the layer, so a context
+    rebuild refreshes it together with the address tables.
+    """
+    record = getattr(layer, "_gdn_recoverssm_records", None)
+    if record is None:
+        raise RuntimeError(
+            "Ascend GDN RecoverSSM: this layer has no record scratch. The commit "
+            "context is created after the KV cache is bound; verify must not run "
+            "before that."
+        )
+    return record
+
+
 def _trace_step(layer, attn_metadata, rows, total, query_start_loc, checkpoint_indices):
     """One line per speculative step for the first few steps of the process.
 
@@ -388,12 +405,17 @@ def _verify(layer, q, k, v, ssm_state, kwargs):
     _trace_step(layer, attn_metadata, rows, total, query_start_loc, checkpoint_indices)
 
     kv_cache = layer.kv_cache
-    if len(kv_cache) < 3:
+    if len(kv_cache) < 2:
         raise RuntimeError(
-            "Ascend GDN RecoverSSM: expected kv_cache = (conv, checkpoint, "
-            f"replay), got {len(kv_cache)} entries. Is --use-replayssm set and "
+            "Ascend GDN RecoverSSM: expected kv_cache = (conv, checkpoint), got "
+            f"{len(kv_cache)} entries. Is --use-replayssm set and "
             "GDN_RECOVERSSM_DISABLE unset?"
         )
+    # Records are scratch owned by the commit context, indexed by request row;
+    # they are no longer a cache page (RFC #19987 s3). The context must exist by
+    # the time a verify runs, because the builder creates it during the commit
+    # context preparation that startup performs before warmup.
+    records = _records_for(layer)
 
     _COUNTERS["verify_calls"] += 1
     _COUNTERS["last_rows"] = rows
@@ -406,7 +428,7 @@ def _verify(layer, q, k, v, ssm_state, kwargs):
         k.unsqueeze(0),
         v.unsqueeze(0),
         checkpoint_state=kv_cache[1],
-        replay_cache=kv_cache[2],
+        replay_cache=records,
         query_start_loc=query_start_loc,
         state_indices=checkpoint_indices,
         spec_query_len=layer.num_spec + 1,
