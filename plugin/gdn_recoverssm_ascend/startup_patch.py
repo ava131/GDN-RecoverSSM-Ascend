@@ -265,7 +265,11 @@ def _prepare(worker) -> None:
             head_v=int(ckpt.shape[2]),
             spec_query_len=int(context.spec_query_len),
             device=ckpt.device,
-            dtypes=(ckpt.dtype,),
+            # Both precisions on purpose: the check builds its own tensors, so the
+            # deployed cache dtype must not shrink the coverage. An fp32 run is the
+            # one that proves the kernel math to 1e-5; a bf16 run only shows the
+            # page rounding stays inside its own tolerance.
+            dtypes=None,
         )
         if not ok:
             logger.error(
