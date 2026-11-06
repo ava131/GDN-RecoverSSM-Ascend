@@ -92,6 +92,13 @@ class AscendGDNRecoverSSMCommitMetadata:
     block_size: int | None
 
 
+# Host-only counter: the commit runs in Python after sampling (outside the graph),
+# so it is the one reliable signal that the RecoverSSM path is live during
+# serving. FULL graph replay does not re-run Python, so verify_calls stops
+# growing after capture and cannot be used for this.
+_COMMIT_STEPS = 0
+
+
 @dataclass
 class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
     """GDN metadata that also carries the RecoverSSM commit payload."""
@@ -116,6 +123,16 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
         n = int(commit.state_indices.shape[0])
         if n == 0:
             return None
+        global _COMMIT_STEPS
+        _COMMIT_STEPS += 1
+        if _COMMIT_STEPS <= 3 or _COMMIT_STEPS % 200 == 0:
+            logger.info(
+                "Ascend GDN RecoverSSM commit: step=%d rows=%d mode=%s "
+                "(checkpoint advanced by the GDN commit kernel)",
+                _COMMIT_STEPS,
+                n,
+                "align" if commit.block_table is not None else "none",
+            )
         context.commit(
             num_accepted_tokens,
             commit.state_indices,
