@@ -474,7 +474,7 @@ def gdn_recoverssm_verify(
     Ascend signatures: ``g`` (log-space decay) and ``beta`` (already sigmoid) come
     from the layer's ``fused_gdn_gating`` in shape [1, T, HV] or [T, HV]; q, k:
     [1, T, H, K]; v: [1, T, HV, V]; checkpoint_state: [blocks, HV, V, K];
-    replay_cache: [blocks, HV, spec_query_len, V + K + 1] fp32. ``qk_already_normalized``
+    replay_cache: [rows, HV, spec_query_len, V + K + 1] fp32 (row-indexed scratch). ``qk_already_normalized``
     selects the pre-normalised (FLA ``l2norm_fwd``, eps 1e-6) path, which is the
     default; pass ``False`` to normalise q/k inside the kernel with the same
     epsilon. Returns out [1, T, HV, V].
@@ -520,8 +520,18 @@ def gdn_recoverssm_verify(
         tuple(checkpoint_state.shape[1:]) == (HV, V, K),
         "checkpoint shape is incompatible",
     )
-    _rec = (nb, HV, spec_query_len, V + K + 1)
-    _require(tuple(replay_cache.shape) == _rec, f"replay buffer needs shape {_rec}")
+    # Records are row-indexed scratch, not cache pages: shape is
+    # [rows, HV, spec_query_len, V + K + 1] and only the row count has to cover
+    # the batch (the checkpoint keeps using ``nb`` pages).
+    _rec_tail = (HV, spec_query_len, V + K + 1)
+    _require(
+        replay_cache.ndim == 4 and tuple(replay_cache.shape[1:]) == _rec_tail,
+        f"replay buffer needs shape [rows, {HV}, {spec_query_len}, {V + K + 1}]",
+    )
+    _require(
+        replay_cache.shape[0] >= state_indices.shape[0],
+        "replay buffer has fewer rows than the batch",
+    )
     _require(replay_cache.dtype == torch.float32, "replay buffer must use float32")
     _require(state_indices.ndim == 1, "state indices must be one-dimensional")
     _require(
@@ -1095,14 +1105,17 @@ class GDNRecoverSSMCommitContext:
                 and s.device == _dev,
                 "layers need matching checkpoints",
             )
-        _rec = (nb, HV, spec_query_len, V + K + 1)
+        _rec_tail = (HV, spec_query_len, V + K + 1)
         for r in replays:
             _require(
-                tuple(r.shape) == _rec
+                r.ndim == 4
+                and tuple(r.shape[1:]) == _rec_tail
                 and r.dtype == torch.float32
                 and r.stride()[1:] == replays[0].stride()[1:]
                 and r.device == _dev,
-                f"layers need matching float32 replay buffers of shape {_rec}",
+                "layers need matching float32 replay buffers of shape "
+                f"[rows, {HV}, {spec_query_len}, {V + K + 1}] (row-indexed scratch, "
+                "not cache pages)",
             )
         conv_ref = conv_states[0]
         _require(
@@ -1158,11 +1171,13 @@ class GDNRecoverSSMCommitContext:
     ) -> "GDNRecoverSSMCommitContext":
         """Build the context from live layers' ``kv_cache`` pages.
 
-        Each layer must expose ``kv_cache`` with exactly three entries: conv
-        state (``[blocks, conv_dim, window]`` in the layout selected by
-        ``is_conv_state_dim_first()``), recurrent checkpoint
-        (``[blocks, HV, V, K]``) and the fp32 replay records
-        (``[blocks, HV, Q, V + K + 1]``).
+        Each layer must expose ``kv_cache`` with exactly two entries: conv state
+        (``[blocks, conv_dim, window]`` in the layout selected by
+        ``is_conv_state_dim_first()``) and the recurrent checkpoint
+        (``[blocks, HV, V, K]``). The fp32 records are allocated here as scratch
+        of shape ``[rows, HV, Q, V + K + 1]`` -- they are per (request, step)
+        temporaries, so they must not live in the cache pages.
+        
 
         Ascend: no gate parameters are read here. The commit kernel replays the
         decay stored in the record, so ``A_log``/``dt_bias`` never enter the

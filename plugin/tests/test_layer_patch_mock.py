@@ -918,6 +918,27 @@ def test_selftest_switch_and_reference():
 
 
 
+def test_record_scratch_validation_is_row_based():
+    """Records are [rows, HV, Q, width]; pages are [blocks, ...].
+
+    The first version of the move-out-of-cache change kept the page-based check,
+    which rejected every real start ("layers need matching float32 replay buffers
+    of shape (1384, 12, 4, 257)"): the pages still have ``blocks`` entries while
+    the scratch has ``rows``.
+    """
+    _install_torch_stub()
+    _install_vllm_stubs()
+
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend" / "kernels.py").read_text()
+    assert "[rows, HV, spec_query_len, V + K + 1]" in src or "[rows," in src
+    # the page-based comparison must be gone from both validators
+    assert "_rec = (nb, HV, spec_query_len, V + K + 1)" not in src
+    assert "layers need matching float32 replay buffers of shape" in src
+    assert "replay buffer has fewer rows than the batch" in src
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()
