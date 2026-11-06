@@ -967,6 +967,26 @@ def test_no_code_path_still_reads_a_third_cache_page():
     assert "layer._gdn_recoverssm_records = record" in kernels_src
 
 
+def test_every_construction_path_exposes_records():
+    """``create`` and ``from_tensors`` must both expose ``records``.
+
+    The start-up self-check builds a context straight from ``from_tensors``; only
+    ``create`` used to attach the attribute, so the check died with
+    AttributeError on the machine while the serving path looked fine.
+    """
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend" / "kernels.py"
+    ).read_text()
+    assert "context.records = list(replays)" in src
+    assert "context.records = records" in src
+    # both must return the object they annotated
+    body = src[src.index("def from_tensors(") :]
+    body = body[: body.index("def create(")]
+    assert "return context" in body
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()

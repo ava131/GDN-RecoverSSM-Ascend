@@ -1140,7 +1140,7 @@ class GDNRecoverSSMCommitContext:
             [t.stride(0) for t in ts], dtype=torch.int64, device=dev
         )
         z = lambda: torch.empty(max_num_reqs, dtype=torch.int32, device=dev)  # noqa: E731
-        return cls(
+        context = cls(
             tuple(conv_states),
             addr(conv_states),
             bstr(conv_states),
@@ -1164,6 +1164,11 @@ class GDNRecoverSSMCommitContext:
             spec_query_len,
             nb,
         )
+        # Expose the records on every construction path, not only in ``create``:
+        # the start-up self-check builds a context straight from ``from_tensors``
+        # and must use the same attribute the serving path reads.
+        context.records = list(replays)
+        return context
 
     @classmethod
     def create(

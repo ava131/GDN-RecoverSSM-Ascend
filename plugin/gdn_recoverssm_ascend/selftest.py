@@ -67,13 +67,16 @@ def sequential_state(
     ``checkpoint`` is ``[HV, V, K]``; ``k``/``v``/``g``/``beta`` are ``[T, HV, *]``.
     Computed in float64 so the reference itself contributes no error.
     """
-    state = checkpoint.to(torch.float64)
+    # The NPU has no float64: run the reference on the host so it is a genuine
+    # high-precision comparison rather than a silent fp32 down-cast.
+    ref = lambda t: t.detach().float().cpu().double()  # noqa: E731
+    state = ref(checkpoint)
     out = state
     for t in range(k.shape[0]):
-        k_t = k[t].to(torch.float64)          # [HV, K]
-        v_t = v[t].to(torch.float64)          # [HV, V]
-        a = g[t].to(torch.float64).exp()      # [HV]
-        b = beta[t].to(torch.float64)         # [HV]
+        k_t = ref(k[t])                       # [HV, K]
+        v_t = ref(v[t])                       # [HV, V]
+        a = ref(g[t]).exp()                   # [HV]
+        b = ref(beta[t])                      # [HV]
         prev = out
         # (S k) is a vector per head, shape [HV, V]
         sk = torch.einsum("hvk,hk->hv", prev, k_t)
@@ -91,8 +94,8 @@ def sequential_state(
 
 
 def _metrics(got: torch.Tensor, want: torch.Tensor) -> tuple[float, float, float]:
-    got = got.to(torch.float64)
-    want = want.to(torch.float64)
+    got = got.detach().float().cpu().double()
+    want = want.detach().float().cpu().double()
     diff = (got - want).abs()
     scale = want.abs().clamp_min(1e-6)
     max_abs = float(diff.max()) if diff.numel() else 0.0
@@ -134,13 +137,16 @@ def run(
     worst = {}
 
     for dtype in dtypes:
+        # Always generate in fp32, then cast: not every random kernel exists for
+        # bf16 on the NPU.
         conv_states = [
-            torch.randn(blocks, 4, 4, dtype=dtype, device=device)
+            torch.randn(blocks, 4, 4, device=device).to(dtype)
             for _ in range(num_layers)
         ]
         checkpoints = [
-            torch.randn(blocks, num_heads, head_v, head_k, dtype=dtype, device=device)
-            * 0.1
+            (torch.randn(blocks, num_heads, head_v, head_k, device=device) * 0.1).to(
+                dtype
+            )
             for _ in range(num_layers)
         ]
         records = [
@@ -163,14 +169,24 @@ def run(
             # One fresh window per case, and a fresh checkpoint for each dtype run
             # so cases cannot leak state into each other.
             for i in range(num_layers):
-                checkpoints[i].normal_(0.0, 0.1)
-            kb = torch.randn(spec_query_len, num_heads, head_k, dtype=dtype, device=device)
-            kb = kb / kb.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-            vb = torch.randn(spec_query_len, num_heads, head_v, dtype=dtype, device=device)
-            gb = -torch.rand(spec_query_len, num_heads, dtype=dtype, device=device)
-            bb = torch.rand(spec_query_len, num_heads, dtype=dtype, device=device)
+                checkpoints[i].copy_(
+                    (
+                        torch.randn(
+                            checkpoints[i].shape, device=device, dtype=torch.float32
+                        )
+                        * 0.1
+                    ).to(checkpoints[i].dtype)
+                )
+            # Build in fp32 and cast down: the NPU does not implement every
+            # random/normal kernel for bf16, and the values do not need to be
+            # generated at low precision for the comparison to be meaningful.
+            kb = torch.randn(spec_query_len, num_heads, head_k, device=device)
+            kb = (kb / kb.norm(dim=-1, keepdim=True).clamp_min(1e-6)).to(dtype)
+            vb = torch.randn(spec_query_len, num_heads, head_v, device=device).to(dtype)
+            gb = (-torch.rand(spec_query_len, num_heads, device=device)).to(dtype)
+            bb = torch.rand(spec_query_len, num_heads, device=device).to(dtype)
 
-            start = checkpoints[0][0].clone()
+            start = checkpoints[0][1].clone()
             want = sequential_state(
                 start, kb[:fold], vb[:fold], gb[:fold], bb[:fold]
             )
@@ -233,7 +249,9 @@ def _recover(context, kb, vb, gb, bb, fold: int) -> torch.Tensor:
     beta = bb.unsqueeze(0)
     out = torch.zeros(1, tokens, num_heads, head_v, dtype=v.dtype, device=v.device)
 
-    state_indices = torch.zeros(1, dtype=torch.int32, device=v.device)
+    # NULL_BLOCK_ID is 0, so page 0 is the null page: use page 1.
+    block = 1
+    state_indices = torch.full((1,), block, dtype=torch.int32, device=v.device)
     query_start_loc = torch.tensor([0, tokens], dtype=torch.int32, device=v.device)
 
     records = context.records[0]
@@ -264,7 +282,7 @@ def _recover(context, kb, vb, gb, bb, fold: int) -> torch.Tensor:
         commit_conv=False,
     )
     # none mode writes the folded state back into the source page.
-    return context.checkpoints[0][0].clone()
+    return context.checkpoints[0][block].clone()
 
 
 __all__ = ["enabled", "run", "sequential_state"]
