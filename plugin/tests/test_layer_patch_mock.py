@@ -987,6 +987,39 @@ def test_every_construction_path_exposes_records():
     assert "return context" in body
 
 
+def test_metadata_class_only_touches_its_own_attributes():
+    """The metadata dataclass must not read builder-only attributes.
+
+    ``commit_recoverssm_state`` runs on the *metadata* object, but referenced
+    ``self.spec_query_len``, which only the builder has. The line sits inside the
+    align-mode branch, so the none-mode runs never touched it and it surfaced only
+    when prefix caching + align were first enabled.
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend"
+    tree = ast.parse((root / "builder.py").read_text())
+    allowed_prefix = "recoverssm_"
+    problems = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name.endswith("Metadata")):
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef):
+                continue
+            for sub in ast.walk(item):
+                if (
+                    isinstance(sub, ast.Attribute)
+                    and isinstance(sub.value, ast.Name)
+                    and sub.value.id == "self"
+                    and not sub.attr.startswith(allowed_prefix)
+                    and not sub.attr.startswith("_")
+                ):
+                    problems.append(f"{node.name}.{item.name}: self.{sub.attr}")
+    assert not problems, problems
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()

@@ -132,13 +132,19 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
         # applied by the postprocess hook after this commit and before the native
         # align postcopy.
         if commit.block_table is not None:
-            _stage_align_update(
-                commit, num_accepted_tokens, n, self.spec_query_len
-            )
+            # The speculative window length lives on the BUILDER; ``self`` here is
+            # the metadata object, which has no such attribute (this line only
+            # runs in align mode, so the none-mode runs never reached it).
+            builder = self.recoverssm_builder
+            num_spec = getattr(builder, "num_spec", None)
+            window = None if num_spec is None else int(num_spec) + 1
+            _stage_align_update(commit, num_accepted_tokens, n, window)
         return None
 
 
-def _stage_align_update(commit, num_accepted_tokens, n: int, self_spec_query_len: int) -> None:
+def _stage_align_update(
+    commit, num_accepted_tokens, n: int, spec_query_len: int | None
+) -> None:
     """Record ``(rows, final_col)`` so postprocess can fix the running column.
 
     RecoverSSM restores the accepted state itself, so the persistent running
@@ -167,7 +173,11 @@ def _stage_align_update(commit, num_accepted_tokens, n: int, self_spec_query_len
         qlen = (qsl[1 : n + 1] - qsl[:n]).clamp(min=0)
         # Same clamp chain as the plan kernel: max(0) -> query_len -> spec window.
         accepted = num_accepted_tokens[rows.long()].clamp(min=0)
-        accepted = torch.minimum(accepted, qlen).clamp(max=self_spec_query_len)
+        accepted = torch.minimum(accepted, qlen)
+        if spec_query_len is not None:
+            # Same bound as the plan kernel's SPEC_QUERY_LEN clamp; without it the
+            # column could point past the window the commit actually folded.
+            accepted = accepted.clamp(max=int(spec_query_len))
         width = int(commit.block_table.shape[1])
         col = ((computed + accepted - 1).clamp(min=0) // int(commit.block_size)).clamp(
             max=width - 1
