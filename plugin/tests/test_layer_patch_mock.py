@@ -898,6 +898,26 @@ def test_record_scratch_is_reserved_from_the_kv_budget():
     assert startup_patch._record_scratch_bytes(broken) == 0
 
 
+def test_selftest_switch_and_reference():
+    """The switch is env-only, and the reference must be a real recurrence."""
+    import os
+
+    _install_torch_stub()
+    _install_vllm_stubs()
+    from gdn_recoverssm_ascend import selftest
+
+    os.environ.pop("GDN_RECOVERSSM_SELFTEST", None)
+    assert selftest.enabled() is False
+    for value in ("1", "true", "YES", "on"):
+        os.environ["GDN_RECOVERSSM_SELFTEST"] = value
+        assert selftest.enabled() is True, value
+    for value in ("0", "false", "nope", ""):
+        os.environ["GDN_RECOVERSSM_SELFTEST"] = value
+        assert selftest.enabled() is False, value
+    os.environ.pop("GDN_RECOVERSSM_SELFTEST", None)
+
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()

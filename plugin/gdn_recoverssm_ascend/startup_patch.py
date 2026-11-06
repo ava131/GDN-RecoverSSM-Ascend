@@ -30,9 +30,12 @@ import functools
 
 from vllm.logger import init_logger
 
+from . import selftest
+
 logger = init_logger("vllm.gdn_recoverssm_ascend.startup")
 
 _APPLIED = False
+_SELFTEST_DONE = False
 
 
 def install() -> None:
@@ -182,6 +185,25 @@ def _log_runtime_flags(worker) -> None:
         scheduler.async_scheduling,
         cls_name,
     )
+    compilation = getattr(config, "compilation_config", None)
+    if compilation is not None:
+        mode = getattr(compilation, "cudagraph_mode", None)
+        logger.info(
+            "Ascend GDN RecoverSSM: cudagraph_mode=%s%s",
+            mode,
+            " (eager: no graph capture, so no first-execute queue setup is needed)"
+            if str(mode).endswith("NONE") or mode is None
+            else "",
+        )
+    cache = getattr(config, "cache_config", None)
+    if cache is not None:
+        logger.info(
+            "Ascend GDN RecoverSSM: prefix_caching=%s mamba_cache_mode=%s "
+            "records=row-indexed (a prefix-cache-shared page cannot carry another "
+            "request's records)",
+            getattr(cache, "enable_prefix_caching", "?"),
+            getattr(cache, "mamba_cache_mode", "?"),
+        )
     if enabled:
         # Asynchronous scheduling is supported: the plugin executes every captured
         # graph once right after capture (see graph_probe._warm_captured_graphs),
@@ -193,6 +215,7 @@ def _log_runtime_flags(worker) -> None:
 
 
 def _prepare(worker) -> None:
+    global _SELFTEST_DONE
     _log_runtime_flags(worker)
     model_runner = getattr(worker, "model_runner", None)
     if model_runner is None:
@@ -230,3 +253,23 @@ def _prepare(worker) -> None:
         "Ascend GDN RecoverSSM: startup preparation complete (%d variants)",
         total_rows,
     )
+
+    if not _SELFTEST_DONE and selftest.enabled():
+        _SELFTEST_DONE = True
+        context = builders[0]._get_context()
+        ckpt = context.checkpoints[0]
+        ok = selftest.run(
+            num_layers=len(context.checkpoints),
+            num_heads=int(ckpt.shape[1]),
+            head_k=int(ckpt.shape[3]),
+            head_v=int(ckpt.shape[2]),
+            spec_query_len=int(context.spec_query_len),
+            device=ckpt.device,
+            dtypes=(ckpt.dtype,),
+        )
+        if not ok:
+            logger.error(
+                "Ascend GDN RecoverSSM selftest reported a MISMATCH; the committed "
+                "state does not reproduce the sequential GDN recurrence on this "
+                "build. The server keeps running -- this is a report, not a guard."
+            )
