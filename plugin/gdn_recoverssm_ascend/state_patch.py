@@ -86,15 +86,11 @@ def install() -> None:
             conv_kernel_size,
             num_spec,
         )
-        if not _FLAG["enabled"]:
-            return shapes
-        spec_query_len = _FLAG["spec_query_len"] or (num_spec + 1)
-        return (
-            *shapes,
-            _replay_shape(
-                tp_world_size, num_v_heads, head_k_dim, head_v_dim, spec_query_len
-            ),
-        )
+        # RecoverSSM no longer adds a page to the cache: the verify->commit
+        # records are per (request, step) temporaries, so they live in a scratch
+        # buffer indexed by request row (see kernels.create) instead of in every
+        # cache page. RFC #19987 section 3.
+        return shapes
 
     MambaStateShapeCalculator.gated_delta_net_state_shape = classmethod(
         gated_delta_net_state_shape
@@ -105,10 +101,9 @@ def install() -> None:
 
     @functools.wraps(orig_dtype)
     def gated_delta_net_state_dtype(cls, *args, **kwargs):
-        dtypes = orig_dtype(cls, *args, **kwargs)
-        if not _FLAG["enabled"]:
-            return dtypes
-        return (*dtypes, torch.float32)
+        # No extra page: the records are a scratch buffer with a fixed fp32
+        # dtype (see kernels.create), so the page layout matches stock exactly.
+        return orig_dtype(cls, *args, **kwargs)
 
     MambaStateDtypeCalculator.gated_delta_net_state_dtype = classmethod(
         gated_delta_net_state_dtype
@@ -117,7 +112,7 @@ def install() -> None:
     _APPLIED = True
     logger.debug(
         "gdn_recoverssm_ascend: GDN state calculators patched "
-        "(replay record appended when enabled)"
+        "(page layout unchanged; records live in a scratch buffer)"
     )
 
 

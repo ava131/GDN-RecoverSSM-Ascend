@@ -231,7 +231,7 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         layers = [fc[name] for name in self.layer_names]
 
         kv = getattr(layers[0], "kv_cache", None)
-        if kv is None or len(kv) < 3:
+        if kv is None or len(kv) < 2:
             # KV cache not bound yet (profiling / early build).
             if not self._ctx_unbound_logged:
                 self._ctx_unbound_logged = True

@@ -388,9 +388,13 @@ def _gdn_recoverssm_verify_kernel(
                 mask=mask_state,
                 other=0.0,
             ).to(tl.float32)
+            # Records are indexed by REQUEST ROW, not by cache page: they are
+            # per (request, speculative step) temporaries (RFC #19987 s3), so a
+            # page shared through prefix caching can never carry another
+            # request's records.
             rec_base = (
                 replay_ptr
-                + state_idx * stride_replay_block
+                + pid_b * stride_replay_block
                 + pid_hv * stride_replay_head
             )
             for t in tl.static_range(SPEC_QUERY_LEN):
@@ -926,7 +930,9 @@ def _commit_gdn_state_kernel(
                 tl.pointer_type(replay_ref_ptr.dtype.element_ty)
             )
             rbs = tl.load(replay_block_strides_ptr + pid_l)
-            rec_base = replay_ptr + src * rbs + pid_h * stride_replay_head
+            # Row-indexed records (see the verify kernel): the checkpoint is read
+            # from the request's page (``src``), the records from its row.
+            rec_base = replay_ptr + pid_b * rbs + pid_h * stride_replay_head
             offs_k = tl.arange(0, BK)
             offs_v = pid_v * BV + tl.arange(0, BV)
             mask_k = offs_k < K
@@ -1169,16 +1175,37 @@ class GDNRecoverSSMCommitContext:
             is_conv_state_dim_first,
         )
 
-        if any(len(layer.kv_cache) != 3 for layer in layers):
-            raise ValueError("GDN RecoverSSM pages must contain conv, state and replay")
-        return cls.from_tensors(
+        if any(len(layer.kv_cache) != 2 for layer in layers):
+            raise ValueError(
+                "GDN RecoverSSM expects conv and checkpoint pages; the replay "
+                "records live outside the cache"
+            )
+        state0 = layers[0].kv_cache[1]
+        num_heads = state0.shape[1]
+        head_v = state0.shape[2]
+        head_k = state0.shape[3]
+        device = state0.device
+        records = [
+            torch.zeros(
+                (max_num_reqs, num_heads, spec_query_len, head_v + head_k + 1),
+                dtype=torch.float32,
+                device=device,
+            )
+            for _ in layers
+        ]
+        context = cls.from_tensors(
             [layer.kv_cache[0] for layer in layers],
             [layer.kv_cache[1] for layer in layers],
-            [layer.kv_cache[2] for layer in layers],
+            records,
             spec_query_len=spec_query_len,
             max_num_reqs=max_num_reqs,
             conv_dim_first=is_conv_state_dim_first(),
         )
+        # Keep strong references: the address tables below only store raw
+        # pointers, and a collected scratch would leave the kernels writing into
+        # freed device memory.
+        context.records = records
+        return context
 
     def make_commit_specs(
         self,

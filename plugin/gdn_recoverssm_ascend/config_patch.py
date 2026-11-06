@@ -158,8 +158,8 @@ def _summary(config, query_len: int) -> str:
     k = getattr(hf, "linear_key_head_dim", None)
     v = getattr(hf, "linear_value_head_dim", None)
     if hv and k and v and hv % tp == 0:
-        replay = f"[{hv // tp}, {query_len}, {v + k + 1}] fp32"
-        states = "3 per layer (conv, checkpoint, replay)"
+        replay = f"{hv // tp} heads x {query_len} x {v + k + 1} fp32 (scratch)"
+        states = "2 per layer (conv, checkpoint); records outside the cache"
     else:
         replay = "?"
         states = "?"

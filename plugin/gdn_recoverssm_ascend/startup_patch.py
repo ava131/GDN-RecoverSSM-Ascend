@@ -53,7 +53,90 @@ def install() -> None:
         return original(self, *args, **kwargs)
 
     NPUWorker.compile_or_warm_up_model = compile_or_warm_up_model
+
+    # Reserve the scratch memory the records will occupy BEFORE vLLM sizes the
+    # KV cache. ``determine_available_memory`` decides how many blocks the pool
+    # gets from (utilization x total - weights - activations); a buffer allocated
+    # afterwards competes with that pool and can push the run past
+    # gpu_memory_utilization. Subtracting the reservation here means the pool is
+    # sized with the scratch already accounted for, so nothing over-subscribes.
+    original_avail = NPUWorker.determine_available_memory
+
+    @functools.wraps(original_avail)
+    def determine_available_memory(self):
+        available = original_avail(self)
+        reserve = _record_scratch_bytes(getattr(self, "vllm_config", None))
+        if not reserve:
+            return available
+        logger.info(
+            "Ascend GDN RecoverSSM scratch reservation: %.1f MiB -- %s; "
+            "deducted from available KV memory (%.1f GiB -> %.1f GiB) so the "
+            "records cannot over-subscribe gpu_memory_utilization",
+            reserve / (1024 * 1024),
+            _record_scratch_desc(getattr(self, "vllm_config", None)),
+            available / (1024**3),
+            max(available - reserve, 0) / (1024**3),
+        )
+        return max(available - reserve, 0)
+
+    NPUWorker.determine_available_memory = determine_available_memory
     _APPLIED = True
+
+
+def _record_geometry(config) -> dict | None:
+    """Rows / layers / heads / window / width of the record scratch, or None."""
+    if config is None:
+        return None
+    try:
+        hf = config.model_config.hf_text_config
+        heads = getattr(hf, "linear_num_value_heads", None)
+        dim_k = getattr(hf, "linear_key_head_dim", None)
+        dim_v = getattr(hf, "linear_value_head_dim", None)
+        tp = config.parallel_config.tensor_parallel_size
+        window = 1 + int(config.num_speculative_tokens or 0)
+        if not (heads and dim_k and dim_v and heads % tp == 0):
+            return None
+        layer_types = getattr(hf, "layer_types", None)
+        if layer_types:
+            layers = sum(1 for t in layer_types if t != "full_attention")
+        else:
+            layers = int(getattr(hf, "num_hidden_layers", 0) or 0)
+        rows = int(config.scheduler_config.max_num_seqs or 0)
+        if layers <= 0 or rows <= 0:
+            return None
+        return {
+            "rows": rows,
+            "layers": layers,
+            "heads": heads // tp,
+            "window": window,
+            "width": dim_v + dim_k + 1,
+        }
+    except Exception:
+        return None
+
+
+def _record_scratch_bytes(config) -> int:
+    geo = _record_geometry(config)
+    if geo is None:
+        return 0
+    return (
+        geo["rows"]
+        * geo["layers"]
+        * geo["heads"]
+        * geo["window"]
+        * geo["width"]
+        * 4  # fp32
+    )
+
+
+def _record_scratch_desc(config) -> str:
+    geo = _record_geometry(config)
+    if geo is None:
+        return "geometry unavailable"
+    return (
+        "rows={rows}, layers={layers}, heads={heads}, window={window}, "
+        "width={width}, fp32, per-request temporaries reused every step"
+    ).format(**geo)
 
 
 def _iter_builders(model_runner):

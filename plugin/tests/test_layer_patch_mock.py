@@ -850,6 +850,54 @@ def test_warmup_uses_the_normal_path_with_recorded_metadata():
         torch_mod.npu = None
 
 
+def test_record_scratch_is_reserved_from_the_kv_budget():
+    """The records must be deducted from available KV memory, not added on top.
+
+    ``determine_available_memory`` is what decides the pool size; a buffer
+    allocated after it competes with the pool.
+    """
+    _install_torch_stub()
+    _install_vllm_stubs()
+    from gdn_recoverssm_ascend import startup_patch
+
+    hf = types.SimpleNamespace(
+        linear_num_value_heads=48,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        layer_types=["linear_attention"] * 48 + ["full_attention"] * 16,
+        num_hidden_layers=64,
+    )
+    config = types.SimpleNamespace(
+        model_config=types.SimpleNamespace(hf_text_config=hf),
+        parallel_config=types.SimpleNamespace(tensor_parallel_size=4),
+        scheduler_config=types.SimpleNamespace(max_num_seqs=51),
+        num_speculative_tokens=3,
+    )
+    geo = startup_patch._record_geometry(config)
+    assert geo == {
+        "rows": 51,
+        "layers": 48,
+        "heads": 12,
+        "window": 4,
+        "width": 257,
+    }, geo
+    expected = 51 * 48 * 12 * 4 * 257 * 4
+    assert startup_patch._record_scratch_bytes(config) == expected
+    # ~120 MiB, i.e. far below the pages it replaces
+    assert 100 * 1024 * 1024 < expected < 140 * 1024 * 1024, expected
+    assert "rows=51" in startup_patch._record_scratch_desc(config)
+
+    # an unusable config must not silently reserve zero for a run that needs it
+    broken = types.SimpleNamespace(
+        model_config=types.SimpleNamespace(hf_text_config=types.SimpleNamespace()),
+        parallel_config=types.SimpleNamespace(tensor_parallel_size=4),
+        scheduler_config=types.SimpleNamespace(max_num_seqs=8),
+        num_speculative_tokens=3,
+    )
+    assert startup_patch._record_geometry(broken) is None
+    assert startup_patch._record_scratch_bytes(broken) == 0
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()
@@ -869,11 +917,14 @@ def test_state_calculator_patch():
     assert len(base) == 2, base
     assert len(mu.MambaStateDtypeCalculator.gated_delta_net_state_dtype()) == 2
 
-    # enabled -> one extra fp32 record of [HV_tp, Q, V+K+1]
+    # enabled -> the cache still holds only conv + checkpoint. The records are a
+    # per-request scratch outside the cache (RFC #19987 s3), so the page layout
+    # is identical to stock and prefix-cache pages stay shareable.
     state_patch.enable(4)
     shapes = mu.MambaStateShapeCalculator.gated_delta_net_state_shape(2, 2, 8, 128, 128, 4, 3)
-    assert shapes[-1] == (4, 4, 257), shapes
-    assert mu.MambaStateDtypeCalculator.gated_delta_net_state_dtype()[-1] == "float32"
+    assert len(shapes) == 2, shapes
+    assert shapes[-1] == (4, 128, 128), shapes
+    assert len(mu.MambaStateDtypeCalculator.gated_delta_net_state_dtype()) == 2
 
 
 def test_disable_flag_keeps_stock_path():
