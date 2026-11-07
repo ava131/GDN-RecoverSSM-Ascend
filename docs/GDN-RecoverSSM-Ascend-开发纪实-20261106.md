@@ -438,8 +438,46 @@ capture 结束
 
 - 必须 **MRV2**（`VLLM_USE_V2_MODEL_RUNNER=1`）：RecoverSSM 的 commit 生命周期只存在于 V2；
 - 必须 `cache_config.mamba_cache_mode ∈ {none, align}`；
-- 必须 `num_speculative_tokens > 0`（否则不启用 RecoverSSM）；
-- 记录当前占用**持久 cache**（§3 未做），因此容量收益只兑现了一半。
+- 必须 `num_speculative_tokens > 0`（否则不启用 RecoverSSM）。
+- ~~记录占用持久 cache（§3 未做）~~ → 已实现：记录改为按请求行索引的 scratch，
+  page 布局与原生一致，大小在 KV 预算之前扣除（`48d85f9`）。
+
+### 7.4 Ascend 平台限制（不属于本插件，但会撞到）
+
+#### `--mamba-cache-dtype float32` 在 Ascend 上不可用
+
+**现象**：设置后第一个 forward 就失败：
+
+```
+RuntimeError: fla_npu(stable): aclnnCausalConv1dGetWorkspaceSize failed: 561002
+```
+
+**根因**：`--mamba-cache-dtype` 只改 conv state 的 dtype，输入 hidden states 仍是模型
+dtype（bf16）。上游 vLLM 在 Triton 路径上有一个完全相同的历史 bug：
+
+> vLLM PR #24883 *[Bugfix][Mamba] - Fix Conv State Kernel FP32 Support*（2025-09-18 合入）
+> "if you pass `--mamba-cache-dtype "float32"` you'd get ... **The kernel needed to cast
+> the input type to be the same as conv state.**"
+
+上游的做法是在 kernel 里把输入 cast 成 conv-state dtype。Ascend 的卷积走
+`vllm_ascend/ops/gdn.py` → `causal_conv1d_update`（fla_npu → `aclnnCausalConv1d`），
+**该调用点没有做这个 cast**，于是 aclnn 的参数检查失败（`561002`）。
+
+**结论与规避**：
+
+| 配置 | conv state | 结果 |
+|---|---|---|
+| `--mamba-cache-dtype float32` | fp32（输入仍 bf16） | ❌ `561002` |
+| `--mamba-ssm-cache-dtype float32` | bf16（只有 SSM 变 fp32） | ✅ 走的是另一条 dtype，不受影响 |
+
+**与本插件无关**：RecoverSSM 的 verify/commit 只读写 SSM checkpoint 与记录，不经过
+卷积算子；因此这个限制**不影响数值自检的 fp32 结论**（自检自己造张量，见 §6.1）。
+
+#### 启动自检的 fp32 结论不依赖部署 dtype
+
+自检分配自己的 checkpoint/记录张量，因此即使线上 cache 是 bf16，也能跑
+"fp32 checkpoint + fp32 record" 这条腿来验证 kernel 数学；另一条腿用 bf16
+checkpoint 复现线上实际路径。两条腿都不经过 conv。
 
 ---
 
