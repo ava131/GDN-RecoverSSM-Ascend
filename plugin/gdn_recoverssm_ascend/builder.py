@@ -159,6 +159,16 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
         return None
 
 
+def _spec_rows_from_host_copy(builder, masks: torch.Tensor) -> torch.Tensor:
+    """Batch rows that carry the spec mask, resolved without a device sync."""
+    cpu = getattr(builder, "spec_sequence_masks_cpu", None)
+    if cpu is not None and cpu.numel() >= masks.numel():
+        return torch.nonzero(cpu[: masks.numel()], as_tuple=False).flatten()
+    # Fallback for a baseline that does not expose the host copy: still correct,
+    # just with the synchronisation this function exists to avoid.
+    return masks.nonzero(as_tuple=False).flatten()
+
+
 def _stage_align_update(
     commit, num_accepted_tokens, n: int, spec_query_len: int | None
 ) -> None:
@@ -413,7 +423,13 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         request_indices = None
         masks = meta.spec_sequence_masks
         if masks is not None and masks.numel() > 0:
-            rows = masks.nonzero(as_tuple=False).flatten()
+            # Resolve the mapping on the HOST. ``nonzero`` on a device tensor has a
+            # data-dependent shape, so it synchronises the whole step; the native
+            # builder keeps a pinned CPU copy of this very mask
+            # (``spec_sequence_masks_cpu``, filled in its build) precisely to avoid
+            # that. Using the device copy here added a sync per metadata group per
+            # step -- three groups, every step.
+            rows = _spec_rows_from_host_copy(self, masks)
             if rows.numel() < n:
                 # Never guess: a wrong mapping folds another request's records
                 # into this request's checkpoint (silent corruption).

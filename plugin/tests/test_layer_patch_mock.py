@@ -1169,6 +1169,30 @@ def test_baseline_builds_no_recover_state():
     graph_probe._ENABLED = False
 
 
+def test_spec_row_mapping_never_calls_nonzero_on_device():
+    """The per-step row mapping must come from the pinned CPU mask.
+
+    ``nonzero`` on a device tensor has a data-dependent shape, so it blocks the
+    step; the native builder keeps ``spec_sequence_masks_cpu`` for exactly this
+    reason. Using the device copy per metadata group (three of them) per step is a
+    per-step synchronisation the baseline does not pay.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend" / "builder.py").read_text()
+    assert "_spec_rows_from_host_copy" in src
+    # inside build(), the device tensor must not be the primary source
+    tree = ast.parse(src)
+    build = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "build"
+    )
+    body = ast.get_source_segment(src, build) or ""
+    assert "masks.nonzero(" not in body.split("_spec_rows_from_host_copy")[0]
+    assert "spec_sequence_masks_cpu" in src
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()
