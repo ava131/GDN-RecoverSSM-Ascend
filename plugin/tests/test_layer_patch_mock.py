@@ -1105,6 +1105,23 @@ def test_disabled_run_prints_nothing_at_info_level():
     assert 'os.getenv("GDN_RECOVERSSM_DISABLE"' in src
 
 
+def test_graph_probe_refuses_to_install_when_disabled():
+    """Even if something imports the probe, a disabled run must not get it."""
+    import os
+
+    _install_torch_stub()
+    _install_vllm_stubs()
+    from gdn_recoverssm_ascend import graph_probe
+
+    graph_probe._APPLIED = False
+    os.environ["GDN_RECOVERSSM_DISABLE"] = "1"
+    try:
+        graph_probe.install()
+        assert graph_probe._APPLIED is False
+    finally:
+        os.environ.pop("GDN_RECOVERSSM_DISABLE", None)
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()

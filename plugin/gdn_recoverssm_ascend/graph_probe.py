@@ -24,6 +24,7 @@ Nothing here changes behaviour: the replayed call is the original one.
 from __future__ import annotations
 
 import functools
+import os
 
 from vllm.logger import init_logger
 
@@ -63,6 +64,11 @@ def _drain_device() -> None:
 def install() -> None:
     global _APPLIED
     if _APPLIED:
+        return
+    # Defence in depth: the entry point already returns before reaching here when
+    # the plugin is disabled, but a baseline run must stay free of our log lines no
+    # matter how this module gets imported.
+    if os.getenv("GDN_RECOVERSSM_DISABLE", "").strip().lower() in ("1", "true", "yes"):
         return
 
     from vllm_ascend.worker.v2 import aclgraph_utils
