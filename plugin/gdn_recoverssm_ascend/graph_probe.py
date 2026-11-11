@@ -34,6 +34,18 @@ _APPLIED = False
 _SEEN: dict = {}
 _FAILED: dict = {}
 _RETRIED: set = set()
+_ENABLED = False
+
+
+def enable() -> None:
+    """Called once the config accepted the GDN RecoverSSM feature.
+
+    The plugin entry point runs before any VllmConfig exists, so the probe cannot
+    decide at install time. Without this flag a baseline run (no --use-replayssm)
+    still wrapped the graph manager and logged every replay.
+    """
+    global _ENABLED
+    _ENABLED = True
 # (num_tokens, num_reqs) -> the attention metadata that was live for that batch
 # shape. ``prepare_attn`` sees every capture-time metadata, so the shapes captured
 # for FULL replay are all recorded here; replaying a graph needs exactly this.
@@ -78,6 +90,8 @@ def install() -> None:
 
     @functools.wraps(original)
     def _updatable_graph_replay(self, desc, attn_metadata):
+        if not _ENABLED:
+            return original(self, desc, attn_metadata)
         try:
             _log_replay_attempt(self, desc)
         except Exception:  # probing must never break a request
@@ -136,6 +150,8 @@ def install() -> None:
 
     @functools.wraps(original_capture)
     def capture(self, *args, **kwargs):
+        if not _ENABLED:
+            return original_capture(self, *args, **kwargs)
         result = original_capture(self, *args, **kwargs)
         try:
             from . import layer_patch

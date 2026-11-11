@@ -217,6 +217,13 @@ def install() -> None:
         from . import state_patch
 
         state_patch.enable(query_len)
+        # The graph probe is installed in every process before any config exists,
+        # so tell it now that the feature is really on; otherwise a baseline run
+        # keeps logging every replay.
+        if self.cache_config.use_kda_recoverssm:
+            from . import graph_probe
+
+            graph_probe.enable()
         logger.info("Ascend GDN RecoverSSM %s", _summary(self, query_len))
         return self
 

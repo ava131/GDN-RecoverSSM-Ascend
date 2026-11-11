@@ -70,6 +70,8 @@ def install() -> None:
     def determine_available_memory(self):
         available = original_avail(self)
         config = getattr(self, "vllm_config", None)
+        if not feature_enabled(config):
+            return available
         reserve = _record_scratch_bytes(config)
         margin = _graph_margin_bytes(config)
         total = reserve + margin
@@ -96,6 +98,18 @@ def install() -> None:
 
 
 _MARGIN_ENV = "GDN_RECOVERSSM_KV_MARGIN_MB"
+
+
+def feature_enabled(config) -> bool:
+    """True only when the RecoverSSM path will actually run.
+
+    The plugin is installed in every process as soon as its entry point loads, and
+    the cache patch only sets ``use_kda_recoverssm`` when ``--use-replayssm`` was
+    accepted. Everything below must key off that resolved flag: a run without the
+    feature is a baseline and must keep its full KV budget and its logs.
+    """
+    cache = getattr(config, "cache_config", None)
+    return bool(getattr(cache, "use_kda_recoverssm", False))
 
 
 def _graph_margin_bytes(config) -> int:
@@ -278,6 +292,8 @@ def _log_runtime_flags(worker) -> None:
 
 def _prepare(worker) -> None:
     global _SELFTEST_DONE
+    if not feature_enabled(getattr(worker, "vllm_config", None)):
+        return
     _log_runtime_flags(worker)
     model_runner = getattr(worker, "model_runner", None)
     if model_runner is None:

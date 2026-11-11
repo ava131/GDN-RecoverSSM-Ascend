@@ -642,7 +642,15 @@ def test_startup_preparation_runs_before_warmup():
             return builder
 
     runner = types.SimpleNamespace(attn_groups=[[_Group()]])
-    worker = types.SimpleNamespace(model_runner=runner)
+    enabled_config = types.SimpleNamespace(
+        cache_config=types.SimpleNamespace(use_kda_recoverssm=True,
+                                           enable_prefix_caching=False,
+                                           mamba_cache_mode="none"),
+        compilation_config=types.SimpleNamespace(cudagraph_mode="NONE"),
+        scheduler_config=types.SimpleNamespace(async_scheduling=True,
+                                              get_scheduler_cls=lambda: type("S", (), {})),
+    )
+    worker = types.SimpleNamespace(model_runner=runner, vllm_config=enabled_config)
 
     from gdn_recoverssm_ascend import startup_patch
 
@@ -657,7 +665,8 @@ def test_startup_preparation_runs_before_warmup():
     lazy = _Lazy()
     group = types.SimpleNamespace(get_metadata_builder=lambda: lazy)
     worker2 = types.SimpleNamespace(
-        model_runner=types.SimpleNamespace(attn_groups=[[group]])
+        model_runner=types.SimpleNamespace(attn_groups=[[group]]),
+        vllm_config=enabled_config,
     )
     try:
         startup_patch._prepare(worker2)
@@ -705,6 +714,7 @@ def test_replay_probe_does_not_touch_the_device():
         graph_probe._SEEN.clear()
         graph_probe._FAILED.clear()
         graph_probe.install()
+        graph_probe.enable()
 
         class _Desc:
             num_tokens = 8
@@ -766,6 +776,7 @@ def test_first_execute_failure_is_retried_once():
         graph_probe._FAILED.clear()
         graph_probe._RETRIED.clear()
         graph_probe.install()
+        graph_probe.enable()
 
         class _Desc:
             num_tokens = 8
@@ -1120,6 +1131,38 @@ def test_graph_probe_refuses_to_install_when_disabled():
         assert graph_probe._APPLIED is False
     finally:
         os.environ.pop("GDN_RECOVERSSM_DISABLE", None)
+
+
+def test_baseline_builds_no_recover_state():
+    """Without --use-replayssm nothing may be reserved, logged or probed.
+
+    The plugin entry point loads in every process regardless of the feature flag, so
+    a run without --use-replayssm must keep its full KV budget (the reservation used
+    to deduct ~3.2 GiB from a baseline) and stay silent.
+    """
+    import os
+
+    _install_torch_stub()
+    _install_vllm_stubs()
+    from gdn_recoverssm_ascend import graph_probe, startup_patch
+
+    base = types.SimpleNamespace(
+        cache_config=types.SimpleNamespace(use_kda_recoverssm=False),
+        compilation_config=types.SimpleNamespace(cudagraph_mode="FULL_DECODE_ONLY"),
+    )
+    on = types.SimpleNamespace(
+        cache_config=types.SimpleNamespace(use_kda_recoverssm=True),
+        compilation_config=types.SimpleNamespace(cudagraph_mode="FULL_DECODE_ONLY"),
+    )
+    assert startup_patch.feature_enabled(base) is False
+    assert startup_patch.feature_enabled(on) is True
+
+    # the probe must stay inert until the config accepts the feature
+    graph_probe._ENABLED = False
+    assert graph_probe._ENABLED is False
+    graph_probe.enable()
+    assert graph_probe._ENABLED is True
+    graph_probe._ENABLED = False
 
 
 def test_state_calculator_patch():
