@@ -271,9 +271,24 @@ def _prepare(worker) -> None:
             # page rounding stays inside its own tolerance.
             dtypes=None,
         )
+        conv_ok = selftest.run_conv(
+            num_layers=len(context.checkpoints),
+            num_heads=int(ckpt.shape[1]),
+            head_k=int(ckpt.shape[3]),
+            head_v=int(ckpt.shape[2]),
+            spec_query_len=int(context.spec_query_len),
+            device=ckpt.device,
+            dtypes=None,
+        )
         if not ok:
             logger.error(
                 "Ascend GDN RecoverSSM selftest reported a MISMATCH; the committed "
                 "state does not reproduce the sequential GDN recurrence on this "
                 "build. The server keeps running -- this is a report, not a guard."
+            )
+        if not conv_ok:
+            logger.error(
+                "Ascend GDN RecoverSSM selftest reported a CONV MISMATCH; the "
+                "convolution-history compaction does not keep the window that ends "
+                "at the committed token. The server keeps running -- report only."
             )

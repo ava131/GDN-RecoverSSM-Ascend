@@ -1020,6 +1020,28 @@ def test_metadata_class_only_touches_its_own_attributes():
     assert not problems, problems
 
 
+def test_conv_compaction_semantics_are_documented_in_the_check():
+    """The conv leg must compare against the compaction definition, not a copy.
+
+    RFC #19987 requires conv-state consistency; the SSM leg passes commit_conv=False,
+    so without this check the convolution half of the validation plan is untested.
+    """
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend" / "selftest.py"
+    ).read_text()
+    assert "def run_conv(" in src
+    # the expected value is a shifted window, not the unchanged row
+    assert "want = before[:, accepted : accepted + history]" in src
+    assert "commit_conv=True" in src
+    assert "CONV SUMMARY" in src
+    startup = (
+        Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend" / "startup_patch.py"
+    ).read_text()
+    assert "selftest.run_conv(" in startup
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()

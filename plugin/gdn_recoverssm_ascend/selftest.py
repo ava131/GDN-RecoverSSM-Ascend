@@ -240,6 +240,108 @@ def run(
     return passed == cases
 
 
+def run_conv(
+    *,
+    num_layers: int,
+    num_heads: int,
+    head_k: int,
+    head_v: int,
+    spec_query_len: int,
+    device: torch.device,
+    dtypes=None,
+    seed: int = 0,
+) -> bool:
+    """Check the convolution-history compaction against its definition.
+
+    The layer's conv update leaves one row holding ``[history | drafts]``:
+    ``conv_kernel_size - 1`` committed inputs followed by the ``num_spec`` draft
+    inputs. Committing ``A`` accepted drafts must keep the window that ends at the
+    committed token:
+
+        new[h] = old[A + h]     for h in [0, history)
+
+    which is "compact the convolution history after sampling" (RFC #19987 s1/s2)
+    and is what the commit kernel does with ``commit_len - 1 = accepted``.
+    """
+    from .kernels import GDNRecoverSSMCommitContext
+
+    if dtypes is None:
+        dtypes = (torch.float32, getattr(torch, "bfloat16", torch.float32))
+    torch.manual_seed(seed + 17)
+
+    blocks = 2
+    num_spec = spec_query_len - 1
+    history = 3  # conv_kernel_size - 1 for the Qwen3.8 kernel size of 4
+    conv_len = history + num_spec
+    conv_dim = 16 * num_heads  # multiple of 16 keeps the tile path exact
+    cases = passed = 0
+    worst = 0.0
+
+    for dtype in dtypes:
+        conv = [
+            torch.randn(blocks, conv_dim, conv_len, device=device).to(dtype)
+            for _ in range(num_layers)
+        ]
+        zero_state = [
+            torch.zeros(blocks, num_heads, head_v, head_k, device=device).to(dtype)
+            for _ in range(num_layers)
+        ]
+        records = [
+            torch.zeros(
+                blocks, num_heads, spec_query_len, head_v + head_k + 1,
+                dtype=torch.float32, device=device,
+            )
+            for _ in range(num_layers)
+        ]
+        context = GDNRecoverSSMCommitContext.from_tensors(
+            conv,
+            zero_state,
+            records,
+            spec_query_len=spec_query_len,
+            max_num_reqs=blocks,
+            conv_dim_first=True,
+        )
+        block = 1
+        for accepted in range(spec_query_len):
+            # Fresh history per case so the cases cannot influence each other.
+            conv[0][block].copy_(
+                torch.randn(conv_dim, conv_len, device=device).to(dtype)
+            )
+            before = conv[0][block].clone()
+            context.commit(
+                torch.tensor([accepted + 1], dtype=torch.int32, device=device),
+                torch.full((1,), block, dtype=torch.int32, device=device),
+                torch.tensor([0, spec_query_len], dtype=torch.int32, device=device),
+                request_indices=torch.zeros(1, dtype=torch.int32, device=device),
+                commit_conv=True,
+            )
+            got = context.conv_states[0][block][:, :history]
+            want = before[:, accepted : accepted + history]
+            max_abs, max_rel, _cos = _metrics(got, want)
+            tol = TOL_FP32 if dtype == torch.float32 else TOL_BF16
+            ok = max_rel <= tol
+            cases += 1
+            passed += int(ok)
+            worst = max(worst, max_rel)
+            logger.info(
+                "Ascend GDN RecoverSSM selftest: conv %s accepted=%d history=%d "
+                "max_abs=%.3e max_rel=%.3e %s",
+                str(dtype).split(".")[-1],
+                accepted,
+                history,
+                max_abs,
+                max_rel,
+                "PASS" if ok else "FAIL",
+            )
+    logger.info(
+        "Ascend GDN RecoverSSM selftest CONV SUMMARY: cases=%d pass=%d fail=%d "
+        "worst_max_rel=%.3e tolerance fp32=%.1e bf16=%.1e %s",
+        cases, passed, cases - passed, worst, TOL_FP32, TOL_BF16,
+        "OK" if passed == cases else "MISMATCH",
+    )
+    return passed == cases
+
+
 def _recover(context, kb, vb, gb, bb, fold: int) -> torch.Tensor:
     """Run verify for the whole window, then commit ``fold`` tokens, in place.
 
