@@ -901,8 +901,8 @@ def test_record_scratch_is_reserved_from_the_kv_budget():
     assert 100 * 1024 * 1024 < expected < 140 * 1024 * 1024, expected
     assert "rows=51" in startup_patch._record_scratch_desc(config)
 
-    # A full-graph batch can be wider than max_num_seqs: 2048 capture tokens with
-    # window 4 is 512 rows, and the context sizes its scratch that way.
+    # Records are sized by max_num_seqs, not by the padded graph batch: padded
+    # rows never reach the record stores.
     wide = types.SimpleNamespace(
         model_config=config.model_config,
         parallel_config=config.parallel_config,
@@ -910,7 +910,7 @@ def test_record_scratch_is_reserved_from_the_kv_budget():
         compilation_config=types.SimpleNamespace(cudagraph_capture_sizes=[1, 2048]),
         num_speculative_tokens=3,
     )
-    assert startup_patch._record_geometry(wide)["rows"] == 512
+    assert startup_patch._record_geometry(wide)["rows"] == 128
 
     # an unusable config must not silently reserve zero for a run that needs it
     broken = types.SimpleNamespace(
@@ -961,8 +961,12 @@ def test_record_scratch_validation_is_row_based():
     assert "[rows, HV, spec_query_len, V + K + 1]" in src or "[rows," in src
     # the page-based comparison must be gone from both validators
     assert "_rec = (nb, HV, spec_query_len, V + K + 1)" not in src
+    # the scratch capacity is passed to both kernels so padded rows cannot
+    # write past it
+    assert "num_record_rows" in src
+    assert "record_row_ok" in src
     assert "layers need matching float32 replay buffers of shape" in src
-    assert "replay buffer has fewer rows than the batch" in src
+    assert "replay buffer has no rows" in src
 
 
 def test_no_code_path_still_reads_a_third_cache_page():

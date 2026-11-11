@@ -305,6 +305,11 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             layers,
             spec_query_len=1 + self.num_spec,
             max_num_reqs=max_rows,
+            # Records are only written by real requests; the padded graph rows are
+            # skipped by the kernels, so cap the scratch at max_num_seqs.
+            record_rows=min(
+                max_rows, int(self.vllm_config.scheduler_config.max_num_seqs or max_rows)
+            ),
         )
         self._ctx_key = key
         logger.info(

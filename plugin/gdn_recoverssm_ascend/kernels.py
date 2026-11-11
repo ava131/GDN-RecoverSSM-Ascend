@@ -315,6 +315,7 @@ def _gdn_recoverssm_verify_kernel(
     scale,
     num_rows,
     num_work,
+    num_record_rows,
     null_block_id,
     stride_q_token,
     stride_k_token,
@@ -392,6 +393,13 @@ def _gdn_recoverssm_verify_kernel(
             # per (request, speculative step) temporaries (RFC #19987 s3), so a
             # page shared through prefix caching can never carry another
             # request's records.
+            #
+            # ``num_record_rows`` is the scratch capacity, which is sized by
+            # max_num_seqs rather than by the (padded) graph batch: graph padding
+            # rows have a null state index and never reach this branch, so the
+            # extra rows would be pure waste. The guard keeps an unexpected
+            # non-null padding row from writing past the buffer.
+            record_row_ok = pid_b < num_record_rows
             rec_base = (
                 replay_ptr
                 + pid_b * stride_replay_block
@@ -442,14 +450,24 @@ def _gdn_recoverssm_verify_kernel(
                     mask=valid & mask_v,
                 )
                 rec = rec_base + t * stride_replay_pos
-                tl.store(rec + offs_v * stride_replay_dim, corr, mask=valid & mask_v)
+                tl.store(
+                    rec + offs_v * stride_replay_dim,
+                    corr,
+                    mask=valid & mask_v & record_row_ok,
+                )
                 if pid_v == 0:
                     tl.store(
-                        rec + (V + offs_k) * stride_replay_dim, k, mask=valid & mask_k
+                        rec + (V + offs_k) * stride_replay_dim,
+                        k,
+                        mask=valid & mask_k & record_row_ok,
                     )
                     # the decay exactly as multiplied here, so the commit replays
                     # this float
-                    tl.store(rec + (V + K) * stride_replay_dim, decay, mask=valid)
+                    tl.store(
+                        rec + (V + K) * stride_replay_dim,
+                        decay,
+                        mask=valid & record_row_ok,
+                    )
 
 
 def gdn_recoverssm_verify(
@@ -528,10 +546,7 @@ def gdn_recoverssm_verify(
         replay_cache.ndim == 4 and tuple(replay_cache.shape[1:]) == _rec_tail,
         f"replay buffer needs shape [rows, {HV}, {spec_query_len}, {V + K + 1}]",
     )
-    _require(
-        replay_cache.shape[0] >= state_indices.shape[0],
-        "replay buffer has fewer rows than the batch",
-    )
+    _require(replay_cache.shape[0] >= 1, "replay buffer has no rows")
     _require(replay_cache.dtype == torch.float32, "replay buffer must use float32")
     _require(state_indices.ndim == 1, "state indices must be one-dimensional")
     _require(
@@ -598,6 +613,7 @@ def gdn_recoverssm_verify(
         scale,
         batch,
         num_work,
+        replay_cache.shape[0],
         NULL_BLOCK_ID,
         q.stride(1),
         k.stride(1),
@@ -884,6 +900,7 @@ def _commit_gdn_state_kernel(
     null_block_id,
     num_rows,
     num_work,
+    num_record_rows,
     stride_state_head,
     stride_state_v,
     stride_state_k,
@@ -919,6 +936,9 @@ def _commit_gdn_state_kernel(
             & (src < NUM_BLOCKS)
             & (n > 0)
             & (final_idx > null_block_id)
+            # Records live in a scratch sized by max_num_seqs; padded graph rows
+            # never reach here, but a non-null padding row must not read past it.
+            & (pid_b < num_record_rows)
         )
         if row_ok:
             dst_idx = final_idx
@@ -1062,6 +1082,7 @@ class GDNRecoverSSMCommitContext:
     boundary_state_indices: torch.Tensor
     boundary_recovery_lens: torch.Tensor
     spec_query_len: int
+    record_rows: int = 0
     num_blocks: int
 
     @classmethod
@@ -1168,11 +1189,17 @@ class GDNRecoverSSMCommitContext:
         # the start-up self-check builds a context straight from ``from_tensors``
         # and must use the same attribute the serving path reads.
         context.records = list(replays)
+        context.record_rows = int(replays[0].shape[0])
         return context
 
     @classmethod
     def create(
-        cls, layers: Sequence[Any], *, spec_query_len: int, max_num_reqs: int
+        cls,
+        layers: Sequence[Any],
+        *,
+        spec_query_len: int,
+        max_num_reqs: int,
+        record_rows: int | None = None,
     ) -> "GDNRecoverSSMCommitContext":
         """Build the context from live layers' ``kv_cache`` pages.
 
@@ -1205,9 +1232,13 @@ class GDNRecoverSSMCommitContext:
         head_v = state0.shape[2]
         head_k = state0.shape[3]
         device = state0.device
+        # Only real requests write records: padded graph rows carry a null state
+        # index and the kernels skip them, so sizing by max_num_seqs (instead of
+        # the padded graph batch) removes ~3/4 of this buffer.
+        rows = int(record_rows or max_num_reqs)
         records = [
             torch.zeros(
-                (max_num_reqs, num_heads, spec_query_len, head_v + head_k + 1),
+                (rows, num_heads, spec_query_len, head_v + head_k + 1),
                 dtype=torch.float32,
                 device=device,
             )
@@ -1483,6 +1514,7 @@ class GDNRecoverSSMCommitContext:
             NULL_BLOCK_ID,
             batch,
             num_work,
+            rr.shape[0],
             ref.stride(1),
             ref.stride(2),
             ref.stride(3),
