@@ -38,13 +38,16 @@ def install() -> None:
     _INSTALLED = True
 
     if os.getenv("GDN_RECOVERSSM_DISABLE", "").strip().lower() in ("1", "true", "yes"):
-        logger.info("gdn_recoverssm_ascend: disabled by GDN_RECOVERSSM_DISABLE")
+        # Silent by design: this runs in every process (API server, engine core and
+        # each worker), so an INFO line here turns a baseline run into six lines of
+        # RecoverSSM output. The plugin stays fully inert -- nothing below runs.
+        logger.debug("gdn_recoverssm_ascend: disabled by GDN_RECOVERSSM_DISABLE")
         return
 
     try:
         import torch_npu  # noqa: F401
     except Exception:  # pragma: no cover - non-Ascend machines
-        logger.info("gdn_recoverssm_ascend: torch_npu unavailable, plugin inactive")
+        logger.debug("gdn_recoverssm_ascend: torch_npu unavailable, plugin inactive")
         return
 
     # Feature/version guard: this plugin only makes sense on a baseline that
@@ -65,7 +68,7 @@ def install() -> None:
         if not hasattr(_ascend_gdn, "recurrent_gated_delta_rule"):
             raise AttributeError("vllm_ascend.ops.gdn.recurrent_gated_delta_rule")
     except Exception as exc:  # noqa: BLE001 - any mismatch means "stay inert"
-        logger.info(
+        logger.debug(
             "gdn_recoverssm_ascend: baseline lacks RecoverSSM support (%s: %s); "
             "plugin stays inert.",
             type(exc).__name__,

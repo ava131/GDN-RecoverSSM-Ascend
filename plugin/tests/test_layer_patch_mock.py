@@ -1084,6 +1084,27 @@ def test_graph_headroom_is_reserved_and_tunable():
     os.environ.pop("GDN_RECOVERSSM_KV_MARGIN_MB", None)
 
 
+def test_disabled_run_prints_nothing_at_info_level():
+    """``GDN_RECOVERSSM_DISABLE=1`` must be invisible in a baseline run.
+
+    The entry point runs in every process (API server, engine core, each worker),
+    so an INFO line on the early-return path turns a clean baseline into six lines
+    of plugin output. Every early return must be DEBUG.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend" / "__init__.py").read_text()
+    tree = ast.parse(src)
+    infos = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "info"):
+            infos.append(node.lineno)
+    assert not infos, f"logger.info at lines {infos}: an inert plugin must be silent"
+    assert 'os.getenv("GDN_RECOVERSSM_DISABLE"' in src
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()
