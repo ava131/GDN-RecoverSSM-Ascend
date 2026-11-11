@@ -112,8 +112,14 @@ def _graph_margin_bytes(config) -> int:
     graphs need. ``GDN_RECOVERSSM_KV_MARGIN_MB`` overrides it.
     """
     compilation = getattr(config, "compilation_config", None)
-    mode = str(getattr(compilation, "cudagraph_mode", "") or "")
-    eager = mode.endswith("NONE") or mode in ("", "None")
+    mode = getattr(compilation, "cudagraph_mode", None)
+    # CUDAGraphMode is a plain Enum, but the value can also arrive as a string.
+    # Only an explicit NONE means "no graph pool"; anything unknown (including a
+    # config that has not resolved the mode yet) is treated as graph mode, because
+    # reserving too little fails the start while reserving too much only costs
+    # capacity.
+    name = (getattr(mode, "name", None) or str(mode or "")).upper()
+    eager = name == "NONE"
     default_mb = 0 if eager else 2048
     raw = os.environ.get(_MARGIN_ENV)
     try:
