@@ -27,6 +27,7 @@ not part of this promise.
 from __future__ import annotations
 
 import functools
+import os
 
 from vllm.logger import init_logger
 
@@ -68,22 +69,64 @@ def install() -> None:
     @functools.wraps(original_avail)
     def determine_available_memory(self):
         available = original_avail(self)
-        reserve = _record_scratch_bytes(getattr(self, "vllm_config", None))
-        if not reserve:
+        config = getattr(self, "vllm_config", None)
+        reserve = _record_scratch_bytes(config)
+        margin = _graph_margin_bytes(config)
+        total = reserve + margin
+        if not total:
             return available
         logger.info(
-            "Ascend GDN RecoverSSM scratch reservation: %.1f MiB -- %s; "
-            "deducted from available KV memory (%.1f GiB -> %.1f GiB) so the "
-            "records cannot over-subscribe gpu_memory_utilization",
+            "Ascend GDN RecoverSSM KV budget: records %.1f MiB (%s) + graph "
+            "headroom %.0f MiB = %.1f MiB deducted from available KV memory "
+            "(%.1f GiB -> %.1f GiB). The graph headroom exists because vLLM sizes "
+            "the pool to fill the budget and would otherwise leave capture short; "
+            "set %s to tune it (0 disables).",
             reserve / (1024 * 1024),
-            _record_scratch_desc(getattr(self, "vllm_config", None)),
+            _record_scratch_desc(config),
+            margin / (1024 * 1024),
+            total / (1024 * 1024),
             available / (1024**3),
-            max(available - reserve, 0) / (1024**3),
+            max(available - total, 0) / (1024**3),
+            _MARGIN_ENV,
         )
-        return max(available - reserve, 0)
+        return max(available - total, 0)
 
     NPUWorker.determine_available_memory = determine_available_memory
     _APPLIED = True
+
+
+_MARGIN_ENV = "GDN_RECOVERSSM_KV_MARGIN_MB"
+
+
+def _graph_margin_bytes(config) -> int:
+    """Headroom kept out of the KV pool for the graph pool.
+
+    vLLM sizes the KV pool to fill the budget: ``available = requested -
+    non_kv_cache_memory``, where non_kv_cache_memory deliberately excludes graph
+    memory. That works as long as the utilisation slack is larger than the graph
+    pool, and moving the records out of the pages grew the pool by ~3 GiB, which
+    ate that slack: capture then fails asking for 770 MiB with 545 MiB free.
+
+    So keep an explicit margin. Eager has no graph pool, so the default is 0
+    there; graph mode defaults to 2 GiB, which covers the ~1.9 GiB the 34 captured
+    graphs need. ``GDN_RECOVERSSM_KV_MARGIN_MB`` overrides it.
+    """
+    compilation = getattr(config, "compilation_config", None)
+    mode = str(getattr(compilation, "cudagraph_mode", "") or "")
+    eager = mode.endswith("NONE") or mode in ("", "None")
+    default_mb = 0 if eager else 2048
+    raw = os.environ.get(_MARGIN_ENV)
+    try:
+        mb = int(raw) if raw is not None else default_mb
+    except ValueError:
+        logger.warning(
+            "Ascend GDN RecoverSSM: %s=%r is not an integer; using %d",
+            _MARGIN_ENV,
+            raw,
+            default_mb,
+        )
+        mb = default_mb
+    return max(mb, 0) << 20
 
 
 def _record_geometry(config) -> dict | None:

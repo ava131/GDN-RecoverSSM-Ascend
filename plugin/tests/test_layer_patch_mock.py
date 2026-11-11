@@ -1042,6 +1042,35 @@ def test_conv_compaction_semantics_are_documented_in_the_check():
     assert "selftest.run_conv(" in startup
 
 
+def test_graph_headroom_is_reserved_and_tunable():
+    """Graph mode must keep room for the capture pool out of the KV budget.
+
+    vLLM sizes the pool to fill the budget and excludes graph memory from its
+    non-KV accounting, so a pool that grows (records moving out of the pages) eats
+    the capture headroom: capture then asks for 770 MiB with 545 MiB free.
+    """
+    import os
+
+    _install_torch_stub()
+    _install_vllm_stubs()
+    from gdn_recoverssm_ascend import startup_patch
+
+    def cfg(mode):
+        return types.SimpleNamespace(
+            compilation_config=types.SimpleNamespace(cudagraph_mode=mode)
+        )
+
+    os.environ.pop("GDN_RECOVERSSM_KV_MARGIN_MB", None)
+    assert startup_patch._graph_margin_bytes(cfg("FULL_DECODE_ONLY")) == 2048 << 20
+    assert startup_patch._graph_margin_bytes(cfg("NONE")) == 0
+
+    os.environ["GDN_RECOVERSSM_KV_MARGIN_MB"] = "512"
+    assert startup_patch._graph_margin_bytes(cfg("FULL_DECODE_ONLY")) == 512 << 20
+    os.environ["GDN_RECOVERSSM_KV_MARGIN_MB"] = "0"
+    assert startup_patch._graph_margin_bytes(cfg("FULL_DECODE_ONLY")) == 0
+    os.environ.pop("GDN_RECOVERSSM_KV_MARGIN_MB", None)
+
+
 def test_state_calculator_patch():
     """Shape/dtype are appended at the calculator, not at the layer."""
     _install_torch_stub()
