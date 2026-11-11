@@ -153,7 +153,20 @@ def _record_geometry(config) -> dict | None:
             layers = sum(1 for t in layer_types if t != "full_attention")
         else:
             layers = int(getattr(hf, "num_hidden_layers", 0) or 0)
+        # The records must cover a full-graph batch, which can be wider than
+        # max_num_seqs: the commit context sizes its scratch as
+        # max(max_num_seqs, decode_cudagraph_max_bs). At KV-sizing time the latter
+        # is not resolved yet, so derive it from the capture sizes (tokens /
+        # speculative window) the same way. Under-reserving here would silently
+        # eat the graph headroom later.
         rows = int(config.scheduler_config.max_num_seqs or 0)
+        compilation = getattr(config, "compilation_config", None)
+        sizes = getattr(compilation, "cudagraph_capture_sizes", None) or ()
+        try:
+            capture_rows = max(int(x) for x in sizes) // max(window, 1) if sizes else 0
+        except (TypeError, ValueError):
+            capture_rows = 0
+        rows = max(rows, capture_rows)
         if layers <= 0 or rows <= 0:
             return None
         return {

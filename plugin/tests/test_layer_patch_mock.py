@@ -873,6 +873,7 @@ def test_record_scratch_is_reserved_from_the_kv_budget():
         model_config=types.SimpleNamespace(hf_text_config=hf),
         parallel_config=types.SimpleNamespace(tensor_parallel_size=4),
         scheduler_config=types.SimpleNamespace(max_num_seqs=51),
+        compilation_config=types.SimpleNamespace(cudagraph_capture_sizes=[1, 4, 8]),
         num_speculative_tokens=3,
     )
     geo = startup_patch._record_geometry(config)
@@ -889,11 +890,23 @@ def test_record_scratch_is_reserved_from_the_kv_budget():
     assert 100 * 1024 * 1024 < expected < 140 * 1024 * 1024, expected
     assert "rows=51" in startup_patch._record_scratch_desc(config)
 
+    # A full-graph batch can be wider than max_num_seqs: 2048 capture tokens with
+    # window 4 is 512 rows, and the context sizes its scratch that way.
+    wide = types.SimpleNamespace(
+        model_config=config.model_config,
+        parallel_config=config.parallel_config,
+        scheduler_config=types.SimpleNamespace(max_num_seqs=128),
+        compilation_config=types.SimpleNamespace(cudagraph_capture_sizes=[1, 2048]),
+        num_speculative_tokens=3,
+    )
+    assert startup_patch._record_geometry(wide)["rows"] == 512
+
     # an unusable config must not silently reserve zero for a run that needs it
     broken = types.SimpleNamespace(
         model_config=types.SimpleNamespace(hf_text_config=types.SimpleNamespace()),
         parallel_config=types.SimpleNamespace(tensor_parallel_size=4),
         scheduler_config=types.SimpleNamespace(max_num_seqs=8),
+        compilation_config=types.SimpleNamespace(cudagraph_capture_sizes=[]),
         num_speculative_tokens=3,
     )
     assert startup_patch._record_geometry(broken) is None
