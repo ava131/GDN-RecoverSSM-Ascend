@@ -440,7 +440,11 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
                     rows.numel(),
                 )
                 return meta
-            request_indices = rows[:n].to(torch.int32)
+            # The mapping is resolved on the host, but every consumer (the plan
+            # kernel and the align bookkeeping) indexes device tensors, so it must
+            # live on the same device. This is a tiny H2D copy (one int32 per spec
+            # row), not a sync.
+            request_indices = rows[:n].to(torch.int32).to(state_indices.device)
             if not self._mapping_logged:
                 self._mapping_logged = True
                 identity = bool(

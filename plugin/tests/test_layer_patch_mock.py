@@ -1191,6 +1191,10 @@ def test_spec_row_mapping_never_calls_nonzero_on_device():
     body = ast.get_source_segment(src, build) or ""
     assert "masks.nonzero(" not in body.split("_spec_rows_from_host_copy")[0]
     assert "spec_sequence_masks_cpu" in src
+    # The host-side mapping must be moved to the compute device before use: the
+    # first version passed a CPU tensor into the commit and every step died with
+    # "commit inputs must be on the same device".
+    assert ".to(state_indices.device)" in src
 
 
 def test_state_calculator_patch():
