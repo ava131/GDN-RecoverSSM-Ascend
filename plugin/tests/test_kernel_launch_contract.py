@@ -129,6 +129,39 @@ def check_local_use_before_assignment() -> list[str]:
     return problems
 
 
+def check_dataclass_field_order() -> list[str]:
+    """No dataclass field with a default may precede one without.
+
+    Adding ``record_rows: int = 0`` in the middle of GDNRecoverSSMCommitContext
+    made every worker die at import time with
+    "TypeError: non-default argument 'num_blocks' follows default argument".
+    """
+    tree = ast.parse(KERNELS.read_text())
+    problems: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        if not any(
+            isinstance(d, ast.Name) and d.id == "dataclass"
+            or isinstance(d, ast.Call) and getattr(d.func, "id", "") == "dataclass"
+            for d in node.decorator_list
+        ):
+            continue
+        seen_default = None
+        for item in node.body:
+            if not isinstance(item, ast.AnnAssign) or not isinstance(item.target, ast.Name):
+                continue
+            has_default = item.value is not None
+            if has_default and seen_default is None:
+                seen_default = item.target.id
+            elif not has_default and seen_default is not None:
+                problems.append(
+                    f"{node.name}: {item.target.id} (no default) follows "
+                    f"{seen_default} (default)"
+                )
+    return problems
+
+
 def test_kernel_launch_contract() -> None:
     problems = check() + check_local_use_before_assignment()
     assert not problems, "\n".join(problems)

@@ -1082,7 +1082,7 @@ class GDNRecoverSSMCommitContext:
     boundary_state_indices: torch.Tensor
     boundary_recovery_lens: torch.Tensor
     spec_query_len: int
-    record_rows: int = 0
+    """Speculative window length (constexpr in every kernel)."""
     num_blocks: int
 
     @classmethod
