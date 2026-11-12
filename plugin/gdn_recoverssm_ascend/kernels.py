@@ -99,11 +99,7 @@ MAX_SPEC_QUERY_LEN = 8
 # clamped by the UB budget. Upstream's comment for the 16-row commit tile: the
 # commit streams each state once, and smaller tiles keep more of them in flight.
 RECOVERSSM_VERIFY_VALUE_TILE = 32
-# 64 halves the number of value tiles, which halves how often the commit kernel
-# re-reads the key/decay records (BV=16: 8 tiles, BV=64: 2). The UB budget check in
-# _commit_value_tile still halves it back if a tile of that width does not fit, so
-# this is a preference, not an assertion.
-RECOVERSSM_COMMIT_VALUE_TILE = 64
+RECOVERSSM_COMMIT_VALUE_TILE = 16
 
 # Upstream `compact_conv_state_kernel` launches with BLOCK_D=256. We never grow
 # past it on A2 (growth is a performance knob to revisit on hardware) and shrink
@@ -674,8 +670,6 @@ def _prepare_commit_plan_kernel(
     final_state_indices_ptr,
     boundary_state_indices_ptr,
     boundary_recovery_lens_ptr,
-    align_valid_ptr,
-    align_col_ptr,
     null_block_id,
     mamba_block_size,
     block_table_width,
@@ -718,7 +712,6 @@ def _prepare_commit_plan_kernel(
     final_state_idx = source_state_idx
     boundary_state_idx = null_block_id
     boundary_recovery_len = 0
-    final_state_col = 0
     if ALIGN_MODE:
         num_computed = tl.load(num_computed_ptr + request_idx * stride_num_computed).to(
             tl.int32
@@ -790,12 +783,6 @@ def _prepare_commit_plan_kernel(
         boundary_recovery_lens_ptr + spec_idx,
         tl.where(valid, boundary_recovery_len, 0),
     )
-    if ALIGN_MODE:
-        # The running column is the one the commit writes. Emitting it here keeps
-        # a single authoritative definition of the formula: the postprocess hook
-        # consumes these two values instead of recomputing them on the host.
-        tl.store(align_valid_ptr + spec_idx, valid.to(tl.int32))
-        tl.store(align_col_ptr + spec_idx, final_state_col)
 
 
 @triton.jit
@@ -895,37 +882,6 @@ def _compact_conv_state_kernel(
                 final_values,
                 mask=mask,
             )
-
-
-@triton.jit
-def _apply_align_kernel(
-    align_valid_ptr,
-    align_col_ptr,
-    request_indices_ptr,
-    idx_mapping_ptr,
-    state_indices_ptr,
-    num_accepted_ptr,
-    num_rows,
-    HAS_REQUEST_INDICES: tl.constexpr,
-):
-    """Point each committed request at the column the commit actually wrote.
-
-    ``valid`` and ``final_col`` come straight from the plan kernel, so the column
-    formula exists in exactly one place. Everything here is a fixed-length masked
-    store: no boolean indexing (which becomes a ``nonzero`` on Ascend, i.e. a
-    device synchronisation per step) and no data-dependent shape.
-    """
-    row = tl.program_id(0)
-    if row < num_rows:
-        valid = tl.load(align_valid_ptr + row)
-        if valid != 0:
-            request_idx = row
-            if HAS_REQUEST_INDICES:
-                request_idx = tl.load(request_indices_ptr + row).to(tl.int64)
-            slot = tl.load(idx_mapping_ptr + request_idx).to(tl.int64)
-            if slot >= 0:
-                tl.store(state_indices_ptr + slot, tl.load(align_col_ptr + row))
-                tl.store(num_accepted_ptr + slot, 1)
 
 
 @triton.jit
@@ -1234,14 +1190,6 @@ class GDNRecoverSSMCommitContext:
         # and must use the same attribute the serving path reads.
         context.records = list(replays)
         context.record_rows = int(replays[0].shape[0])
-        # align 簿记的输出缓冲：plan kernel 写、后处理读。构造后挂载，保持
-        # dataclass 字段顺序不变。
-        context.align_valid = torch.empty(
-            max_num_reqs, dtype=torch.int32, device=dev
-        )
-        context.align_col = torch.empty(
-            max_num_reqs, dtype=torch.int32, device=dev
-        )
         return context
 
     @classmethod
@@ -1315,25 +1263,6 @@ class GDNRecoverSSMCommitContext:
         for layer, record in zip(layers, records):
             layer._gdn_recoverssm_records = record
         return context
-
-    def apply_align(self, request_indices, idx_mapping, state_indices, num_accepted_tokens) -> None:
-        """Apply the plan's column decision to the running state indices."""
-        rows = int(request_indices.shape[0])
-        if rows == 0 or self.spec_query_len <= 0:
-            return
-        if getattr(self, "align_valid", None) is None or self.align_col is None:
-            return
-        _apply_align_kernel[(rows,)](
-            self.align_valid,
-            self.align_col,
-            request_indices,
-            idx_mapping,
-            state_indices,
-            num_accepted_tokens,
-            rows,
-            HAS_REQUEST_INDICES=True,
-            num_warps=1,
-        )
 
     def make_commit_specs(
         self,
@@ -1487,8 +1416,6 @@ class GDNRecoverSSMCommitContext:
                 self.final_state_indices,
                 self.boundary_state_indices,
                 self.boundary_recovery_lens,
-                self.align_valid,
-                self.align_col,
                 NULL_BLOCK_ID,
                 mamba_block_size or 1,
                 block_table.shape[1] if block_table is not None else 1,

@@ -149,31 +149,14 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
         # applied by the postprocess hook after this commit and before the native
         # align postcopy.
         if commit.block_table is not None:
-            _stage_align_update(commit.request_indices, n, context)
+            # The speculative window length lives on the BUILDER; ``self`` here is
+            # the metadata object, which has no such attribute (this line only
+            # runs in align mode, so the none-mode runs never reached it).
+            builder = self.recoverssm_builder
+            num_spec = getattr(builder, "num_spec", None)
+            window = None if num_spec is None else int(num_spec) + 1
+            _stage_align_update(commit, num_accepted_tokens, n, window)
         return None
-
-
-def _upload_rows(builder, rows: torch.Tensor, n: int, device) -> torch.Tensor:
-    """Copy the host-resolved rows to the device without blocking the stream.
-
-    ``Tensor.to(device)`` defaults to ``non_blocking=False``, and torch-npu's copy
-    path then synchronises the current stream before the transfer -- a per-step
-    stall. The native builder solves the same problem with a pinned CPU buffer and
-    an async copy, which is what this does (the buffers are allocated once).
-    """
-    cpu = getattr(builder, "_rec_rows_cpu", None)
-    dev = getattr(builder, "_rec_rows_dev", None)
-    if cpu is None or dev is None or cpu.numel() < n:
-        # Grow geometrically: the row count oscillates with the batch, and
-        # reallocating on every oscillation would defeat the purpose.
-        capacity = max(int(n), 2 * (cpu.numel() if cpu is not None else 0), 8)
-        cpu = torch.empty(capacity, dtype=torch.int32, pin_memory=True)
-        dev = torch.empty(capacity, dtype=torch.int32, device=device)
-        builder._rec_rows_cpu = cpu
-        builder._rec_rows_dev = dev
-    cpu[:n].copy_(rows.to(torch.int32))
-    dev[:n].copy_(cpu[:n], non_blocking=True)
-    return dev[:n]
 
 
 def _spec_rows_from_host_copy(builder, masks: torch.Tensor) -> torch.Tensor:
@@ -186,31 +169,49 @@ def _spec_rows_from_host_copy(builder, masks: torch.Tensor) -> torch.Tensor:
     return masks.nonzero(as_tuple=False).flatten()
 
 
-def _stage_align_update(request_indices, n: int, context) -> None:
-    """Remember what the postprocess hook needs to apply the plan's decision.
+def _stage_align_update(
+    commit, num_accepted_tokens, n: int, spec_query_len: int | None
+) -> None:
+    """Record ``(rows, final_col)`` so postprocess can fix the running column.
 
-    The column itself is NOT recomputed here: the plan kernel emits
-    ``valid``/``final_col`` and the apply kernel consumes them, so the formula
-    stays in one place (it used to be duplicated on the host, in eight device
-    operations per step).
+    RecoverSSM restores the accepted state itself, so the persistent running
+    column must become the column the commit actually wrote
+    (``floor(max(C + A - 1, 0) / block)``) and the persistent accepted count must
+    go back to the neutral 1. The generic Recover kernel uses a different column
+    formula, so returning its metadata would be wrong; this is the GDN-specific
+    bookkeeping instead.
     """
     global _PENDING_ALIGN
-    if request_indices is None:
-        # Without the batch-row mapping the persistent slot cannot be addressed;
-        # guessing an identity mapping would write another request's column.
-        logger.warning(
-            "Ascend GDN RecoverSSM: align bookkeeping skipped, the spec rows "
-            "have no batch-row mapping"
+    try:
+        import torch
+
+        rows = commit.request_indices
+        if rows is None:
+            # Without the batch-row mapping we cannot address the persistent
+            # request slots; guessing an identity mapping would write another
+            # request's column. Skip and say so.
+            logger.warning(
+                "Ascend GDN RecoverSSM: align bookkeeping skipped, the spec rows "
+                "have no batch-row mapping"
+            )
+            return
+        computed = commit.num_computed_tokens[rows.long()]
+        qsl = commit.query_start_loc
+        qlen = (qsl[1 : n + 1] - qsl[:n]).clamp(min=0)
+        # Same clamp chain as the plan kernel: max(0) -> query_len -> spec window.
+        accepted = num_accepted_tokens[rows.long()].clamp(min=0)
+        accepted = torch.minimum(accepted, qlen)
+        if spec_query_len is not None:
+            # Same bound as the plan kernel's SPEC_QUERY_LEN clamp; without it the
+            # column could point past the window the commit actually folded.
+            accepted = accepted.clamp(max=int(spec_query_len))
+        width = int(commit.block_table.shape[1])
+        col = ((computed + accepted - 1).clamp(min=0) // int(commit.block_size)).clamp(
+            max=width - 1
         )
-        return
-    _PENDING_ALIGN = {
-        "request_indices": request_indices[:n],
-        "rows": n,
-        # The context owns the align buffers this step's plan wrote into; keeping
-        # it here (instead of a module-level "last context") ties the payload to
-        # its owner, so a group that did not commit this step cannot be applied.
-        "context": context,
-    }
+        _PENDING_ALIGN = {"rows": rows, "cols": col}
+    except Exception as exc:  # never break the step on bookkeeping
+        logger.warning("Ascend GDN RecoverSSM: align bookkeeping skipped (%s)", exc)
 
 
 class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
@@ -230,7 +231,6 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._context: Any = None
         self._ctx_key: tuple | None = None
-        self._ctx_sentinel: tuple | None = None
         self._ctx_unbound_logged = False
         self._mapping_logged = False
         self._capturing = False
@@ -278,18 +278,6 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
                     "no" if kv is None else len(kv),
                 )
             return None
-
-        # Cheap sentinel first: a re-bind replaces the kv_cache tuple (or at least
-        # the tensors' storage), so neither the tuple identity nor the first base
-        # pointer can stay the same. Only when the sentinel changes is the full
-        # per-layer signature rebuilt -- that scan is ~128 Python calls and must
-        # not run every step.
-        # Per-layer tuple identity: catches a re-bind of ANY layer (a partial one
-        # included) for ~16 id() calls, instead of the full shape/stride/dtype scan.
-        sentinel = tuple(id(layer.kv_cache) for layer in layers)
-        if self._context is not None and sentinel == self._ctx_sentinel:
-            return self._context
-        self._ctx_sentinel = sentinel
 
         # Signature of EVERY participating layer's bound state tensors. Keying on
         # the first layer alone misses a partial re-bind (or a layout change) on
@@ -454,9 +442,9 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
                 return meta
             # The mapping is resolved on the host, but every consumer (the plan
             # kernel and the align bookkeeping) indexes device tensors, so it must
-            # reach the device. It goes through a pinned buffer with a
-            # non-blocking copy: `.to(device)` would synchronise the stream first.
-            request_indices = _upload_rows(self, rows[:n], n, state_indices.device)
+            # live on the same device. This is a tiny H2D copy (one int32 per spec
+            # row), not a sync.
+            request_indices = rows[:n].to(torch.int32).to(state_indices.device)
             if not self._mapping_logged:
                 self._mapping_logged = True
                 identity = bool(
