@@ -1089,11 +1089,11 @@ def test_graph_headroom_is_reserved_and_tunable():
         )
 
     os.environ.pop("GDN_RECOVERSSM_KV_MARGIN_MB", None)
-    # No reservation by default: the graph pool grows out of the utilisation slack
-    # exactly as it does for a baseline run, which is the proven-working case. Only
-    # the record scratch is deducted, with its exact size.
-    assert startup_patch._graph_margin_bytes(cfg("FULL_DECODE_ONLY")) == 0
-    assert startup_patch._graph_margin_bytes(cfg("NONE")) == 0
+    # 512 MiB by default, in both modes: vLLM fills the pool to the budget and the
+    # record scratch alone is enough to tip a 480 MiB sampling buffer over (observed
+    # with the default at 0). 2 GiB was a misdiagnosis that cost three slots.
+    assert startup_patch._graph_margin_bytes(cfg("FULL_DECODE_ONLY")) == 512 << 20
+    assert startup_patch._graph_margin_bytes(cfg("NONE")) == 512 << 20
 
     os.environ["GDN_RECOVERSSM_KV_MARGIN_MB"] = "512"
     assert startup_patch._graph_margin_bytes(cfg("FULL_DECODE_ONLY")) == 512 << 20

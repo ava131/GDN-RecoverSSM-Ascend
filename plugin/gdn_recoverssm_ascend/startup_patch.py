@@ -126,16 +126,16 @@ def _graph_margin_bytes(config) -> int:
     there; graph mode defaults to 2 GiB, which covers the ~1.9 GiB the 34 captured
     graphs need. ``GDN_RECOVERSSM_KV_MARGIN_MB`` overrides it.
     """
-    # Default 0: the graph pool grows out of the utilisation slack exactly as it
-    # does for a baseline run, and a baseline proves that works. Reserving "for the
-    # graph" was a mistake -- it cost ~2 GiB of KV capacity that the baseline never
-    # gives up, which is why the graph-mode concurrency came out at 22 instead of
-    # ~25. The only thing this plugin adds over the baseline is the record scratch,
-    # and that is deducted separately with its exact size.
+    # Default 512 MiB. Not zero: vLLM fills the pool up to the budget and leaves
+    # only (1 - utilisation) ~= 2.95 GiB for every transient buffer. A baseline run
+    # survives on that; this plugin additionally holds the record scratch (289 MiB),
+    # which is enough to tip a 480 MiB sampling buffer over -- observed exactly that
+    # way when the default was 0. Not 2048 either: 2 GiB was a misdiagnosis that cost
+    # ~3 concurrency slots.
     #
-    # The knob stays for the case where this machine's allocator fragments more than
-    # the baseline's: set GDN_RECOVERSSM_KV_MARGIN_MB=512 to buy headroom back.
-    default_mb = 0
+    # The right order of magnitude is "as much as the scratch", and
+    # GDN_RECOVERSSM_KV_MARGIN_MB overrides it for machines that fragment more.
+    default_mb = 512
     raw = os.environ.get(_MARGIN_ENV)
     try:
         mb = int(raw) if raw is not None else default_mb
