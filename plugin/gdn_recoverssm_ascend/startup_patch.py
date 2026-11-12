@@ -80,9 +80,10 @@ def install() -> None:
         logger.info(
             "Ascend GDN RecoverSSM KV budget: records %.1f MiB (%s) + graph "
             "headroom %.0f MiB = %.1f MiB deducted from available KV memory "
-            "(%.1f GiB -> %.1f GiB). The graph headroom exists because vLLM sizes "
-            "the pool to fill the budget and would otherwise leave capture short; "
-            "set %s to tune it (0 disables).",
+            "(%.1f GiB -> %.1f GiB). The graph headroom defaults to 0: the capture "
+            "pool grows out of the utilisation slack exactly as it does for a "
+            "baseline, and only the record scratch is ours to pay for. Set %s if a "
+            "machine fragments enough to need headroom.",
             reserve / (1024 * 1024),
             _record_scratch_desc(config),
             margin / (1024 * 1024),
@@ -125,16 +126,16 @@ def _graph_margin_bytes(config) -> int:
     there; graph mode defaults to 2 GiB, which covers the ~1.9 GiB the 34 captured
     graphs need. ``GDN_RECOVERSSM_KV_MARGIN_MB`` overrides it.
     """
-    compilation = getattr(config, "compilation_config", None)
-    mode = getattr(compilation, "cudagraph_mode", None)
-    # CUDAGraphMode is a plain Enum, but the value can also arrive as a string.
-    # Only an explicit NONE means "no graph pool"; anything unknown (including a
-    # config that has not resolved the mode yet) is treated as graph mode, because
-    # reserving too little fails the start while reserving too much only costs
-    # capacity.
-    name = (getattr(mode, "name", None) or str(mode or "")).upper()
-    eager = name == "NONE"
-    default_mb = 0 if eager else 2048
+    # Default 0: the graph pool grows out of the utilisation slack exactly as it
+    # does for a baseline run, and a baseline proves that works. Reserving "for the
+    # graph" was a mistake -- it cost ~2 GiB of KV capacity that the baseline never
+    # gives up, which is why the graph-mode concurrency came out at 22 instead of
+    # ~25. The only thing this plugin adds over the baseline is the record scratch,
+    # and that is deducted separately with its exact size.
+    #
+    # The knob stays for the case where this machine's allocator fragments more than
+    # the baseline's: set GDN_RECOVERSSM_KV_MARGIN_MB=512 to buy headroom back.
+    default_mb = 0
     raw = os.environ.get(_MARGIN_ENV)
     try:
         mb = int(raw) if raw is not None else default_mb

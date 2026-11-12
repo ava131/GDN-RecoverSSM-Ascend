@@ -1089,7 +1089,10 @@ def test_graph_headroom_is_reserved_and_tunable():
         )
 
     os.environ.pop("GDN_RECOVERSSM_KV_MARGIN_MB", None)
-    assert startup_patch._graph_margin_bytes(cfg("FULL_DECODE_ONLY")) == 2048 << 20
+    # No reservation by default: the graph pool grows out of the utilisation slack
+    # exactly as it does for a baseline run, which is the proven-working case. Only
+    # the record scratch is deducted, with its exact size.
+    assert startup_patch._graph_margin_bytes(cfg("FULL_DECODE_ONLY")) == 0
     assert startup_patch._graph_margin_bytes(cfg("NONE")) == 0
 
     os.environ["GDN_RECOVERSSM_KV_MARGIN_MB"] = "512"
