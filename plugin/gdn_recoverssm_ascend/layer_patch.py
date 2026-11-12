@@ -109,13 +109,24 @@ class _RecoverCommitProxy:
     def commit_step(self, *args, **kwargs):
         result = self._inner.commit_step(*args, **kwargs)
         try:
-            _apply_align_bookkeeping(kwargs.get("state_indices"), kwargs.get("num_accepted_tokens"), kwargs.get("idx_mapping") or (args[1] if len(args) > 1 else None))
+            _apply_align_bookkeeping(
+                kwargs.get("state_indices"),
+                kwargs.get("num_accepted_tokens"),
+                kwargs.get("idx_mapping") or (args[1] if len(args) > 1 else None),
+            )
         except Exception:
             pass
         return result
 
 
 def _apply_align_bookkeeping(state_indices, num_accepted_tokens, idx_mapping):
+    """Apply the plan kernel's column decision with one masked kernel.
+
+    The previous version indexed device tensors with a boolean mask, which on
+    Ascend lowers to ``nonzero`` -- a data-dependent shape, hence a device
+    synchronisation on every step. The plan kernel now emits ``valid`` and
+    ``final_col``; this only launches a fixed-length kernel.
+    """
     if state_indices is None or num_accepted_tokens is None or idx_mapping is None:
         return
     from . import builder as builder_mod
@@ -123,17 +134,12 @@ def _apply_align_bookkeeping(state_indices, num_accepted_tokens, idx_mapping):
     pending = builder_mod.take_pending_align()
     if not pending:
         return
-    rows = pending["rows"].long()
-    slots = idx_mapping[rows].long()
-    # Mask instead of branching: a `bool(tensor)` here would force a device
-    # synchronisation on every step.
-    keep = slots >= 0
-    slots = slots[keep]
-    cols = pending["cols"][keep]
-    # One request slot per committed batch row: point it at the column the commit
-    # actually wrote and reset the accepted count to the neutral value.
-    state_indices[slots] = cols.to(state_indices.dtype)
-    num_accepted_tokens[slots] = 1
+    context = pending.get("context")
+    if context is None:
+        return
+    context.apply_align(
+        pending["request_indices"], idx_mapping, state_indices, num_accepted_tokens
+    )
 
 
 def install() -> None:

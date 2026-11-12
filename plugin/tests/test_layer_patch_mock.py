@@ -1191,10 +1191,39 @@ def test_spec_row_mapping_never_calls_nonzero_on_device():
     body = ast.get_source_segment(src, build) or ""
     assert "masks.nonzero(" not in body.split("_spec_rows_from_host_copy")[0]
     assert "spec_sequence_masks_cpu" in src
-    # The host-side mapping must be moved to the compute device before use: the
-    # first version passed a CPU tensor into the commit and every step died with
-    # "commit inputs must be on the same device".
-    assert ".to(state_indices.device)" in src
+    # The mapping must reach the device through the pinned buffer with an async
+    # copy: `.to(device)` defaults to non_blocking=False, and torch-npu then
+    # synchronises the stream before the transfer (a per-step stall). The first
+    # version also passed a CPU tensor straight into the commit, which failed every
+    # step with "commit inputs must be on the same device".
+    assert "_upload_rows" in src
+    assert "non_blocking=True" in src
+    assert ".to(state_indices.device)" not in src
+    # no boolean-mask indexing left on the post-sampling path
+    assert "slots[keep]" not in src
+
+
+def test_align_apply_is_a_masked_kernel_not_boolean_indexing():
+    """The align apply must not use boolean-mask indexing.
+
+    ``slots[keep]`` lowers to ``nonzero`` on Ascend: a data-dependent shape, so a
+    device synchronisation every step. The plan kernel now emits valid/final_col
+    and a fixed-length kernel applies them.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend"
+    layer = (root / "layer_patch.py").read_text()
+    builder = (root / "builder.py").read_text()
+    kernels = (root / "kernels.py").read_text()
+
+    assert "[keep]" not in layer, "boolean-mask indexing is back in layer_patch"
+    assert "[keep]" not in builder, "boolean-mask indexing is back in builder"
+    assert "_apply_align_kernel" in kernels
+    assert "align_valid" in kernels and "align_col" in kernels
+    # the column formula must not be recomputed on the host any more
+    assert "computed + accepted" not in builder
+    assert "apply_align(" in layer
 
 
 def test_state_calculator_patch():
