@@ -213,56 +213,55 @@ def check_local_use_before_assignment() -> list[str]:
     return problems
 
 
-def check_no_nested_tuples_in_kernels() -> list[str]:
-    """Triton-Ascend 3.2.2 cannot build a tuple whose elements are tuples.
+def check_no_tuple_values_in_kernels() -> list[str]:
+    """A triton kernel may not hold a tuple in a variable on this toolchain.
 
-    A staged window written as ``staged = (load(t0), load(t1), ...)`` where
-    ``load`` returns a 5-tuple makes the device compiler fail at capture time:
+    Triton-Ascend 3.2.2 fails on both shapes we tried for a staged window:
 
-        TypeError: cannot convert (<tensor>, ...) of type <class 'tuple'> to tensor
+        staged = (load(t0), load(t1), ...)   # TypeError: cannot convert tuple
+        staged = (q0, q1, ...); staged[t]    # ValueError: unsupported tensor index
 
-    Only the NPU compiler rejects it, so it is checked statically here: inside a
-    ``triton.jit`` kernel, a tuple literal must not contain a nested tuple literal
-    and must not contain a call to a function that returns a tuple.
+    So, inside a kernel: a tuple literal may not be assigned to a name (only
+    unpacking into names is allowed), and a name bound to a tuple may not be
+    subscripted. Both are checked statically; only the NPU compiler would catch
+    them otherwise.
     """
     tree = ast.parse(KERNELS.read_text())
-
-    tuple_returning = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            for sub in ast.walk(node):
-                if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Tuple):
-                    tuple_returning.add(node.name)
-                    break
-
     problems: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
             continue
         is_kernel = any(
-            (isinstance(d, ast.Call) and getattr(d.func, "attr", "") == "jit")
-            or (isinstance(d, ast.Attribute) and d.attr == "jit")
+            isinstance(d, ast.Call) and getattr(d.func, "attr", "") == "jit"
             for d in node.decorator_list
         ) or node.name.endswith("_kernel")
         if not is_kernel:
             continue
+        tuple_names: set[str] = set()
         for sub in ast.walk(node):
-            if not isinstance(sub, ast.Tuple):
-                continue
-            for elt in sub.elts:
-                if isinstance(elt, ast.Tuple):
-                    problems.append(
-                        f"{node.name}: nested tuple literal at line {elt.lineno}"
-                    )
-                elif (
-                    isinstance(elt, ast.Call)
-                    and isinstance(elt.func, ast.Name)
-                    and elt.func.id in tuple_returning
-                ):
-                    problems.append(
-                        f"{node.name}: tuple element calls tuple-returning "
-                        f"{elt.func.id}() at line {elt.lineno}"
-                    )
+            if isinstance(sub, ast.Assign) and isinstance(sub.value, ast.Tuple):
+                for tgt in sub.targets:
+                    if isinstance(tgt, ast.Name):
+                        tuple_names.add(tgt.id)
+                        problems.append(
+                            f"{node.name}: binds a tuple to {tgt.id!r} "
+                            f"(line {sub.lineno})"
+                        )
+            if isinstance(sub, ast.Tuple):
+                for elt in sub.elts:
+                    if isinstance(elt, ast.Tuple):
+                        problems.append(
+                            f"{node.name}: nested tuple literal at line {elt.lineno}"
+                        )
+            if (
+                isinstance(sub, ast.Subscript)
+                and isinstance(sub.value, ast.Name)
+                and sub.value.id in tuple_names
+            ):
+                problems.append(
+                    f"{node.name}: indexes tuple {sub.value.id!r} "
+                    f"(line {sub.lineno})"
+                )
     return problems
 
 
@@ -308,7 +307,7 @@ def test_kernel_launch_contract() -> None:
         check()
         + check_local_use_before_assignment()
         + check_dataclass_field_order()
-        + check_no_nested_tuples_in_kernels()
+        + check_no_tuple_values_in_kernels()
     )
     assert not problems, "\n".join(problems)
 

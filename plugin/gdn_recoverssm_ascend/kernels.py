@@ -605,227 +605,43 @@ def _gdn_recoverssm_verify_kernel(
             rec_base = (
                 replay_ptr + pid_b * stride_replay_block + pid_hv * stride_replay_head
             )
-            # Load the whole short window before the recurrent dependency
-            # chain. Keep Q/K/V in their input dtype until consumed. This tuple
-            # has compile-time indices; it needs neither device gather nor an
-            # extra reduction for each token. Unused Q slots are compile-time
-            # masked away for this specialization.
-            _q0, _k0, _v0, _d0, _b0 = _load_verify_token(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                g_ptr,
-                beta_ptr,
-                bos,
-                query_len,
-                total_tokens,
-                pid_h,
-                pid_hv,
-                offs_k,
-                offs_v,
-                mask_k,
-                mask_v,
-                stride_q_token,
-                stride_k_token,
-                stride_v_token,
-                stride_g_token,
-                stride_beta_token,
-                K,
-                V,
-                SPEC_QUERY_LEN,
-                0,
-            )
-            _q1, _k1, _v1, _d1, _b1 = _load_verify_token(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                g_ptr,
-                beta_ptr,
-                bos,
-                query_len,
-                total_tokens,
-                pid_h,
-                pid_hv,
-                offs_k,
-                offs_v,
-                mask_k,
-                mask_v,
-                stride_q_token,
-                stride_k_token,
-                stride_v_token,
-                stride_g_token,
-                stride_beta_token,
-                K,
-                V,
-                SPEC_QUERY_LEN,
-                1,
-            )
-            _q2, _k2, _v2, _d2, _b2 = _load_verify_token(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                g_ptr,
-                beta_ptr,
-                bos,
-                query_len,
-                total_tokens,
-                pid_h,
-                pid_hv,
-                offs_k,
-                offs_v,
-                mask_k,
-                mask_v,
-                stride_q_token,
-                stride_k_token,
-                stride_v_token,
-                stride_g_token,
-                stride_beta_token,
-                K,
-                V,
-                SPEC_QUERY_LEN,
-                2,
-            )
-            _q3, _k3, _v3, _d3, _b3 = _load_verify_token(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                g_ptr,
-                beta_ptr,
-                bos,
-                query_len,
-                total_tokens,
-                pid_h,
-                pid_hv,
-                offs_k,
-                offs_v,
-                mask_k,
-                mask_v,
-                stride_q_token,
-                stride_k_token,
-                stride_v_token,
-                stride_g_token,
-                stride_beta_token,
-                K,
-                V,
-                SPEC_QUERY_LEN,
-                3,
-            )
-            _q4, _k4, _v4, _d4, _b4 = _load_verify_token(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                g_ptr,
-                beta_ptr,
-                bos,
-                query_len,
-                total_tokens,
-                pid_h,
-                pid_hv,
-                offs_k,
-                offs_v,
-                mask_k,
-                mask_v,
-                stride_q_token,
-                stride_k_token,
-                stride_v_token,
-                stride_g_token,
-                stride_beta_token,
-                K,
-                V,
-                SPEC_QUERY_LEN,
-                4,
-            )
-            _q5, _k5, _v5, _d5, _b5 = _load_verify_token(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                g_ptr,
-                beta_ptr,
-                bos,
-                query_len,
-                total_tokens,
-                pid_h,
-                pid_hv,
-                offs_k,
-                offs_v,
-                mask_k,
-                mask_v,
-                stride_q_token,
-                stride_k_token,
-                stride_v_token,
-                stride_g_token,
-                stride_beta_token,
-                K,
-                V,
-                SPEC_QUERY_LEN,
-                5,
-            )
-            _q6, _k6, _v6, _d6, _b6 = _load_verify_token(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                g_ptr,
-                beta_ptr,
-                bos,
-                query_len,
-                total_tokens,
-                pid_h,
-                pid_hv,
-                offs_k,
-                offs_v,
-                mask_k,
-                mask_v,
-                stride_q_token,
-                stride_k_token,
-                stride_v_token,
-                stride_g_token,
-                stride_beta_token,
-                K,
-                V,
-                SPEC_QUERY_LEN,
-                6,
-            )
-            _q7, _k7, _v7, _d7, _b7 = _load_verify_token(
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                g_ptr,
-                beta_ptr,
-                bos,
-                query_len,
-                total_tokens,
-                pid_h,
-                pid_hv,
-                offs_k,
-                offs_v,
-                mask_k,
-                mask_v,
-                stride_q_token,
-                stride_k_token,
-                stride_v_token,
-                stride_g_token,
-                stride_beta_token,
-                K,
-                V,
-                SPEC_QUERY_LEN,
-                7,
-            )
-            staged_q = (_q0, _q1, _q2, _q3, _q4, _q5, _q6, _q7)
-            staged_k = (_k0, _k1, _k2, _k3, _k4, _k5, _k6, _k7)
-            staged_v = (_v0, _v1, _v2, _v3, _v4, _v5, _v6, _v7)
-            staged_d = (_d0, _d1, _d2, _d3, _d4, _d5, _d6, _d7)
-            staged_b = (_b0, _b1, _b2, _b3, _b4, _b5, _b6, _b7)
             for t in tl.static_range(SPEC_QUERY_LEN):
                 tok = bos + t
                 # The window may be shorter than the token tensor, never longer:
                 # ``spec_query_start_loc`` can describe graph-padded rows.
                 valid = (t < query_len) & (tok >= 0) & (tok < total_tokens)
-                q = staged_q[t].to(tl.float32)
-                raw_k = staged_k[t]
+                # Loaded per token inside the unrolled loop: Triton-Ascend 3.2.2
+                # rejects a staged window held in a tuple (nested tuples are not
+                # convertible, and a tuple of tensors cannot be indexed by a
+                # constexpr -- "unsupported tensor index: constexpr[0]").
+                q, raw_k, v, decay, beta = _load_verify_token(
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    g_ptr,
+                    beta_ptr,
+                    bos,
+                    query_len,
+                    total_tokens,
+                    pid_h,
+                    pid_hv,
+                    offs_k,
+                    offs_v,
+                    mask_k,
+                    mask_v,
+                    stride_q_token,
+                    stride_k_token,
+                    stride_v_token,
+                    stride_g_token,
+                    stride_beta_token,
+                    K,
+                    V,
+                    SPEC_QUERY_LEN,
+                    t,
+                )
+                q = q.to(tl.float32)
                 k = raw_k.to(tl.float32)
-                v = staged_v[t].to(tl.float32)
-                decay = staged_d[t]
-                beta = staged_b[t]
+                v = v.to(tl.float32)
                 if USE_QK_L2NORM:
                     # Same epsilon as FLA l2norm_fwd so both paths agree.
                     q = q * tl.rsqrt(tl.sum(q * q) + 1e-6)
