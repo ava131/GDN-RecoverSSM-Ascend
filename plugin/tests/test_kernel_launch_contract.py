@@ -226,7 +226,17 @@ def check_no_tuple_values_in_kernels() -> list[str]:
     subscripted. Both are checked statically; only the NPU compiler would catch
     them otherwise.
     """
-    tree = ast.parse(KERNELS.read_text())
+    problems: list[str] = []
+    sources = sorted(KERNELS.parent.glob("*.py"))
+    for path in sources:
+        # The rule applies to every module that defines device kernels, not just
+        # the main one: the grouped publisher hit it too.
+        tree = ast.parse(path.read_text())
+        problems.extend(_scan_tuples(tree, path.name))
+    return problems
+
+
+def _scan_tuples(tree: ast.AST, label: str) -> list[str]:
     problems: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
@@ -244,14 +254,15 @@ def check_no_tuple_values_in_kernels() -> list[str]:
                     if isinstance(tgt, ast.Name):
                         tuple_names.add(tgt.id)
                         problems.append(
-                            f"{node.name}: binds a tuple to {tgt.id!r} "
+                            f"{label}:{node.name}: binds a tuple to {tgt.id!r} "
                             f"(line {sub.lineno})"
                         )
             if isinstance(sub, ast.Tuple):
                 for elt in sub.elts:
                     if isinstance(elt, ast.Tuple):
                         problems.append(
-                            f"{node.name}: nested tuple literal at line {elt.lineno}"
+                            f"{label}:{node.name}: nested tuple literal at "
+                            f"line {elt.lineno}"
                         )
             if (
                 isinstance(sub, ast.Subscript)
@@ -259,7 +270,7 @@ def check_no_tuple_values_in_kernels() -> list[str]:
                 and sub.value.id in tuple_names
             ):
                 problems.append(
-                    f"{node.name}: indexes tuple {sub.value.id!r} "
+                    f"{label}:{node.name}: indexes tuple {sub.value.id!r} "
                     f"(line {sub.lineno})"
                 )
     return problems

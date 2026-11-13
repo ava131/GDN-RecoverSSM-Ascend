@@ -88,24 +88,40 @@ def _grouped_plan_kernel(
     ALIGN_MODE: tl.constexpr,
     PUBLISH_ALIGN: tl.constexpr,
 ):
-    # Triton-Ascend 3.2.2 cannot bind runtime Python tuples as kernel
-    # arguments. Local tuples are compile-time indexing constructs only.
-    state_ptrs = (state0, state1, state2)
-    qsl_ptrs = (qsl0, qsl1, qsl2)
-    mapping_ptrs = (mapping0, mapping1, mapping2)
-    table_ptrs = (table0, table1, table2)
-    computed_ptrs = (computed0, computed1, computed2)
-    table_widths = (table_width0, table_width1, table_width2)
-    table_row_strides = (table_row_stride0, table_row_stride1, table_row_stride2)
+    # Triton-Ascend 3.2.2 supports neither nested tuples nor indexing a tuple of
+    # runtime values by a constexpr ("unsupported tensor index: constexpr[0]"), so
+    # the per-group values are selected with a compile-time branch instead of a
+    # tuple lookup.
     row = tl.program_id(0)
     all_valid = tl.full((), True, tl.int1)
     shared_col = tl.full((), -1, tl.int32)
     shared_request = tl.full((), -1, tl.int64)
     for group in tl.static_range(NUM_GROUPS):
-        request = tl.load(mapping_ptrs[group] + row * MAP_STRIDES[group]).to(tl.int64)
-        source = tl.load(state_ptrs[group] + row * SI_STRIDES[group]).to(tl.int64)
-        bos = tl.load(qsl_ptrs[group] + row * QSL_STRIDES[group]).to(tl.int64)
-        eos = tl.load(qsl_ptrs[group] + (row + 1) * QSL_STRIDES[group]).to(tl.int64)
+        if group == 0:
+            state_p, qsl_p, mapping_p, table_p = state0, qsl0, mapping0, table0
+            computed_p, table_width, table_row_stride = (
+                computed0,
+                table_width0,
+                table_row_stride0,
+            )
+        elif group == 1:
+            state_p, qsl_p, mapping_p, table_p = state1, qsl1, mapping1, table1
+            computed_p, table_width, table_row_stride = (
+                computed1,
+                table_width1,
+                table_row_stride1,
+            )
+        else:
+            state_p, qsl_p, mapping_p, table_p = state2, qsl2, mapping2, table2
+            computed_p, table_width, table_row_stride = (
+                computed2,
+                table_width2,
+                table_row_stride2,
+            )
+        request = tl.load(mapping_p + row * MAP_STRIDES[group]).to(tl.int64)
+        source = tl.load(state_p + row * SI_STRIDES[group]).to(tl.int64)
+        bos = tl.load(qsl_p + row * QSL_STRIDES[group]).to(tl.int64)
+        eos = tl.load(qsl_p + (row + 1) * QSL_STRIDES[group]).to(tl.int64)
         qlen = eos - bos
         accepted = tl.load(sampled_ptr + request).to(tl.int32)
         count = tl.minimum(tl.maximum(accepted, 0), qlen)
@@ -117,17 +133,17 @@ def _grouped_plan_kernel(
         computed_ok = tl.full((), True, tl.int1)
         if ALIGN_MODE:
             computed = tl.load(
-                computed_ptrs[group] + request * COMPUTED_STRIDES[group]
+                computed_p + request * COMPUTED_STRIDES[group]
             ).to(tl.int64)
             computed_ok = computed >= 0
             position = computed + count
             col = tl.minimum(
                 tl.maximum(position - 1, 0) // BLOCK_SIZES[group],
-                table_widths[group] - 1,
+                table_width - 1,
             ).to(tl.int32)
             final = tl.load(
-                table_ptrs[group]
-                + request * table_row_strides[group]
+                table_p
+                + request * table_row_stride
                 + col * TABLE_COL_STRIDES[group]
             ).to(tl.int64)
             next_boundary = (computed // BLOCK_SIZES[group] + 1) * BLOCK_SIZES[group]
@@ -135,13 +151,13 @@ def _grouped_plan_kernel(
             boundary_len = (next_boundary - computed).to(tl.int32)
             boundary_col = next_boundary // BLOCK_SIZES[group] - 1
             boundary = tl.load(
-                table_ptrs[group]
-                + request * table_row_strides[group]
+                table_p
+                + request * table_row_stride
                 + boundary_col * TABLE_COL_STRIDES[group],
                 mask=crossed
                 & computed_ok
                 & (boundary_col >= 0)
-                & (boundary_col < table_widths[group]),
+                & (boundary_col < table_width),
                 other=null_block_id,
             ).to(tl.int64)
         geometry = (bos >= 0) & (bos <= eos) & (qlen <= SPEC_QUERY_LEN)
