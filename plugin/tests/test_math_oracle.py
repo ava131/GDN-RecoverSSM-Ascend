@@ -153,7 +153,9 @@ def test_record_layout_roundtrip():
 # --------------------------------------------------------------------------- #
 # align mode: commit-plan boundary arithmetic
 # --------------------------------------------------------------------------- #
-def commit_plan(num_computed: int, mamba_block_size: int, accepted: int, block_table_width: int):
+def commit_plan(
+    num_computed: int, mamba_block_size: int, accepted: int, block_table_width: int
+):
     """Mirror of the boundary computation in ``_prepare_commit_plan_kernel``.
 
     Returns (final_block_col, boundary_block_col_or_None, boundary_len).
@@ -183,10 +185,22 @@ def test_commit_destinations_are_allocated():
     so the write can land on a null page.
     """
     block = 128
-    for computed, accepted in ((124, 4), (125, 3), (126, 2), (127, 1), (128, 1), (255, 1)):
+    for computed, accepted in (
+        (124, 4),
+        (125, 3),
+        (126, 2),
+        (127, 1),
+        (128, 1),
+        (255, 1),
+    ):
         col, _, _ = commit_plan(computed, block, accepted, 8)
         needed_blocks = -(-(computed + accepted) // block)  # ceil
-        assert col <= max(needed_blocks - 1, 0), (computed, accepted, col, needed_blocks)
+        assert col <= max(needed_blocks - 1, 0), (
+            computed,
+            accepted,
+            col,
+            needed_blocks,
+        )
 
 
 def test_boundary_state_starts_from_same_checkpoint():
@@ -206,8 +220,8 @@ def test_boundary_state_starts_from_same_checkpoint():
         return h
 
     records = [corr] * 3
-    assert abs(fold(3, h0) - 3.0) < 1e-12                     # final
-    assert abs(fold(2, h0) - 4.0) < 1e-12                     # boundary, one pass
+    assert abs(fold(3, h0) - 3.0) < 1e-12  # final
+    assert abs(fold(2, h0) - 4.0) < 1e-12  # boundary, one pass
 
     # single pass: snapshot after 2 steps, continue to 3
     h, boundary = h0, None
@@ -243,7 +257,6 @@ def test_commit_non_square():
     h0 = rng.standard_normal((V, K))
     records = rng.standard_normal((4, V + K + 1))
     records[:, V + K] = rng.random(4) * 0.5
-    h = h0.copy()
     for a in range(5):
         assert commit(h0, records[:a], a).shape == (V, K)
     ref = h0.copy()
@@ -271,9 +284,7 @@ def test_bounded_dispatch_covers_every_tile():
             assert len(seen) == M, (nv, rows, heads, cap, len(seen))
             assert sorted(seen) == list(range(M)), (nv, rows, heads, cap)
             # every (tile, row, head) triple appears exactly once
-            triples = {
-                (w % nv, (w // nv) % rows, w // nv // rows) for w in range(M)
-            }
+            triples = {(w % nv, (w // nv) % rows, w // nv // rows) for w in range(M)}
             assert len(triples) == M
 
 
@@ -285,12 +296,12 @@ def test_dispatch_keeps_boundary_and_final_semantics():
     guard per-tile. This models the guard.
     """
     M, P = 10, 3
-    invalid = {2, 5}          # rows that must become no-ops
+    invalid = {2, 5}  # rows that must become no-ops
     executed = []
     for pid in range(P):
         for work in range(pid, M, P):
             if work in invalid:
-                continue      # per-tile no-op, NOT a function return
+                continue  # per-tile no-op, NOT a function return
             executed.append(work)
     assert sorted(executed) == [w for w in range(M) if w not in invalid]
     assert len(executed) == M - len(invalid)
@@ -304,7 +315,13 @@ def test_align_running_column_after_commit():
     next round targets column 1 again and reads the stale S126.
     """
     block = 128
-    for C, A, expected in ((126, 1, 0), (127, 1, 0), (128, 1, 1), (124, 4, 0), (255, 1, 1)):
+    for C, A, expected in (
+        (126, 1, 0),
+        (127, 1, 0),
+        (128, 1, 1),
+        (124, 4, 0),
+        (255, 1, 1),
+    ):
         col = max(C + A - 1, 0) // block
         assert col == expected, (C, A, col, expected)
     # the value the generic Recover kernel would use is different at a boundary
@@ -316,7 +333,7 @@ def test_align_bookkeeping_maps_rows_to_slots():
     """Only committed rows are touched, mapped through idx_mapping."""
     rows = [0, 2]
     cols = [0, 1]
-    idx_mapping = [7, -1, 3]        # batch row -> request slot (-1 = inactive)
+    idx_mapping = [7, -1, 3]  # batch row -> request slot (-1 = inactive)
     state = [9, 9, 9, 9, 9, 9, 9, 9]
     accepted = [9] * 8
     for row, col in zip(rows, cols):
@@ -327,7 +344,7 @@ def test_align_bookkeeping_maps_rows_to_slots():
         accepted[slot] = 1
     assert state[7] == 0 and state[3] == 1
     assert accepted[7] == 1 and accepted[3] == 1
-    assert state[0] == 9          # untouched slots keep their value
+    assert state[0] == 9  # untouched slots keep their value
 
 
 if __name__ == "__main__":

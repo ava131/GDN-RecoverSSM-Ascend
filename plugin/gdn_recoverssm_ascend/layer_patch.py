@@ -33,7 +33,6 @@ import os
 import threading
 
 import torch
-
 from vllm.logger import init_logger
 
 logger = init_logger("vllm.gdn_recoverssm_ascend." + __name__.rsplit(".", 1)[-1])
@@ -107,33 +106,47 @@ class _RecoverCommitProxy:
         return self._inner.record_step(*args, **kwargs)
 
     def commit_step(self, *args, **kwargs):
-        result = self._inner.commit_step(*args, **kwargs)
-        try:
-            _apply_align_bookkeeping(kwargs.get("state_indices"), kwargs.get("num_accepted_tokens"), kwargs.get("idx_mapping") or (args[1] if len(args) > 1 else None))
-        except Exception:
-            pass
-        return result
+        # Consume the exact step once, before a following prepare can replace it.
+        # The coordinator owns all GDN groups; generic metadata still delegates
+        # to the upstream RecoverSSMState implementation.
+        sampled = args[0] if args else kwargs.get("num_sampled")
+        mapping = args[1] if len(args) > 1 else kwargs.get("idx_mapping")
+        step = getattr(self._inner, "_step", None)
+        if isinstance(sampled, int) or step is None:
+            return self._inner.commit_step(*args, **kwargs)
+        from time import perf_counter_ns
 
+        from . import diagnostics
+        from .grouped_commit import GroupedCommitCoordinator
 
-def _apply_align_bookkeeping(state_indices, num_accepted_tokens, idx_mapping):
-    if state_indices is None or num_accepted_tokens is None or idx_mapping is None:
-        return
-    from . import builder as builder_mod
-
-    pending = builder_mod.take_pending_align()
-    if not pending:
-        return
-    rows = pending["rows"].long()
-    slots = idx_mapping[rows].long()
-    # Mask instead of branching: a `bool(tensor)` here would force a device
-    # synchronisation on every step.
-    keep = slots >= 0
-    slots = slots[keep]
-    cols = pending["cols"][keep]
-    # One request slot per committed batch row: point it at the column the commit
-    # actually wrote and reset the accepted count to the neutral value.
-    state_indices[slots] = cols.to(state_indices.dtype)
-    num_accepted_tokens[slots] = 1
+        gdn = tuple(
+            m for m in step if getattr(m, "recoverssm_commit", None) is not None
+        )
+        other = tuple(m for m in step if getattr(m, "recoverssm_commit", None) is None)
+        self._inner._step = None
+        coordinator = getattr(self._inner, "_gdn_commit_coordinator", None)
+        if coordinator is None:
+            coordinator = GroupedCommitCoordinator()
+            self._inner._gdn_commit_coordinator = coordinator
+        start = perf_counter_ns()
+        if gdn:
+            coordinator.commit(
+                gdn,
+                sampled,
+                mapping,
+                kwargs.get("state_indices"),
+                kwargs.get("num_accepted_tokens"),
+            )
+            diagnostics.host_commit(
+                (perf_counter_ns() - start) / 1000.0,
+                coordinator.last_group_count,
+                coordinator.last_launch_count,
+                coordinator.last_rows,
+            )
+        if other:
+            self._inner._step = other
+            return self._inner.commit_step(*args, **kwargs)
+        return None
 
 
 def install() -> None:
@@ -182,6 +195,19 @@ def install() -> None:
         def _forward_core(self, *args, _original=original_core, **kwargs):
             depth = _push_layer(self)
             try:
+                # The pinned native ABI has four tensor arguments. Older/mock
+                # callers without that ABI retain the exact original path.
+                if _enabled(self) and (
+                    len(args) >= 4
+                    or all(
+                        key in kwargs
+                        for key in ("mixed_qkv", "b", "a", "core_attn_out")
+                    )
+                ):
+                    from .spec_forward import try_spec_forward
+
+                    if try_spec_forward(self, *args, **kwargs):
+                        return None
                 return _original(self, *args, **kwargs)
             finally:
                 _pop_layer(depth)
@@ -235,8 +261,23 @@ def install() -> None:
             # (input_batch, cudagraph_mode, block_tables, slot_mappings,
             #  attn_groups, kv_cache_config, for_capture=False, ubatch_idx=0)
             attn_groups = args[4] if len(args) > 4 else []
-        for_capture = bool(kwargs.get("for_capture", False))
+        for_capture = bool(
+            kwargs.get("for_capture", args[6] if len(args) > 6 else False)
+        )
         recoverssm.record_step(attn_metadata, attn_groups, for_capture=for_capture)
+        if not for_capture:
+            from . import diagnostics
+
+            batch = args[0] if args else kwargs.get("input_batch")
+            rows = None
+            for meta in attn_metadata.values():
+                commit = getattr(meta, "recoverssm_commit", None)
+                if commit is not None:
+                    rows = commit.request_rows
+                    break
+            if batch is not None:
+                diagnostics.note_step(rows, int(batch.num_tokens), int(batch.num_reqs))
+
         return attn_metadata
 
     state_cls.prepare_attn = prepare_attn
@@ -350,7 +391,7 @@ def _trace_step(layer, attn_metadata, rows, total, query_start_loc, checkpoint_i
     )
 
 
-def _verify(layer, q, k, v, ssm_state, kwargs):
+def _verify(layer, q, k, v, ssm_state, kwargs, out=None):
     """Run the RecoverSSM verify for one speculative window.
 
     ``q``/``k`` are ``[T, H, K]`` and already L2-normalised by the caller
@@ -366,9 +407,7 @@ def _verify(layer, q, k, v, ssm_state, kwargs):
 
     attn_metadata = get_forward_context().attn_metadata[layer.prefix]
     if attn_metadata.spec_query_start_loc is None:
-        raise RuntimeError(
-            "Ascend GDN RecoverSSM: spec_query_start_loc is required"
-        )
+        raise RuntimeError("Ascend GDN RecoverSSM: spec_query_start_loc is required")
 
     # Authoritative spec-row count: the length of ``spec_query_start_loc``.
     # ``num_spec_decodes`` can count graph-padded rows, and the stock Ascend code
@@ -416,6 +455,18 @@ def _verify(layer, q, k, v, ssm_state, kwargs):
     # the time a verify runs, because the builder creates it during the commit
     # context preparation that startup performs before warmup.
     records = _records_for(layer)
+    producer = getattr(attn_metadata, "recoverssm_context", None)
+    if producer is not None:
+        builder = attn_metadata.recoverssm_builder
+        layer_index = builder.layer_names.index(layer.prefix)
+        if (
+            producer.checkpoints[layer_index] is not kv_cache[1]
+            or producer.records[layer_index] is not records
+        ):
+            raise RuntimeError(
+                "GDN binding changed between metadata construction and verify; "
+                "refusing to mix checkpoint and record epochs"
+            )
 
     _COUNTERS["verify_calls"] += 1
     _COUNTERS["last_rows"] = rows
@@ -434,8 +485,7 @@ def _verify(layer, q, k, v, ssm_state, kwargs):
         spec_query_len=layer.num_spec + 1,
         scale=kwargs.get("scale"),
         qk_already_normalized=True,
+        out=out,
     )
     # The stock kernel returns [T, HV, V] and the layer adds the batch dim.
     return out.squeeze(0)
-
-

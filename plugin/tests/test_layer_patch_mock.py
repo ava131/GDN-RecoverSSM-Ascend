@@ -30,8 +30,10 @@ class FakeTensor:
 
     def __init__(self, data=None, shape=None, dtype=None):
         self.data = np.asarray(data) if data is not None else None
-        self.shape = tuple(shape) if shape is not None else (
-            self.data.shape if self.data is not None else ()
+        self.shape = (
+            tuple(shape)
+            if shape is not None
+            else (self.data.shape if self.data is not None else ())
         )
         self.dtype = dtype
 
@@ -51,10 +53,18 @@ class FakeTensor:
         return FakeTensor(shape=self.shape)
 
     def min(self):
-        return FakeTensor(np.array(int(self.data.min()))) if self.data is not None else FakeTensor()
+        return (
+            FakeTensor(np.array(int(self.data.min())))
+            if self.data is not None
+            else FakeTensor()
+        )
 
     def max(self):
-        return FakeTensor(np.array(int(self.data.max()))) if self.data is not None else FakeTensor()
+        return (
+            FakeTensor(np.array(int(self.data.max())))
+            if self.data is not None
+            else FakeTensor()
+        )
 
     def item(self):
         return int(self.data) if self.data is not None else 0
@@ -85,6 +95,7 @@ class FakeTensor:
 def _install_torch_stub():
     torch = types.ModuleType("torch")
     torch.float32 = "float32"
+    torch.int32 = "int32"
     torch.long = "long"
     torch.Tensor = FakeTensor
     sys.modules.setdefault("torch", torch)
@@ -188,13 +199,20 @@ def _install_gdn_stub():
         def __init__(self):
             self.recoverssm = _RecoverSSMState()
 
-        def prepare_attn(self, input_batch, cudagraph_mode, block_tables,
-                         slot_mappings, attn_groups, kv_cache_config,
-                         for_capture=False, ubatch_idx=0):
+        def prepare_attn(
+            self,
+            input_batch,
+            cudagraph_mode,
+            block_tables,
+            slot_mappings,
+            attn_groups,
+            kv_cache_config,
+            for_capture=False,
+            ubatch_idx=0,
+        ):
             return {"layer.0": "metadata"}
 
-        def postprocess_state(self, idx_mapping, num_sampled,
-                              num_computed_tokens=None):
+        def postprocess_state(self, idx_mapping, num_sampled, num_computed_tokens=None):
             return None
 
     # Faithful three-class topology: base (vLLM), real layer (vLLM subclass),
@@ -237,8 +255,11 @@ def _install_gdn_stub():
     ascend.ops = ops
     sys.modules["vllm_ascend"] = ascend
     sys.modules["vllm_ascend.ops"] = ops
-    for name in ("vllm_ascend.worker", "vllm_ascend.worker.v2",
-                 "vllm_ascend.worker.v2.model_states"):
+    for name in (
+        "vllm_ascend.worker",
+        "vllm_ascend.worker.v2",
+        "vllm_ascend.worker.v2.model_states",
+    ):
         m = types.ModuleType(name)
         m.__path__ = []
         sys.modules[name] = m
@@ -262,8 +283,10 @@ def _install_gdn_stub():
         donor = AscendGatedDeltaNetAttention
         original_init = QwenGatedDeltaNetAttention.__init__
         if use_saved_init:
+
             def _init(self, *a, **k):
                 original_init(self, *a, **k)
+
             QwenGatedDeltaNetAttention.__init__ = _init
         QwenGatedDeltaNetAttention._forward_core = donor._forward_core
         QwenGatedDeltaNetAttention.get_attn_backend = donor.get_attn_backend
@@ -271,9 +294,12 @@ def _install_gdn_stub():
     QwenGatedDeltaNetAttention._simulate_worker_patch = staticmethod(
         _simulate_worker_patch
     )
-    for name in ("vllm.model_executor", "vllm.model_executor.layers",
-                 "vllm.model_executor.layers.mamba",
-                 "vllm.model_executor.layers.mamba.gdn"):
+    for name in (
+        "vllm.model_executor",
+        "vllm.model_executor.layers",
+        "vllm.model_executor.layers.mamba",
+        "vllm.model_executor.layers.mamba.gdn",
+    ):
         m = types.ModuleType(name)
         m.__path__ = []
         sys.modules[name] = m
@@ -534,7 +560,7 @@ def test_worker_patch_order_independent():
     captured = _install_kernels_stub()
 
     layer_patch.install()
-    cls._simulate_worker_patch()          # worker runs second and overwrites
+    cls._simulate_worker_patch()  # worker runs second and overwrites
 
     layer = cls()
     assert layer.get_attn_backend().get_name() == "ASCEND_GDN_RECOVERSSM"
@@ -571,6 +597,7 @@ def test_graph_probe_logs_task_count():
     """The probe must log descriptor + updatable task count before replaying."""
     _install_torch_stub()
     _install_vllm_stubs()
+    _install_gdn_stub()
 
     calls = {"replay": 0}
 
@@ -597,6 +624,8 @@ def test_graph_probe_logs_task_count():
 
     graph_probe._APPLIED = False
     graph_probe._SEEN.clear()
+    graph_probe._FAILED.clear()
+    graph_probe.enable()
     graph_probe.install()
 
     mgr = ModelAclGraphManager()
@@ -610,24 +639,32 @@ def test_graph_probe_logs_task_count():
     assert graph_probe._SEEN[key[0]]["count"] == 1
 
 
-def test_startup_preparation_runs_before_warmup():
+def test_startup_preparation_runs_before_warmup(monkeypatch):
     """The commit variants must be compiled before vLLM's warmup/capture."""
     _install_torch_stub()
     _install_vllm_stubs()
+    _install_gdn_stub()
 
     events = []
 
     class _Ctx:
         checkpoints = [types.SimpleNamespace(device="npu")] * 2
         commit_lens = FakeTensor(np.zeros(8, dtype=np.int32))
+        record_rows = 8
 
-        def prepare(self, *, capacity, state_table_width, request_mapping, device):
+        def prepare_verify(self, **kwargs):
+            return []
+
+        def prepare(
+            self, *, capacity, state_table_width, request_mapping, device, **options
+        ):
             events.append(("prepare", capacity, state_table_width, request_mapping))
             return list(range(capacity))
 
     class _Builder:
         num_spec = 3
         _accepted_buffer = FakeTensor(np.zeros(8, dtype=np.int32))
+        spec_sequence_indices = types.SimpleNamespace(dtype="int64")
 
         def __init__(self):
             self._ctx = _Ctx()
@@ -641,19 +678,45 @@ def test_startup_preparation_runs_before_warmup():
         def get_metadata_builder(self):
             return builder
 
-    runner = types.SimpleNamespace(attn_groups=[[_Group()]])
+    runner = types.SimpleNamespace(attn_groups=[[_Group()]], block_tables=None)
     enabled_config = types.SimpleNamespace(
-        cache_config=types.SimpleNamespace(use_kda_recoverssm=True,
-                                           enable_prefix_caching=False,
-                                           mamba_cache_mode="none"),
+        cache_config=types.SimpleNamespace(
+            use_kda_recoverssm=True,
+            enable_prefix_caching=False,
+            mamba_cache_mode="none",
+        ),
         compilation_config=types.SimpleNamespace(cudagraph_mode="NONE"),
-        scheduler_config=types.SimpleNamespace(async_scheduling=True,
-                                              get_scheduler_cls=lambda: type("S", (), {})),
+        scheduler_config=types.SimpleNamespace(
+            async_scheduling=True, get_scheduler_cls=lambda: type("S", (), {})
+        ),
+        model_config=types.SimpleNamespace(
+            max_model_len=32768, dtype="bf16", architecture="Qwen3_5ForCausalLM"
+        ),
     )
+    builder.vllm_config = enabled_config
     worker = types.SimpleNamespace(model_runner=runner, vllm_config=enabled_config)
 
-    from gdn_recoverssm_ascend import startup_patch
+    import gdn_recoverssm_ascend as package
 
+    grouped_stub = types.ModuleType("gdn_recoverssm_ascend.grouped_commit")
+    grouped_stub.prepare_grouped_commit = lambda *args, **kwargs: 0
+    monkeypatch.setitem(sys.modules, grouped_stub.__name__, grouped_stub)
+    monkeypatch.setattr(package, "grouped_commit", grouped_stub, raising=False)
+    from gdn_recoverssm_ascend import (
+        diagnostics,
+        grouped_commit,
+        sampling_patch,
+        startup_patch,
+    )
+
+    monkeypatch.setattr(diagnostics, "configure", lambda worker: None)
+    monkeypatch.setattr(sampling_patch, "prepare", lambda worker: None)
+    monkeypatch.setattr(
+        grouped_commit, "prepare_grouped_commit", lambda *args, **kwargs: 0
+    )
+    monkeypatch.setattr(startup_patch, "_log_context_geometry", lambda *args: 0)
+    monkeypatch.setattr(startup_patch, "_log_versions", lambda: None)
+    monkeypatch.setattr(startup_patch, "_SELFTEST_DONE", True)
     startup_patch._prepare(worker)
     assert events == [("prepare", 8, 4, True)], events
 
@@ -684,6 +747,7 @@ def test_replay_probe_does_not_touch_the_device():
     """
     _install_torch_stub()
     _install_vllm_stubs()
+    _install_gdn_stub()
 
     synced = {"n": 0}
     torch_mod = sys.modules["torch"]
@@ -733,15 +797,11 @@ def test_replay_probe_does_not_touch_the_device():
         torch_mod.npu = None
 
 
-def test_first_execute_failure_is_retried_once():
-    """A first-execute failure drains the device and retries exactly once.
-
-    CaptureModel::AllocSqCqAndBindInternal resets its own state on failure, so the
-    next execute re-attempts the allocation. That turns the async-scheduling
-    first-execute failure into a one-off hiccup instead of a dead engine.
-    """
+def test_arbitrary_replay_failure_is_not_retried():
+    """A replay exception may follow partial work; never execute it twice."""
     _install_torch_stub()
     _install_vllm_stubs()
+    _install_gdn_stub()
 
     synced = {"n": 0}
     torch_mod = sys.modules["torch"]
@@ -774,7 +834,6 @@ def test_first_execute_failure_is_retried_once():
         graph_probe._APPLIED = False
         graph_probe._SEEN.clear()
         graph_probe._FAILED.clear()
-        graph_probe._RETRIED.clear()
         graph_probe.install()
         graph_probe.enable()
 
@@ -786,21 +845,21 @@ def test_first_execute_failure_is_retried_once():
         mgr = ModelAclGraphManager()
         mgr.graphs[desc] = _Graph()
 
-        assert mgr._updatable_graph_replay(desc, None) == "ok"
-        assert state["calls"] == 2, state          # failed once, retried once
-        assert synced["n"] == 1, synced            # one drain, between the two
-
-        # a descriptor that keeps failing must propagate after ONE retry, not loop
-        state.update(fail=99, calls=0)
-        graph_probe._FAILED.clear()
-        graph_probe._RETRIED.discard(graph_probe._describe(desc))
         try:
             mgr._updatable_graph_replay(desc, None)
         except RuntimeError as exc:
             assert "Send sqe" in str(exc)
         else:
-            raise AssertionError("a descriptor that keeps failing must propagate")
-        assert state["calls"] == 2, state          # one retry only, never a loop
+            raise AssertionError("a replay failure must propagate immediately")
+        assert state["calls"] == 1, state
+        assert synced["n"] == 0, synced
+        try:
+            mgr._updatable_graph_replay(desc, None)
+        except RuntimeError as exc:
+            assert "unusable" in str(exc)
+        else:
+            raise AssertionError("a failed graph must not be executed again")
+        assert state["calls"] == 1
     finally:
         torch_mod.npu = None
 
@@ -846,19 +905,25 @@ def test_warmup_uses_the_normal_path_with_recorded_metadata():
         d4, d8, d64 = _Desc(4, 1), _Desc(8, 2), _Desc(64, 16)
         for d in (d4, d8, d64):
             mgr.graphs[d] = object()
-            graph_probe._CAPTURE_META[(d.num_tokens, d.num_reqs)] = (
-                "meta-%d-%d" % (d.num_tokens, d.num_reqs)
+            graph_probe._CAPTURE_META[(d.num_tokens, d.num_reqs)] = "meta-%d-%d" % (
+                d.num_tokens,
+                d.num_reqs,
             )
 
         graph_probe._warm_captured_graphs(mgr)
         assert replayed == [(4, 1), (8, 2), (64, 16)], replayed
         assert mgr.model_runner.model_state.attn_metadata == "original"
 
-        # a shape without recorded metadata is skipped, never guessed
+        # No graph may be deferred to its first serving execution.
         replayed.clear()
         mgr.graphs[_Desc(12, 3)] = object()
-        graph_probe._warm_captured_graphs(mgr)
-        assert replayed == [(4, 1), (8, 2), (64, 16)], replayed
+        try:
+            graph_probe._warm_captured_graphs(mgr)
+        except RuntimeError as exc:
+            assert "metadata missing" in str(exc)
+        else:
+            raise AssertionError("missing graph metadata must stop readiness")
+        assert replayed == []
     finally:
         torch_mod.npu = None
 
@@ -875,13 +940,14 @@ def test_record_scratch_is_reserved_from_the_kv_budget():
 
     hf = types.SimpleNamespace(
         linear_num_value_heads=48,
+        linear_num_key_heads=16,
         linear_key_head_dim=128,
         linear_value_head_dim=128,
         layer_types=["linear_attention"] * 48 + ["full_attention"] * 16,
         num_hidden_layers=64,
     )
     config = types.SimpleNamespace(
-        model_config=types.SimpleNamespace(hf_text_config=hf),
+        model_config=types.SimpleNamespace(hf_text_config=hf, dtype="torch.bfloat16"),
         parallel_config=types.SimpleNamespace(tensor_parallel_size=4),
         scheduler_config=types.SimpleNamespace(max_num_seqs=51),
         compilation_config=types.SimpleNamespace(cudagraph_capture_sizes=[1, 4, 8]),
@@ -892,13 +958,18 @@ def test_record_scratch_is_reserved_from_the_kv_budget():
         "rows": 51,
         "layers": 48,
         "heads": 12,
+        "key_heads": 4,
         "window": 4,
         "width": 257,
+        "key_dim": 128,
+        "value_dim": 128,
+        "key_dtype": "torch.bfloat16",
+        "key_bytes": 2,
     }, geo
-    expected = 51 * 48 * 12 * 4 * 257 * 4
+    expected = 51 * 48 * 4 * (12 * 128 * 4 + 4 * 128 * 2 + 12 * 4)
     assert startup_patch._record_scratch_bytes(config) == expected
-    # ~120 MiB, i.e. far below the pages it replaces
-    assert 100 * 1024 * 1024 < expected < 140 * 1024 * 1024, expected
+    # ~67 MiB, below the packed FP32 representation and the state pages saved.
+    assert 60 * 1024 * 1024 < expected < 75 * 1024 * 1024, expected
     assert "rows=51" in startup_patch._record_scratch_desc(config)
 
     # Records are sized by max_num_seqs, not by the padded graph batch: padded
@@ -943,7 +1014,6 @@ def test_selftest_switch_and_reference():
     os.environ.pop("GDN_RECOVERSSM_SELFTEST", None)
 
 
-
 def test_record_scratch_validation_is_row_based():
     """Records are [rows, HV, Q, width]; pages are [blocks, ...].
 
@@ -957,7 +1027,9 @@ def test_record_scratch_validation_is_row_based():
 
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend" / "kernels.py").read_text()
+    src = (
+        Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend" / "kernels.py"
+    ).read_text()
     assert "[rows, HV, spec_query_len, V + K + 1]" in src or "[rows," in src
     # the page-based comparison must be gone from both validators
     assert "_rec = (nb, HV, spec_query_len, V + K + 1)" not in src
@@ -965,8 +1037,9 @@ def test_record_scratch_validation_is_row_based():
     # write past it
     assert "num_record_rows" in src
     assert "record_row_ok" in src
-    assert "layers need matching float32 replay buffers of shape" in src
-    assert "replay buffer has no rows" in src
+    assert "class ReplayRecordBuffers" in src
+    assert "record_layout" in src and "record_rows" in src
+    assert "record_row_ok" in src
 
 
 def test_no_code_path_still_reads_a_third_cache_page():
@@ -1065,7 +1138,9 @@ def test_conv_compaction_semantics_are_documented_in_the_check():
     assert "commit_conv=True" in src
     assert "CONV SUMMARY" in src
     startup = (
-        Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend" / "startup_patch.py"
+        Path(__file__).resolve().parents[1]
+        / "gdn_recoverssm_ascend"
+        / "startup_patch.py"
     ).read_text()
     assert "selftest.run_conv(" in startup
 
@@ -1112,12 +1187,17 @@ def test_disabled_run_prints_nothing_at_info_level():
     import ast
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend" / "__init__.py").read_text()
+    src = (
+        Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend" / "__init__.py"
+    ).read_text()
     tree = ast.parse(src)
     infos = []
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "info"):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "info"
+        ):
             infos.append(node.lineno)
     assert not infos, f"logger.info at lines {infos}: an inert plugin must be silent"
     assert 'os.getenv("GDN_RECOVERSSM_DISABLE"' in src
@@ -1147,17 +1227,17 @@ def test_baseline_builds_no_recover_state():
     a run without --use-replayssm must keep its full KV budget (the reservation used
     to deduct ~3.2 GiB from a baseline) and stay silent.
     """
-    import os
-
     _install_torch_stub()
     _install_vllm_stubs()
     from gdn_recoverssm_ascend import graph_probe, startup_patch
 
     base = types.SimpleNamespace(
+        model_config=types.SimpleNamespace(architecture="Qwen3_5ForCausalLM"),
         cache_config=types.SimpleNamespace(use_kda_recoverssm=False),
         compilation_config=types.SimpleNamespace(cudagraph_mode="FULL_DECODE_ONLY"),
     )
     on = types.SimpleNamespace(
+        model_config=types.SimpleNamespace(architecture="Qwen3_5ForCausalLM"),
         cache_config=types.SimpleNamespace(use_kda_recoverssm=True),
         compilation_config=types.SimpleNamespace(cudagraph_mode="FULL_DECODE_ONLY"),
     )
@@ -1173,31 +1253,31 @@ def test_baseline_builds_no_recover_state():
 
 
 def test_spec_row_mapping_never_calls_nonzero_on_device():
-    """The per-step row mapping must come from the pinned CPU mask.
-
-    ``nonzero`` on a device tensor has a data-dependent shape, so it blocks the
-    step; the native builder keeps ``spec_sequence_masks_cpu`` for exactly this
-    reason. Using the device copy per metadata group (three of them) per step is a
-    per-step synchronisation the baseline does not pay.
-    """
+    """Borrow native mapping; no plugin CPU recompute or upload remains."""
     import ast
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend" / "builder.py").read_text()
-    assert "_spec_rows_from_host_copy" in src
-    # inside build(), the device tensor must not be the primary source
-    tree = ast.parse(src)
-    build = next(
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "build"
+    source = (
+        Path(__file__).resolve().parents[1] / "gdn_recoverssm_ascend" / "builder.py"
+    ).read_text()
+    tree = ast.parse(source)
+    helper = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_native_spec_rows"
     )
-    body = ast.get_source_segment(src, build) or ""
-    assert "masks.nonzero(" not in body.split("_spec_rows_from_host_copy")[0]
-    assert "spec_sequence_masks_cpu" in src
-    # The host-side mapping must be moved to the compute device before use: the
-    # first version passed a CPU tensor into the commit and every step died with
-    # "commit inputs must be on the same device".
-    assert ".to(state_indices.device)" in src
+    helper_source = ast.get_source_segment(source, helper)
+    assert "spec_sequence_indices" in helper_source
+    assert (
+        "nonzero"
+        not in "\n".join(
+            x.split("#")[0]
+            for x in helper_source.splitlines()
+            if not x.strip().startswith(('"', "'"))
+        ).split("raise RuntimeError")[0]
+    )
+    assert ".to(" not in helper_source and ".copy_(" not in helper_source
+    assert "return rows[:n]" in helper_source
 
 
 def test_state_calculator_patch():
@@ -1215,7 +1295,9 @@ def test_state_calculator_patch():
 
     # disabled -> untouched
     state_patch.disable()
-    base = mu.MambaStateShapeCalculator.gated_delta_net_state_shape(2, 2, 8, 128, 128, 4, 3)
+    base = mu.MambaStateShapeCalculator.gated_delta_net_state_shape(
+        2, 2, 8, 128, 128, 4, 3
+    )
     assert len(base) == 2, base
     assert len(mu.MambaStateDtypeCalculator.gated_delta_net_state_dtype()) == 2
 
@@ -1223,7 +1305,9 @@ def test_state_calculator_patch():
     # per-request scratch outside the cache (RFC #19987 s3), so the page layout
     # is identical to stock and prefix-cache pages stay shareable.
     state_patch.enable(4)
-    shapes = mu.MambaStateShapeCalculator.gated_delta_net_state_shape(2, 2, 8, 128, 128, 4, 3)
+    shapes = mu.MambaStateShapeCalculator.gated_delta_net_state_shape(
+        2, 2, 8, 128, 128, 4, 3
+    )
     assert len(shapes) == 2, shapes
     assert shapes[-1] == (4, 128, 128), shapes
     assert len(mu.MambaStateDtypeCalculator.gated_delta_net_state_dtype()) == 2

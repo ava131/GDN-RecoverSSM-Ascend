@@ -14,9 +14,9 @@ resolves in every process before the engine is built, and it monkey-patches:
 3. ``vllm_ascend.ops.gdn.recurrent_gated_delta_rule`` -- redirects only the
    speculative-decode call to the RecoverSSM verify kernel (layer_patch.py).
 
-The commit after sampling needs no patching: vLLM v0.30.0 already calls
-``RecoverSSMState.commit_step`` on the metadata object our backend builds
-(see ``vllm/v1/worker/gpu/model_states/recoverssm.py``).
+The upstream post-sampling lifecycle is retained. Its ``commit_step`` is wrapped
+to coordinate physical cache groups and publish GDN-specific align bookkeeping;
+no vLLM or vllm-ascend source is edited on disk.
 """
 
 from __future__ import annotations
@@ -54,12 +54,12 @@ def install() -> None:
     # already ships the generic RecoverSSM lifecycle (vLLM >= v0.30). On any
     # other tree it must stay inert instead of breaking engine startup.
     try:
+        import vllm_ascend.ops.gdn as _ascend_gdn
         from vllm.config import VllmConfig
         from vllm.v1.attention.backends import recoverssm_metadata  # noqa: F401
         from vllm.v1.worker.gpu.model_states.recoverssm import (  # noqa: F401
             RecoverSSMState,
         )
-        import vllm_ascend.ops.gdn as _ascend_gdn
 
         if not hasattr(VllmConfig, "validate_mamba_cached_kernel"):
             raise AttributeError("VllmConfig.validate_mamba_cached_kernel")
@@ -76,7 +76,14 @@ def install() -> None:
         )
         return
 
-    from . import config_patch, graph_probe, layer_patch, state_patch, startup_patch
+    from . import (
+        config_patch,
+        diagnostics,
+        graph_probe,
+        layer_patch,
+        startup_patch,
+        state_patch,
+    )
 
     state_patch.install()
     config_patch.install()
@@ -89,6 +96,9 @@ def install() -> None:
         graph_probe.install()
     except Exception as exc:  # probing is optional
         logger.debug("gdn_recoverssm_ascend: graph probe unavailable (%s)", exc)
+    # Observe the existing completed CPU output; do not add device reads or
+    # scheduling knobs. Install last so readiness follows every startup guard.
+    diagnostics.install()
     logger.debug("gdn_recoverssm_ascend: installed")
 
 

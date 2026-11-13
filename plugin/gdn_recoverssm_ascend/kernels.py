@@ -8,7 +8,7 @@
 # helpers of `.../mamba/recoverssm_utils.py` (`recoverssm_require`,
 # `recoverssm_ptr_table`) inlined as `_require` / `_ptr_table`.
 #
-# Ascend adaptations, and nothing else:
+# Ascend adaptations:
 #   * every UB-resident tile is derived at runtime from `get_ub_size_bytes()`
 #     with a conservative FP32 budget and an explicit fit assertion;
 #   * no `is_950()` branches and no grouped-head fast path (A2 always runs the
@@ -18,8 +18,9 @@
 #   * the GDN gate/beta are precomputed by the layer
 #     (`DeviceOperator.fused_gdn_gating`) and enter the verify kernel as
 #     `g` (log-space decay) and `beta` (= sigmoid(b)).
-# The math, the `[corr(V), k_hat(K), decay(1)]` record layout, the null-row
-# behaviour, the commit fold and the ALIGN/BOUNDARY handling are upstream's.
+# The forward recovery arithmetic is retained. Serving records use typed SoA
+# planes with one key per GQA key head; packed FP32 buffers remain a constructor
+# compatibility path. Boundary and final states are captured during one fold.
 
 """RecoverSSM for Gated DeltaNet (Qwen-style GDN) on Ascend NPUs: speculative
 verify from one checkpoint without per-draft state snapshots, and accepted-state
@@ -30,11 +31,12 @@ scalar per value head (g = -exp(A_log) * softplus(a + dt_bias)), q/k heads are
 grouped over value heads (HV // H), and q/k are L2-normalised inside the kernel
 when requested. The verify step caches, per token, the delta-rule correction
 c_t = beta_t * (v_t - S'_t k_t) (V floats), the normalised key (K floats) and the
-decay exp(g_t) (1 float) in one fp32 "replay" record. Recovery folds the accepted
+decay exp(g_t) (1 float). Typed records retain FP32 correction/decay and
+store each normalized GQA key once in its exact input dtype. Recovery folds the accepted
 prefix: S_n = exp(sum_t g_t) S_0 + sum_t exp(sum_{s>t} g_s) c_t k_t^T and writes
 the checkpoint once (plus the block-boundary state in align mode).
 
-Ascend A2 (910B, Triton-Ascend 3.6.0) specifics:
+Ascend A2 (910B, Triton-Ascend 3.2.2 deployment) specifics:
   * The gate is not recomputed here. The caller runs the fused GDN gating once
     per step and passes `g` (log-space decay, shape [1, T, HV] or [T, HV]) and
     `beta` (already sigmoid(b)). The kernel only does `decay = exp(g)`.
@@ -51,9 +53,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-
 from vllm_ascend.ops.triton.triton_utils import get_ub_size_bytes
 
 try:  # natural bound for a per-tile loop on this device
@@ -61,6 +63,8 @@ try:  # natural bound for a per-tile loop on this device
 except ImportError:  # pragma: no cover - older drops
     get_vectorcore_num = None
 
+
+logger = init_logger("vllm.gdn_recoverssm_ascend.kernels")
 
 _LAUNCH_CAP: int | None = None
 
@@ -84,6 +88,7 @@ def _launch_cap() -> int:
     except Exception:
         _LAUNCH_CAP = 48
     return _LAUNCH_CAP
+
 
 # ---------------------------------------------------------------------------
 # Configuration constants (Ascend A2)
@@ -158,6 +163,137 @@ def _ptr_table(tensors: Sequence[torch.Tensor], device) -> torch.Tensor:
     return torch.tensor(ptrs, dtype=torch.int64, device=device)
 
 
+@dataclass(frozen=True)
+class ReplayRecordBuffers:
+    """Step-owned typed records; keys are shared by grouped value heads.
+
+    Keys loaded from an already-normalized BF16/FP16 tensor retain those exact
+    input bits. Correction and decay always remain FP32. A future kernel doing
+    normalization internally must allocate FP32 keys instead.
+    """
+
+    correction: torch.Tensor
+    key: torch.Tensor
+    decay: torch.Tensor
+
+    @property
+    def shape(self) -> tuple[int, int, int, int]:
+        rows, heads, window, value_dim = self.correction.shape
+        return (rows, heads, window, value_dim + self.key.shape[-1] + 1)
+
+    @property
+    def dtype(self):
+        # Logical record arithmetic dtype, retained for diagnostic consumers.
+        return torch.float32
+
+    @property
+    def device(self):
+        return self.correction.device
+
+    @property
+    def num_key_heads(self) -> int:
+        return int(self.key.shape[1])
+
+    @property
+    def key_dtype(self):
+        return self.key.dtype
+
+    @property
+    def record_bytes(self) -> int:
+        return sum(
+            t.numel() * t.element_size()
+            for t in (self.correction, self.key, self.decay)
+        )
+
+    @classmethod
+    def allocate(
+        cls,
+        rows: int,
+        num_value_heads: int,
+        num_key_heads: int,
+        window: int,
+        value_dim: int,
+        key_dim: int,
+        *,
+        device,
+        key_dtype=torch.float32,
+    ):
+        _require(
+            rows > 0
+            and num_key_heads > 0
+            and 0 < window <= MAX_SPEC_QUERY_LEN
+            and value_dim > 0
+            and key_dim > 0
+            and num_value_heads > 0
+            and num_value_heads % num_key_heads == 0,
+            "record head/row geometry is invalid",
+        )
+        _require(
+            key_dtype in (torch.float16, torch.bfloat16, torch.float32),
+            "record keys require FP16, BF16 or FP32",
+        )
+        return cls(
+            torch.zeros(
+                (rows, num_value_heads, window, value_dim),
+                dtype=torch.float32,
+                device=device,
+            ),
+            torch.zeros(
+                (rows, num_key_heads, window, key_dim), dtype=key_dtype, device=device
+            ),
+            torch.zeros(
+                (rows, num_value_heads, window), dtype=torch.float32, device=device
+            ),
+        )
+
+
+def record_nbytes(record: torch.Tensor | ReplayRecordBuffers) -> int:
+    return (
+        record.record_bytes
+        if isinstance(record, ReplayRecordBuffers)
+        else record.numel() * record.element_size()
+    )
+
+
+def record_geometry_bytes(
+    rows: int,
+    num_layers: int,
+    num_value_heads: int,
+    num_key_heads: int,
+    window: int,
+    key_dim: int,
+    value_dim: int,
+    key_dtype=torch.float32,
+) -> int:
+    """Physical bytes, including deduplicated keys and their actual dtype."""
+    _require(
+        min(
+            rows, num_layers, num_value_heads, num_key_heads, window, key_dim, value_dim
+        )
+        > 0,
+        "record geometry must be positive",
+    )
+    _require(
+        num_value_heads % num_key_heads == 0,
+        "value heads must be a multiple of key heads",
+    )
+    _require(
+        key_dtype in (torch.float16, torch.bfloat16, torch.float32),
+        "record keys require FP16, BF16 or FP32",
+    )
+    key_bytes = 4 if key_dtype == torch.float32 else 2
+    return (
+        rows
+        * num_layers
+        * window
+        * (
+            num_value_heads * value_dim * 4
+            + num_key_heads * key_dim * key_bytes
+            + num_value_heads * 4
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # UB budget (Ascend A2)
 # ---------------------------------------------------------------------------
@@ -188,7 +324,8 @@ def _verify_ub_floats(block_v: int, block_k: int) -> int:
     vectors = RECOVERSSM_UB_VECTOR_ROWS * (block_v + block_k)
     record = block_v + block_k + 1
     output = block_v
-    return matrices + vectors + record + output
+    staged = MAX_SPEC_QUERY_LEN * (2 * block_k + block_v + 2)
+    return matrices + vectors + record + output + staged
 
 
 def _assert_verify_ub_fit(block_v: int, block_k: int) -> None:
@@ -300,6 +437,58 @@ def _conv_dim_tile(block_history: int) -> int:
 
 
 @triton.jit
+def _load_verify_token(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    g_ptr,
+    beta_ptr,
+    bos,
+    query_len,
+    total_tokens,
+    pid_h,
+    pid_hv,
+    offs_k,
+    offs_v,
+    mask_k,
+    mask_v,
+    stride_q_token,
+    stride_k_token,
+    stride_v_token,
+    stride_g_token,
+    stride_beta_token,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    SPEC_QUERY_LEN: tl.constexpr,
+    T: tl.constexpr,
+):
+    tok = bos + T
+    valid = (T < SPEC_QUERY_LEN) & (T < query_len) & (tok >= 0) & (tok < total_tokens)
+    q = tl.load(
+        q_ptr + tok * stride_q_token + pid_h * K + offs_k,
+        mask=valid & mask_k,
+        other=0.0,
+    )
+    k = tl.load(
+        k_ptr + tok * stride_k_token + pid_h * K + offs_k,
+        mask=valid & mask_k,
+        other=0.0,
+    )
+    v = tl.load(
+        v_ptr + tok * stride_v_token + pid_hv * V + offs_v,
+        mask=valid & mask_v,
+        other=0.0,
+    )
+    g = tl.load(g_ptr + tok * stride_g_token + pid_hv, mask=valid, other=0.0).to(
+        tl.float32
+    )
+    beta = tl.load(
+        beta_ptr + tok * stride_beta_token + pid_hv, mask=valid, other=0.0
+    ).to(tl.float32)
+    return q, k, v, tl.exp(g), beta
+
+
+@triton.jit(do_not_specialize=["total_tokens", "num_rows", "num_work"])
 def _gdn_recoverssm_verify_kernel(
     q_ptr,
     k_ptr,
@@ -308,6 +497,8 @@ def _gdn_recoverssm_verify_kernel(
     beta_ptr,
     state_ptr,
     replay_ptr,
+    key_record_ptr,
+    decay_record_ptr,
     out_ptr,
     query_start_loc_ptr,
     state_indices_ptr,
@@ -330,6 +521,13 @@ def _gdn_recoverssm_verify_kernel(
     stride_replay_head,
     stride_replay_pos,
     stride_replay_dim,
+    stride_key_row,
+    stride_key_head,
+    stride_key_pos,
+    stride_key_dim,
+    stride_decay_row,
+    stride_decay_head,
+    stride_decay_pos,
     stride_out_token,
     stride_qsl,
     stride_si,
@@ -343,6 +541,7 @@ def _gdn_recoverssm_verify_kernel(
     USE_QK_L2NORM: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     NUM_VALUE_TILES: tl.constexpr,
+    RECORD_SOA: tl.constexpr,
 ):
     # Bounded physical dispatch. Logical work is
     #   NUM_VALUE_TILES x num_rows x HV
@@ -377,7 +576,10 @@ def _gdn_recoverssm_verify_kernel(
                 tl.store(
                     out_ptr + tok_null * stride_out_token + pid_hv * V + offs_v,
                     tl.zeros([BV], dtype=tl.float32),
-                    mask=(t < query_len) & (tok_null < total_tokens) & mask_v,
+                    mask=(t < query_len)
+                    & (tok_null >= 0)
+                    & (tok_null < total_tokens)
+                    & mask_v,
                 )
         else:
             state = tl.load(
@@ -401,44 +603,231 @@ def _gdn_recoverssm_verify_kernel(
             # non-null padding row from writing past the buffer.
             record_row_ok = pid_b < num_record_rows
             rec_base = (
-                replay_ptr
-                + pid_b * stride_replay_block
-                + pid_hv * stride_replay_head
+                replay_ptr + pid_b * stride_replay_block + pid_hv * stride_replay_head
+            )
+            # Load the whole short window before the recurrent dependency
+            # chain. Keep Q/K/V in their input dtype until consumed. This tuple
+            # has compile-time indices; it needs neither device gather nor an
+            # extra reduction for each token. Unused Q slots are compile-time
+            # masked away for this specialization.
+            staged = (
+                _load_verify_token(
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    g_ptr,
+                    beta_ptr,
+                    bos,
+                    query_len,
+                    total_tokens,
+                    pid_h,
+                    pid_hv,
+                    offs_k,
+                    offs_v,
+                    mask_k,
+                    mask_v,
+                    stride_q_token,
+                    stride_k_token,
+                    stride_v_token,
+                    stride_g_token,
+                    stride_beta_token,
+                    K,
+                    V,
+                    SPEC_QUERY_LEN,
+                    0,
+                ),
+                _load_verify_token(
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    g_ptr,
+                    beta_ptr,
+                    bos,
+                    query_len,
+                    total_tokens,
+                    pid_h,
+                    pid_hv,
+                    offs_k,
+                    offs_v,
+                    mask_k,
+                    mask_v,
+                    stride_q_token,
+                    stride_k_token,
+                    stride_v_token,
+                    stride_g_token,
+                    stride_beta_token,
+                    K,
+                    V,
+                    SPEC_QUERY_LEN,
+                    1,
+                ),
+                _load_verify_token(
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    g_ptr,
+                    beta_ptr,
+                    bos,
+                    query_len,
+                    total_tokens,
+                    pid_h,
+                    pid_hv,
+                    offs_k,
+                    offs_v,
+                    mask_k,
+                    mask_v,
+                    stride_q_token,
+                    stride_k_token,
+                    stride_v_token,
+                    stride_g_token,
+                    stride_beta_token,
+                    K,
+                    V,
+                    SPEC_QUERY_LEN,
+                    2,
+                ),
+                _load_verify_token(
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    g_ptr,
+                    beta_ptr,
+                    bos,
+                    query_len,
+                    total_tokens,
+                    pid_h,
+                    pid_hv,
+                    offs_k,
+                    offs_v,
+                    mask_k,
+                    mask_v,
+                    stride_q_token,
+                    stride_k_token,
+                    stride_v_token,
+                    stride_g_token,
+                    stride_beta_token,
+                    K,
+                    V,
+                    SPEC_QUERY_LEN,
+                    3,
+                ),
+                _load_verify_token(
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    g_ptr,
+                    beta_ptr,
+                    bos,
+                    query_len,
+                    total_tokens,
+                    pid_h,
+                    pid_hv,
+                    offs_k,
+                    offs_v,
+                    mask_k,
+                    mask_v,
+                    stride_q_token,
+                    stride_k_token,
+                    stride_v_token,
+                    stride_g_token,
+                    stride_beta_token,
+                    K,
+                    V,
+                    SPEC_QUERY_LEN,
+                    4,
+                ),
+                _load_verify_token(
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    g_ptr,
+                    beta_ptr,
+                    bos,
+                    query_len,
+                    total_tokens,
+                    pid_h,
+                    pid_hv,
+                    offs_k,
+                    offs_v,
+                    mask_k,
+                    mask_v,
+                    stride_q_token,
+                    stride_k_token,
+                    stride_v_token,
+                    stride_g_token,
+                    stride_beta_token,
+                    K,
+                    V,
+                    SPEC_QUERY_LEN,
+                    5,
+                ),
+                _load_verify_token(
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    g_ptr,
+                    beta_ptr,
+                    bos,
+                    query_len,
+                    total_tokens,
+                    pid_h,
+                    pid_hv,
+                    offs_k,
+                    offs_v,
+                    mask_k,
+                    mask_v,
+                    stride_q_token,
+                    stride_k_token,
+                    stride_v_token,
+                    stride_g_token,
+                    stride_beta_token,
+                    K,
+                    V,
+                    SPEC_QUERY_LEN,
+                    6,
+                ),
+                _load_verify_token(
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    g_ptr,
+                    beta_ptr,
+                    bos,
+                    query_len,
+                    total_tokens,
+                    pid_h,
+                    pid_hv,
+                    offs_k,
+                    offs_v,
+                    mask_k,
+                    mask_v,
+                    stride_q_token,
+                    stride_k_token,
+                    stride_v_token,
+                    stride_g_token,
+                    stride_beta_token,
+                    K,
+                    V,
+                    SPEC_QUERY_LEN,
+                    7,
+                ),
             )
             for t in tl.static_range(SPEC_QUERY_LEN):
                 tok = bos + t
                 # The window may be shorter than the token tensor, never longer:
                 # ``spec_query_start_loc`` can describe graph-padded rows.
-                valid = (t < query_len) & (tok < total_tokens)
-                q = tl.load(
-                    q_ptr + tok * stride_q_token + pid_h * K + offs_k,
-                    mask=valid & mask_k,
-                    other=0.0,
-                ).to(tl.float32)
-                k = tl.load(
-                    k_ptr + tok * stride_k_token + pid_h * K + offs_k,
-                    mask=valid & mask_k,
-                    other=0.0,
-                ).to(tl.float32)
-                v = tl.load(
-                    v_ptr + tok * stride_v_token + pid_hv * V + offs_v,
-                    mask=valid & mask_v,
-                    other=0.0,
-                ).to(tl.float32)
-                g = tl.load(
-                    g_ptr + tok * stride_g_token + pid_hv, mask=valid, other=0.0
-                ).to(tl.float32)
-                beta = tl.load(
-                    beta_ptr + tok * stride_beta_token + pid_hv,
-                    mask=valid,
-                    other=0.0,
-                ).to(tl.float32)
+                valid = (t < query_len) & (tok >= 0) & (tok < total_tokens)
+                q = staged[t][0].to(tl.float32)
+                raw_k = staged[t][1]
+                k = raw_k.to(tl.float32)
+                v = staged[t][2].to(tl.float32)
+                decay = staged[t][3]
+                beta = staged[t][4]
                 if USE_QK_L2NORM:
                     # Same epsilon as FLA l2norm_fwd so both paths agree.
                     q = q * tl.rsqrt(tl.sum(q * q) + 1e-6)
                     k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
                 q = q * scale
-                decay = tl.exp(g)
                 new_state = state * decay
                 corr = (v - tl.sum(new_state * k[None, :], 1)) * beta
                 new_state = new_state + corr[:, None] * k[None, :]
@@ -455,14 +844,33 @@ def _gdn_recoverssm_verify_kernel(
                     corr,
                     mask=valid & mask_v & record_row_ok,
                 )
-                if pid_v == 0:
+                if RECORD_SOA:
+                    if pid_v == 0:
+                        tl.store(
+                            decay_record_ptr
+                            + pid_b * stride_decay_row
+                            + pid_hv * stride_decay_head
+                            + t * stride_decay_pos,
+                            decay,
+                            mask=valid & record_row_ok,
+                        )
+                        if pid_hv % (HV // H) == 0:
+                            key_value = k if USE_QK_L2NORM else raw_k
+                            tl.store(
+                                key_record_ptr
+                                + pid_b * stride_key_row
+                                + pid_h * stride_key_head
+                                + t * stride_key_pos
+                                + offs_k * stride_key_dim,
+                                key_value,
+                                mask=valid & mask_k & record_row_ok,
+                            )
+                elif pid_v == 0:
                     tl.store(
                         rec + (V + offs_k) * stride_replay_dim,
                         k,
                         mask=valid & mask_k & record_row_ok,
                     )
-                    # the decay exactly as multiplied here, so the commit replays
-                    # this float
                     tl.store(
                         rec + (V + K) * stride_replay_dim,
                         decay,
@@ -478,13 +886,14 @@ def gdn_recoverssm_verify(
     v: torch.Tensor,
     *,
     checkpoint_state: torch.Tensor,
-    replay_cache: torch.Tensor,
+    replay_cache: torch.Tensor | ReplayRecordBuffers,
     query_start_loc: torch.Tensor,
     state_indices: torch.Tensor,
     spec_query_len: int,
     scale: float | None = None,
     qk_already_normalized: bool = True,
     out: torch.Tensor | None = None,
+    _collect: list | None = None,
 ) -> torch.Tensor:
     """Verify a GDN speculative window against its checkpoint without modifying the
     checkpoint.
@@ -541,13 +950,49 @@ def gdn_recoverssm_verify(
     # Records are row-indexed scratch, not cache pages: shape is
     # [rows, HV, spec_query_len, V + K + 1] and only the row count has to cover
     # the batch (the checkpoint keeps using ``nb`` pages).
-    _rec_tail = (HV, spec_query_len, V + K + 1)
-    _require(
-        replay_cache.ndim == 4 and tuple(replay_cache.shape[1:]) == _rec_tail,
-        f"replay buffer needs shape [rows, {HV}, {spec_query_len}, {V + K + 1}]",
-    )
-    _require(replay_cache.shape[0] >= 1, "replay buffer has no rows")
-    _require(replay_cache.dtype == torch.float32, "replay buffer must use float32")
+    soa = isinstance(replay_cache, ReplayRecordBuffers)
+    if soa:
+        corr, key_record, decay_record = (
+            replay_cache.correction,
+            replay_cache.key,
+            replay_cache.decay,
+        )
+        _require(
+            corr.ndim == 4
+            and tuple(corr.shape[1:]) == (HV, spec_query_len, V)
+            and tuple(key_record.shape) == (corr.shape[0], H, spec_query_len, K)
+            and tuple(decay_record.shape) == (corr.shape[0], HV, spec_query_len),
+            "typed record geometry is incompatible",
+        )
+        _require(
+            corr.dtype == decay_record.dtype == torch.float32,
+            "correction and decay records must remain FP32",
+        )
+        _require(
+            key_record.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and (
+                key_record.dtype == torch.float32
+                or (qk_already_normalized and key_record.dtype == k.dtype)
+            ),
+            "low-precision key records require already-normalized input dtype",
+        )
+        _require(
+            all(t.stride(-1) == 1 for t in (corr, key_record, decay_record)),
+            "typed record innermost dimensions must be contiguous",
+        )
+        key_strides = key_record.stride()
+        decay_strides = decay_record.stride()
+    else:
+        corr = key_record = decay_record = replay_cache
+        _rec_tail = (HV, spec_query_len, V + K + 1)
+        _require(
+            corr.ndim == 4 and tuple(corr.shape[1:]) == _rec_tail,
+            "packed replay record shape is incompatible",
+        )
+        _require(corr.dtype == torch.float32, "packed records must remain FP32")
+        key_strides = (0, 0, 0, 0)
+        decay_strides = (0, 0, 0)
+    _require(corr.shape[0] >= 1, "replay buffer has no rows")
     _require(state_indices.ndim == 1, "state indices must be one-dimensional")
     _require(
         query_start_loc.ndim == 1
@@ -568,7 +1013,9 @@ def gdn_recoverssm_verify(
                 g,
                 beta,
                 checkpoint_state,
-                replay_cache,
+                corr,
+                key_record,
+                decay_record,
                 query_start_loc,
                 state_indices,
             )
@@ -598,52 +1045,67 @@ def gdn_recoverssm_verify(
     num_value_tiles = triton.cdiv(V, BV)
     num_work = num_value_tiles * batch * HV
     grid = (min(num_work, _launch_cap()),)
-    _gdn_recoverssm_verify_kernel[grid](
-        q,
-        k,
-        v,
-        g2,
-        beta2,
-        checkpoint_state,
-        replay_cache,
-        out,
-        query_start_loc,
-        state_indices,
-        total,
-        scale,
-        batch,
-        num_work,
-        replay_cache.shape[0],
-        NULL_BLOCK_ID,
-        q.stride(1),
-        k.stride(1),
-        v.stride(1),
-        g2.stride(0),
-        beta2.stride(0),
-        checkpoint_state.stride(0),
-        checkpoint_state.stride(1),
-        checkpoint_state.stride(2),
-        checkpoint_state.stride(3),
-        replay_cache.stride(0),
-        replay_cache.stride(1),
-        replay_cache.stride(2),
-        replay_cache.stride(3),
-        out.stride(1),
-        query_start_loc.stride(0),
-        state_indices.stride(0),
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BK=BK,
-        BV=BV,
-        SPEC_QUERY_LEN=spec_query_len,
-        USE_QK_L2NORM=not qk_already_normalized,
-        NUM_BLOCKS=nb,
-        NUM_VALUE_TILES=num_value_tiles,
-        num_warps=4,
-        num_stages=2,
+    spec = _LaunchSpec(
+        kernel=_gdn_recoverssm_verify_kernel,
+        args=(
+            q,
+            k,
+            v,
+            g2,
+            beta2,
+            checkpoint_state,
+            corr,
+            key_record,
+            decay_record,
+            out,
+            query_start_loc,
+            state_indices,
+            total,
+            scale,
+            batch,
+            num_work,
+            corr.shape[0],
+            NULL_BLOCK_ID,
+            q.stride(1),
+            k.stride(1),
+            v.stride(1),
+            g2.stride(0),
+            beta2.stride(0),
+            checkpoint_state.stride(0),
+            checkpoint_state.stride(1),
+            checkpoint_state.stride(2),
+            checkpoint_state.stride(3),
+            corr.stride(0),
+            corr.stride(1),
+            corr.stride(2),
+            corr.stride(3),
+            *key_strides,
+            *decay_strides,
+            out.stride(1),
+            query_start_loc.stride(0),
+            state_indices.stride(0),
+        ),
+        kwargs={
+            "H": H,
+            "HV": HV,
+            "K": K,
+            "V": V,
+            "BK": BK,
+            "BV": BV,
+            "SPEC_QUERY_LEN": spec_query_len,
+            "USE_QK_L2NORM": not qk_already_normalized,
+            "NUM_BLOCKS": nb,
+            "NUM_VALUE_TILES": num_value_tiles,
+            "RECORD_SOA": soa,
+            "num_warps": 4,
+            "num_stages": 2,
+        },
+        grid=grid,
     )
+    if _collect is None:
+        spec.launch()
+    else:
+        _collect.append(spec)
     return out
 
 
@@ -670,6 +1132,8 @@ def _prepare_commit_plan_kernel(
     final_state_indices_ptr,
     boundary_state_indices_ptr,
     boundary_recovery_lens_ptr,
+    align_valid_ptr,
+    align_col_ptr,
     null_block_id,
     mamba_block_size,
     block_table_width,
@@ -712,6 +1176,7 @@ def _prepare_commit_plan_kernel(
     final_state_idx = source_state_idx
     boundary_state_idx = null_block_id
     boundary_recovery_len = 0
+    final_state_col = 0
     if ALIGN_MODE:
         num_computed = tl.load(num_computed_ptr + request_idx * stride_num_computed).to(
             tl.int32
@@ -739,11 +1204,14 @@ def _prepare_commit_plan_kernel(
         next_boundary = (num_computed // mamba_block_size + 1) * mamba_block_size
         crosses_boundary = final_num_computed >= next_boundary
         boundary_recovery_len = next_boundary - num_computed
+        boundary_col = next_boundary // mamba_block_size - 1
         boundary_state_idx = tl.load(
             block_table_ptr
             + request_idx * stride_block_table_row
-            + (next_boundary // mamba_block_size - 1) * stride_block_table_col,
-            mask=crosses_boundary,
+            + boundary_col * stride_block_table_col,
+            mask=crosses_boundary
+            & (boundary_col >= 0)
+            & (boundary_col < block_table_width),
             other=null_block_id,
         ).to(tl.int64)
     # Unified validity for this plan row. Everything downstream -- conv
@@ -752,9 +1220,7 @@ def _prepare_commit_plan_kernel(
     # defined no-op; a row that claims work but has an impossible geometry is
     # dropped rather than partially executed.
     geometry_ok = (bos >= 0) & (bos <= eos) & (query_len <= SPEC_QUERY_LEN)
-    source_ok = (source_state_idx > null_block_id) & (
-        source_state_idx < NUM_BLOCKS
-    )
+    source_ok = (source_state_idx > null_block_id) & (source_state_idx < NUM_BLOCKS)
     final_ok = (final_state_idx > null_block_id) & (final_state_idx < NUM_BLOCKS)
     valid = (
         source_ok
@@ -764,12 +1230,11 @@ def _prepare_commit_plan_kernel(
         & (commit_len <= query_len)
     )
     if ALIGN_MODE:
+        valid = valid & (num_computed >= 0)
         boundary_ok = (boundary_state_idx > null_block_id) & (
             boundary_state_idx < NUM_BLOCKS
         )
-        boundary_recovery_len = tl.where(
-            boundary_ok, boundary_recovery_len, 0
-        )
+        boundary_recovery_len = tl.where(boundary_ok, boundary_recovery_len, 0)
     tl.store(commit_lens_ptr + spec_idx, tl.where(valid, commit_len, 0))
     tl.store(
         final_state_indices_ptr + spec_idx,
@@ -783,6 +1248,9 @@ def _prepare_commit_plan_kernel(
         boundary_recovery_lens_ptr + spec_idx,
         tl.where(valid, boundary_recovery_len, 0),
     )
+
+    tl.store(align_valid_ptr + spec_idx, valid.to(tl.int32))
+    tl.store(align_col_ptr + spec_idx, final_state_col)
 
 
 @triton.jit
@@ -819,9 +1287,9 @@ def _compact_conv_state_kernel(
         rest = work // NUM_D_TILES
         pid_b = rest % num_rows
         pid_l = rest // num_rows
-        source_state_idx = tl.load(
-            state_indices_ptr + pid_b * stride_state_indices
-        ).to(tl.int64)
+        source_state_idx = tl.load(state_indices_ptr + pid_b * stride_state_indices).to(
+            tl.int64
+        )
         commit_len = tl.load(commit_lens_ptr + pid_b)
         final_state_idx = tl.load(final_state_indices_ptr + pid_b).to(tl.int64)
         row_ok = (
@@ -848,9 +1316,7 @@ def _compact_conv_state_kernel(
 
             offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
             offs_h = tl.arange(0, BLOCK_HISTORY)
-            mask = (offs_d[:, None] < conv_dim) & (
-                offs_h[None, :] < conv_history_len
-            )
+            mask = (offs_d[:, None] < conv_dim) & (offs_h[None, :] < conv_history_len)
             final_values = tl.load(
                 source_ptr
                 + offs_d[:, None] * dim_stride
@@ -892,6 +1358,12 @@ def _commit_gdn_state_kernel(
     replay_ref_ptr,
     replay_base_addrs_ptr,
     replay_block_strides_ptr,
+    key_ref_ptr,
+    key_base_addrs_ptr,
+    key_block_strides_ptr,
+    decay_ref_ptr,
+    decay_base_addrs_ptr,
+    decay_block_strides_ptr,
     state_indices_ptr,
     commit_lens_ptr,
     final_state_indices_ptr,
@@ -907,6 +1379,11 @@ def _commit_gdn_state_kernel(
     stride_replay_head,
     stride_replay_pos,
     stride_replay_dim,
+    stride_key_head,
+    stride_key_pos,
+    stride_key_dim,
+    stride_decay_head,
+    stride_decay_pos,
     stride_si,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -915,6 +1392,8 @@ def _commit_gdn_state_kernel(
     NUM_HEADS: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     NUM_VALUE_TILES: tl.constexpr,
+    NUM_KEY_HEADS: tl.constexpr,
+    RECORD_SOA: tl.constexpr,
 ):
     # One physical program handles several logical (value tile, row, layer*head)
     # tiles. Every early exit below is a per-tile no-op, never a function return:
@@ -936,6 +1415,7 @@ def _commit_gdn_state_kernel(
             & (src < NUM_BLOCKS)
             & (n > 0)
             & (final_idx > null_block_id)
+            & (final_idx < NUM_BLOCKS)
             # Records live in a scratch sized by max_num_seqs; padded graph rows
             # never reach here, but a non-null padding row must not read past it.
             & (pid_b < num_record_rows)
@@ -950,7 +1430,10 @@ def _commit_gdn_state_kernel(
             b_len = tl.load(boundary_recovery_lens_ptr + pid_b).to(tl.int32)
             # Chained ``and`` is rejected by triton-ascend: fold into one term.
             store_boundary = (
-                (b_idx > null_block_id) & (b_idx != final_idx) & (b_len > 0)
+                (b_idx > null_block_id)
+                & (b_idx < NUM_BLOCKS)
+                & (b_idx != final_idx)
+                & (b_len > 0)
             )
             state_ptr = tl.load(state_base_addrs_ptr + pid_l).to(
                 tl.pointer_type(state_ref_ptr.dtype.element_ty)
@@ -963,6 +1446,18 @@ def _commit_gdn_state_kernel(
             # Row-indexed records (see the verify kernel): the checkpoint is read
             # from the request's page (``src``), the records from its row.
             rec_base = replay_ptr + pid_b * rbs + pid_h * stride_replay_head
+            if RECORD_SOA:
+                key_ptr = tl.load(key_base_addrs_ptr + pid_l).to(
+                    tl.pointer_type(key_ref_ptr.dtype.element_ty)
+                )
+                key_bs = tl.load(key_block_strides_ptr + pid_l)
+                key_head = pid_h // (NUM_HEADS // NUM_KEY_HEADS)
+                key_base = key_ptr + pid_b * key_bs + key_head * stride_key_head
+                decay_ptr = tl.load(decay_base_addrs_ptr + pid_l).to(
+                    tl.pointer_type(decay_ref_ptr.dtype.element_ty)
+                )
+                decay_bs = tl.load(decay_block_strides_ptr + pid_l)
+                decay_base = decay_ptr + pid_b * decay_bs + pid_h * stride_decay_head
             offs_k = tl.arange(0, BK)
             offs_v = pid_v * BV + tl.arange(0, BV)
             mask_k = offs_k < K
@@ -983,10 +1478,18 @@ def _commit_gdn_state_kernel(
             for t in range(n):
                 rec = rec_base + t * stride_replay_pos
                 c = tl.load(rec + offs_v * stride_replay_dim, mask=mask_v, other=0.0)
-                kk = tl.load(
-                    rec + (V + offs_k) * stride_replay_dim, mask=mask_k, other=0.0
-                )
-                decay = tl.load(rec + (V + K) * stride_replay_dim)
+                if RECORD_SOA:
+                    kk = tl.load(
+                        key_base + t * stride_key_pos + offs_k * stride_key_dim,
+                        mask=mask_k,
+                        other=0.0,
+                    ).to(tl.float32)
+                    decay = tl.load(decay_base + t * stride_decay_pos)
+                else:
+                    kk = tl.load(
+                        rec + (V + offs_k) * stride_replay_dim, mask=mask_k, other=0.0
+                    )
+                    decay = tl.load(rec + (V + K) * stride_replay_dim)
                 h = tl.fma(c[:, None], kk[None, :], h * decay)
                 if store_boundary:
                     if t + 1 == b_len:
@@ -1074,7 +1577,7 @@ class GDNRecoverSSMCommitContext:
     checkpoints: tuple[torch.Tensor, ...]
     state_base_addrs: torch.Tensor
     state_block_strides: torch.Tensor
-    replays: tuple[torch.Tensor, ...]
+    replays: tuple[Any, ...]
     replay_base_addrs: torch.Tensor
     replay_block_strides: torch.Tensor
     commit_lens: torch.Tensor
@@ -1090,7 +1593,7 @@ class GDNRecoverSSMCommitContext:
         cls,
         conv_states: Sequence[torch.Tensor],
         checkpoints: Sequence[torch.Tensor],
-        replays: Sequence[torch.Tensor],
+        replays: Sequence[torch.Tensor | ReplayRecordBuffers],
         *,
         spec_query_len: int,
         max_num_reqs: int,
@@ -1126,18 +1629,45 @@ class GDNRecoverSSMCommitContext:
                 and s.device == _dev,
                 "layers need matching checkpoints",
             )
-        _rec_tail = (HV, spec_query_len, V + K + 1)
-        for r in replays:
-            _require(
-                r.ndim == 4
-                and tuple(r.shape[1:]) == _rec_tail
-                and r.dtype == torch.float32
-                and r.stride()[1:] == replays[0].stride()[1:]
-                and r.device == _dev,
-                "layers need matching float32 replay buffers of shape "
-                f"[rows, {HV}, {spec_query_len}, {V + K + 1}] (row-indexed scratch, "
-                "not cache pages)",
-            )
+        soa = isinstance(replays[0], ReplayRecordBuffers)
+        _require(
+            all(isinstance(r, ReplayRecordBuffers) == soa for r in replays),
+            "packed and typed records cannot share a commit context",
+        )
+        if soa:
+            corrs = [r.correction for r in replays]
+            keys = [r.key for r in replays]
+            decays = [r.decay for r in replays]
+            H = keys[0].shape[1]
+            _require(H > 0 and HV % H == 0, "record key heads are incompatible")
+            for c, k, d in zip(corrs, keys, decays):
+                _require(
+                    c.shape == corrs[0].shape
+                    and tuple(c.shape[1:]) == (HV, spec_query_len, V)
+                    and tuple(k.shape) == (c.shape[0], H, spec_query_len, K)
+                    and tuple(d.shape) == (c.shape[0], HV, spec_query_len)
+                    and c.dtype == d.dtype == torch.float32
+                    and k.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                    and k.dtype == keys[0].dtype
+                    and all(t.device == _dev for t in (c, k, d))
+                    and c.stride()[1:] == corrs[0].stride()[1:]
+                    and k.stride()[1:] == keys[0].stride()[1:]
+                    and d.stride()[1:] == decays[0].stride()[1:],
+                    "layers need matching typed replay geometry/dtypes/strides",
+                )
+        else:
+            corrs = keys = decays = list(replays)
+            H = HV
+            for r in replays:
+                _require(
+                    r.ndim == 4
+                    and tuple(r.shape[1:]) == (HV, spec_query_len, V + K + 1)
+                    and r.shape == replays[0].shape
+                    and r.dtype == torch.float32
+                    and r.stride()[1:] == replays[0].stride()[1:]
+                    and r.device == _dev,
+                    "layers need matching packed FP32 replay buffers",
+                )
         conv_ref = conv_states[0]
         _require(
             conv_ref.ndim == 3 and conv_ref.shape[0] == nb,
@@ -1176,8 +1706,8 @@ class GDNRecoverSSMCommitContext:
             addr(checkpoints),
             bstr(checkpoints),
             tuple(replays),
-            addr(replays),
-            bstr(replays),
+            addr(corrs),
+            bstr(corrs),
             z(),
             z(),
             z(),
@@ -1189,7 +1719,19 @@ class GDNRecoverSSMCommitContext:
         # the start-up self-check builds a context straight from ``from_tensors``
         # and must use the same attribute the serving path reads.
         context.records = list(replays)
-        context.record_rows = int(replays[0].shape[0])
+        context.record_rows = int(corrs[0].shape[0])
+        context.record_layout = "soa" if soa else "packed"
+        context.num_key_heads = int(H)
+        context.key_dtype = keys[0].dtype
+        context.correction_base_addrs = context.replay_base_addrs
+        context.correction_block_strides = context.replay_block_strides
+        context.key_base_addrs = addr(keys)
+        context.key_block_strides = bstr(keys)
+        context.decay_base_addrs = addr(decays)
+        context.decay_block_strides = bstr(decays)
+        context.record_bytes = sum(record_nbytes(r) for r in replays)
+        context.align_valid = z()
+        context.align_col = z()
         return context
 
     @classmethod
@@ -1200,6 +1742,8 @@ class GDNRecoverSSMCommitContext:
         spec_query_len: int,
         max_num_reqs: int,
         record_rows: int | None = None,
+        num_key_heads: int | None = None,
+        key_dtype: torch.dtype | None = None,
     ) -> "GDNRecoverSSMCommitContext":
         """Build the context from live layers' ``kv_cache`` pages.
 
@@ -1209,7 +1753,7 @@ class GDNRecoverSSMCommitContext:
         (``[blocks, HV, V, K]``). The fp32 records are allocated here as scratch
         of shape ``[rows, HV, Q, V + K + 1]`` -- they are per (request, step)
         temporaries, so they must not live in the cache pages.
-        
+
 
         Ascend: no gate parameters are read here. The commit kernel replays the
         decay stored in the record, so ``A_log``/``dt_bias`` never enter the
@@ -1236,11 +1780,18 @@ class GDNRecoverSSMCommitContext:
         # index and the kernels skip them, so sizing by max_num_seqs (instead of
         # the padded graph batch) removes ~3/4 of this buffer.
         rows = int(record_rows or max_num_reqs)
+        key_heads = num_heads if num_key_heads is None else int(num_key_heads)
+        record_key_dtype = torch.float32 if key_dtype is None else key_dtype
         records = [
-            torch.zeros(
-                (rows, num_heads, spec_query_len, head_v + head_k + 1),
-                dtype=torch.float32,
+            ReplayRecordBuffers.allocate(
+                rows,
+                num_heads,
+                key_heads,
+                spec_query_len,
+                head_v,
+                head_k,
                 device=device,
+                key_dtype=record_key_dtype,
             )
             for _ in layers
         ]
@@ -1294,6 +1845,92 @@ class GDNRecoverSSMCommitContext:
         )
         return tuple(specs)
 
+    def prepare_verify(
+        self,
+        *,
+        activation_dtype: torch.dtype,
+        state_table_width: int | None = None,
+        device: torch.device | None = None,
+    ) -> list[dict[str, Any]]:
+        """Compile serving-pool verify signatures without reading/writing state.
+
+        Native gating implementations return either activation-typed or FP32
+        beta. The value view may be contiguous or retain the combined-QKV token
+        stride. Both legal signatures are registered before readiness. Runtime
+        row/token/work counts are deliberately not specialized, so this single
+        logical row covers every serving batch size of the same layer geometry.
+        """
+        device = self.checkpoints[0].device if device is None else device
+        record = self.records[0]
+        _, hv, value_dim, key_dim = self.checkpoints[0].shape
+        key_heads = self.num_key_heads
+        window = self.spec_query_len
+        width = int(state_table_width or window)
+        _require(width > 0, "verify preparation requires a positive table stride")
+        q = torch.empty(
+            (1, window, key_heads, key_dim), dtype=activation_dtype, device=device
+        )
+        k = torch.empty_like(q)
+        g = torch.empty((1, window, hv), dtype=torch.float32, device=device)
+        output = torch.empty(
+            (1, window, hv, value_dim), dtype=activation_dtype, device=device
+        )
+        state_table = torch.empty((1, width), dtype=torch.int32, device=device)
+        offsets = torch.empty(2, dtype=torch.int32, device=device)
+        beta_dtypes = tuple(dict.fromkeys((torch.float32, activation_dtype)))
+        report = []
+        for packed_value in (False, True):
+            if packed_value:
+                features = 2 * key_heads * key_dim + hv * value_dim
+                combined = torch.empty(
+                    (1, window, features), dtype=activation_dtype, device=device
+                )
+                value = combined[:, :, 2 * key_heads * key_dim :].view(
+                    1, window, hv, value_dim
+                )
+            else:
+                value = torch.empty_like(output)
+            for beta_dtype in beta_dtypes:
+                beta = torch.empty((1, window, hv), dtype=beta_dtype, device=device)
+                specs = []
+                gdn_recoverssm_verify(
+                    g,
+                    beta,
+                    q,
+                    k,
+                    value,
+                    checkpoint_state=self.checkpoints[0],
+                    replay_cache=record,
+                    query_start_loc=offsets,
+                    state_indices=state_table[:, 0],
+                    spec_query_len=window,
+                    qk_already_normalized=True,
+                    out=output,
+                    _collect=specs,
+                )
+                for spec in specs:
+                    spec.compile_only()
+                block_k = triton.next_power_of_2(key_dim)
+                block_v = _verify_value_tile(block_k, value_dim)
+                description = dict(
+                    activation_dtype=str(activation_dtype),
+                    beta_dtype=str(beta_dtype),
+                    value_token_stride=value.stride(1),
+                    state_index_stride=width,
+                    state_blocks=self.num_blocks,
+                    record_rows=self.record_rows,
+                    num_value_heads=hv,
+                    num_key_heads=key_heads,
+                    window=window,
+                    value_tile=block_v,
+                    key_tile=block_k,
+                    ub_estimate_bytes=_verify_ub_floats(block_v, block_k) * 4,
+                )
+                report.append(description)
+                logger.info("GDN_VERIFY_PREPARED %s", description)
+        self.verify_prepare_report = tuple(report)
+        return report
+
     def prepare(
         self,
         *,
@@ -1301,35 +1938,54 @@ class GDNRecoverSSMCommitContext:
         state_table_width: int,
         request_mapping: bool,
         device: torch.device,
+        align_mode: bool = False,
+        mamba_block_size: int | None = None,
+        block_table_width: int | None = None,
+        request_index_dtype=torch.int64,
+        accepted_dtype=torch.int32,
+        state_index_dtype=torch.int32,
+        query_index_dtype=torch.int32,
+        computed_dtype=torch.int32,
     ) -> list[int]:
-        """Compile + register every commit variant the serving path can launch.
+        """Compile exact none/align input signatures before requests arrive.
 
-        ``capacity`` is the largest speculative row count (the plan buffer size).
-        The dummy inputs mirror the real sources' dtype/stride/layout -- notably
-        ``state_indices`` is a column view of a two-dimensional table, so its
-        stride is the table width, not 1. Nothing is launched: only compilation
-        and device registration happen here.
+        Plans may have graph-padded capacity, but only real record rows commit.
+        Dummies preserve runtime dtype, table-column stride and optional inputs.
         """
-        compiled_rows: list[int] = []
-        for rows in range(1, capacity + 1):
-            table = torch.zeros(
-                (rows, state_table_width), dtype=torch.int32, device=device
+        _require(
+            not align_mode
+            or (
+                mamba_block_size is not None and mamba_block_size >= self.spec_query_len
+            ),
+            "align preparation requires the runtime block size",
+        )
+        compiled_rows = []
+        for rows in range(1, min(capacity, self.record_rows) + 1):
+            table = torch.empty(
+                (rows, state_table_width), dtype=state_index_dtype, device=device
             )
             state_indices = table[:, 0]
-            qsl = torch.zeros(rows + 1, dtype=torch.int32, device=device)
-            accepted = torch.zeros(rows, dtype=torch.int32, device=device)
+            qsl = torch.empty(rows + 1, dtype=query_index_dtype, device=device)
+            accepted = torch.empty(rows, dtype=accepted_dtype, device=device)
             mapping = (
-                torch.arange(rows, dtype=torch.int32, device=device)
+                torch.empty(rows, dtype=request_index_dtype, device=device)
                 if request_mapping
                 else None
             )
-            specs = self.make_commit_specs(
+            bt = computed = None
+            if align_mode:
+                width = int(block_table_width or state_table_width)
+                bt = torch.empty((rows, width), dtype=state_index_dtype, device=device)
+                computed = torch.empty(rows, dtype=computed_dtype, device=device)
+            for spec in self.make_commit_specs(
                 accepted,
                 state_indices,
                 qsl,
                 request_indices=mapping,
-            )
-            for spec in specs:
+                block_table=bt,
+                num_computed_tokens=computed,
+                mamba_block_size=mamba_block_size if align_mode else None,
+            ):
                 spec.compile_only()
             compiled_rows.append(rows)
         return compiled_rows
@@ -1384,8 +2040,8 @@ class GDNRecoverSSMCommitContext:
             "align block size must cover one speculative window",
         )
         _require(
-            block_table is None or block_table.ndim == 2,
-            "block table must be two-dimensional",
+            block_table is None or (block_table.ndim == 2 and block_table.shape[1] > 0),
+            "block table must be two-dimensional with a positive width",
         )
         _dev = self.checkpoints[0].device
         _require(
@@ -1416,6 +2072,8 @@ class GDNRecoverSSMCommitContext:
                 self.final_state_indices,
                 self.boundary_state_indices,
                 self.boundary_recovery_lens,
+                self.align_valid,
+                self.align_col,
                 NULL_BLOCK_ID,
                 mamba_block_size or 1,
                 block_table.shape[1] if block_table is not None else 1,
@@ -1425,11 +2083,7 @@ class GDNRecoverSSMCommitContext:
                 query_start_loc.stride(0),
                 bt_stride[0],
                 bt_stride[1],
-                (
-                    0
-                    if num_computed_tokens is None
-                    else num_computed_tokens.stride(0)
-                ),
+                (0 if num_computed_tokens is None else num_computed_tokens.stride(0)),
             ),
             kwargs={
                 "SPEC_QUERY_LEN": self.spec_query_len,
@@ -1457,11 +2111,11 @@ class GDNRecoverSSMCommitContext:
                 kernel=_compact_conv_state_kernel,
                 grid=(min(conv_work, _launch_cap()),),
                 args=(
-                conv_ref,
-                self.conv_state_base_addrs,
-                self.conv_state_block_strides,
-                self.conv_state_dim_strides,
-                self.conv_state_token_strides,
+                    conv_ref,
+                    self.conv_state_base_addrs,
+                    self.conv_state_block_strides,
+                    self.conv_state_dim_strides,
+                    self.conv_state_token_strides,
                     state_indices,
                     self.commit_lens,
                     self.final_state_indices,
@@ -1494,8 +2148,13 @@ class GDNRecoverSSMCommitContext:
         # and smaller tiles keep more of them in flight); the cap is kept and the
         # tile is additionally clamped to the UB budget of this device.
         BV = _commit_value_tile(BK, V)
-        rr = self.replays[0]
-        align = block_table is not None
+        record = self.replays[0]
+        soa = self.record_layout == "soa"
+        rr = record.correction if soa else record
+        kr = record.key if soa else record
+        dr = record.decay if soa else record
+        key_strides = kr.stride()[1:] if soa else (0, 0, 0)
+        decay_strides = dr.stride()[1:] if soa else (0, 0)
         # Must be computed before the argument tuple that consumes them.
         num_value_tiles = triton.cdiv(V, BV)
         num_work = num_value_tiles * batch * (num_layers * HV)
@@ -1506,6 +2165,12 @@ class GDNRecoverSSMCommitContext:
             rr,
             self.replay_base_addrs,
             self.replay_block_strides,
+            kr,
+            self.key_base_addrs,
+            self.key_block_strides,
+            dr,
+            self.decay_base_addrs,
+            self.decay_block_strides,
             state_indices,
             self.commit_lens,
             self.final_state_indices,
@@ -1521,6 +2186,8 @@ class GDNRecoverSSMCommitContext:
             rr.stride(1),
             rr.stride(2),
             rr.stride(3),
+            *key_strides,
+            *decay_strides,
             state_indices.stride(0),
         )
         # One launch per layer set: the final and the boundary state come out of a
@@ -1538,6 +2205,8 @@ class GDNRecoverSSMCommitContext:
                 "NUM_HEADS": HV,
                 "NUM_BLOCKS": self.num_blocks,
                 "NUM_VALUE_TILES": num_value_tiles,
+                "NUM_KEY_HEADS": self.num_key_heads,
+                "RECORD_SOA": soa,
                 "num_warps": 4,
                 "num_stages": 2,
             },
@@ -1553,4 +2222,10 @@ class GDNRecoverSSMCommitContext:
         )
 
 
-__all__ = ["GDNRecoverSSMCommitContext", "gdn_recoverssm_verify"]
+__all__ = [
+    "GDNRecoverSSMCommitContext",
+    "ReplayRecordBuffers",
+    "gdn_recoverssm_verify",
+    "record_geometry_bytes",
+    "record_nbytes",
+]

@@ -35,7 +35,6 @@ Ascend-specific differences from upstream (see ``docs/FEASIBILITY.md``):
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -49,31 +48,12 @@ from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMPostprocessMetadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
-
 from vllm_ascend.ops.gdn_attn_builder import (
     AscendGDNAttentionBackend,
     AscendGDNAttentionMetadataBuilder,
 )
 
 logger = init_logger("vllm.gdn_recoverssm_ascend.builder")
-
-# Pending align bookkeeping for the step being postprocessed. The commit runs
-# inside ``RecoverSSMState.commit_step`` and the native align postcopy runs right
-# after it, so the update has to be applied in between -- the wrapper around
-# ``postprocess_state`` consumes this and clears it.
-_PENDING_ALIGN: dict | None = None
-
-
-def take_pending_align():
-    """Pop the pending align update (consumed once per step)."""
-    global _PENDING_ALIGN
-    pending, _PENDING_ALIGN = _PENDING_ALIGN, None
-    return pending
-
-
-def _env_flag(name: str) -> bool:
-    value = os.getenv(name)
-    return value is not None and value.strip() not in ("", "0", "false", "False")
 
 
 @dataclass
@@ -90,6 +70,10 @@ class AscendGDNRecoverSSMCommitMetadata:
     block_table: torch.Tensor | None
     num_computed_tokens: torch.Tensor | None
     block_size: int | None
+    # CPU-only identities for deciding whether groups share logical rows. The
+    # physical page tables are deliberately NOT shared between groups.
+    request_rows: tuple[int, ...] = ()
+    query_lens: tuple[int, ...] = ()
 
 
 # Host-only counter: the commit runs in Python after sampling (outside the graph),
@@ -107,6 +91,9 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
     # The builder resolves (and re-resolves) the commit context, so a metadata
     # object created before the KV cache was bound still commits correctly.
     recoverssm_builder: Any = field(default=None, repr=False, compare=False)
+    # The producer and consumer share one immutable binding epoch. Resolving a
+    # fresh context only after verify would lose the records just produced.
+    recoverssm_context: Any = field(default=None, repr=False, compare=False)
 
     def commit_recoverssm_state(
         self, num_accepted_tokens: torch.Tensor
@@ -114,7 +101,12 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
         commit = self.recoverssm_commit
         if commit is None or self.recoverssm_builder is None:
             return None
-        context = self.recoverssm_builder._get_context()
+        if commit.block_table is not None:
+            raise RuntimeError(
+                "GDN align recovery must run through the step coordinator so "
+                "persistent ownership is published from the same valid plan"
+            )
+        context = self.recoverssm_context
         if context is None:
             logger.warning(
                 "Ascend GDN RecoverSSM: commit skipped, the KV cache is not bound yet"
@@ -142,76 +134,30 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
             num_computed_tokens=commit.num_computed_tokens,
             mamba_block_size=commit.block_size,
         )
+        # The model-state coordinator normally handles this method's entire
+        # step. A direct caller still gets the same physical recovery; align
+        # publication requires the model-state persistent slot mapping.
         # Deliberately no RecoverSSMPostprocessMetadata: the generic kernel would
         # advance the running column with (computed + sampled) // block, which is
         # not the column this commit wrote. The GDN-specific bookkeeping (running
         # column = commit target, persistent accepted = 1) is staged here and
         # applied by the postprocess hook after this commit and before the native
         # align postcopy.
-        if commit.block_table is not None:
-            # The speculative window length lives on the BUILDER; ``self`` here is
-            # the metadata object, which has no such attribute (this line only
-            # runs in align mode, so the none-mode runs never reached it).
-            builder = self.recoverssm_builder
-            num_spec = getattr(builder, "num_spec", None)
-            window = None if num_spec is None else int(num_spec) + 1
-            _stage_align_update(commit, num_accepted_tokens, n, window)
         return None
 
 
-def _spec_rows_from_host_copy(builder, masks: torch.Tensor) -> torch.Tensor:
-    """Batch rows that carry the spec mask, resolved without a device sync."""
-    cpu = getattr(builder, "spec_sequence_masks_cpu", None)
-    if cpu is not None and cpu.numel() >= masks.numel():
-        return torch.nonzero(cpu[: masks.numel()], as_tuple=False).flatten()
-    # Fallback for a baseline that does not expose the host copy: still correct,
-    # just with the synchronisation this function exists to avoid.
-    return masks.nonzero(as_tuple=False).flatten()
-
-
-def _stage_align_update(
-    commit, num_accepted_tokens, n: int, spec_query_len: int | None
-) -> None:
-    """Record ``(rows, final_col)`` so postprocess can fix the running column.
-
-    RecoverSSM restores the accepted state itself, so the persistent running
-    column must become the column the commit actually wrote
-    (``floor(max(C + A - 1, 0) / block)``) and the persistent accepted count must
-    go back to the neutral 1. The generic Recover kernel uses a different column
-    formula, so returning its metadata would be wrong; this is the GDN-specific
-    bookkeeping instead.
-    """
-    global _PENDING_ALIGN
-    try:
-        import torch
-
-        rows = commit.request_indices
-        if rows is None:
-            # Without the batch-row mapping we cannot address the persistent
-            # request slots; guessing an identity mapping would write another
-            # request's column. Skip and say so.
-            logger.warning(
-                "Ascend GDN RecoverSSM: align bookkeeping skipped, the spec rows "
-                "have no batch-row mapping"
-            )
-            return
-        computed = commit.num_computed_tokens[rows.long()]
-        qsl = commit.query_start_loc
-        qlen = (qsl[1 : n + 1] - qsl[:n]).clamp(min=0)
-        # Same clamp chain as the plan kernel: max(0) -> query_len -> spec window.
-        accepted = num_accepted_tokens[rows.long()].clamp(min=0)
-        accepted = torch.minimum(accepted, qlen)
-        if spec_query_len is not None:
-            # Same bound as the plan kernel's SPEC_QUERY_LEN clamp; without it the
-            # column could point past the window the commit actually folded.
-            accepted = accepted.clamp(max=int(spec_query_len))
-        width = int(commit.block_table.shape[1])
-        col = ((computed + accepted - 1).clamp(min=0) // int(commit.block_size)).clamp(
-            max=width - 1
+def _native_spec_rows(builder, n: int, device):
+    """Borrow the exact map the native builder has already uploaded this step."""
+    rows = getattr(builder, "spec_sequence_indices", None)
+    host_rows = getattr(builder, "spec_sequence_indices_cpu", None)
+    if rows is None or host_rows is None or rows.numel() < n or host_rows.numel() < n:
+        raise RuntimeError(
+            "Ascend GDN RecoverSSM requires the native speculative row buffers; "
+            "refusing to guess a mapping or add a synchronizing device nonzero"
         )
-        _PENDING_ALIGN = {"rows": rows, "cols": col}
-    except Exception as exc:  # never break the step on bookkeeping
-        logger.warning("Ascend GDN RecoverSSM: align bookkeeping skipped (%s)", exc)
+    if rows.device != device:
+        raise RuntimeError("native speculative row mapping is on the wrong device")
+    return rows[:n], tuple(int(x) for x in host_rows[:n].tolist())
 
 
 class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
@@ -232,7 +178,6 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         self._context: Any = None
         self._ctx_key: tuple | None = None
         self._ctx_unbound_logged = False
-        self._mapping_logged = False
         self._capturing = False
         # A full-graph replay re-uses the addresses captured at capture time, so
         # the accepted-token input must live in one **persistent** buffer that is
@@ -245,9 +190,22 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             vllm_config.scheduler_config.max_num_seqs,
             int(getattr(self, "decode_cudagraph_max_bs", 0) or 0),
         )
-        self._accepted_buffer = torch.ones(
-            max_rows, dtype=torch.int32, device=device
-        )
+        self._accepted_buffer = torch.ones(max_rows, dtype=torch.int32, device=device)
+
+    def _record_key_heads(self, layer) -> int:
+        config = self.vllm_config.model_config.hf_text_config
+        heads = getattr(config, "linear_num_key_heads", None)
+        if heads is None:
+            attn = getattr(config, "linear_attn_config", None)
+            if isinstance(attn, dict):
+                heads = attn.get("num_key_heads")
+        if heads is None:
+            # No grouping is safer than inventing a model's head mapping.
+            return int(layer.kv_cache[1].shape[1])
+        tp = int(self.vllm_config.parallel_config.tensor_parallel_size)
+        if int(heads) % tp:
+            raise ValueError("GDN key heads must be divisible by tensor parallel size")
+        return int(heads) // tp
 
     # ------------------------------------------------------------------ context
     def _get_context(self):
@@ -287,10 +245,12 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
                 layer_name,
                 tuple(
                     (
+                        id(t),
                         t.data_ptr(),
                         tuple(t.shape),
                         tuple(t.stride()),
-                        str(t.dtype),
+                        t.dtype,
+                        t.device,
                     )
                     for t in layer.kv_cache
                 ),
@@ -300,6 +260,16 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         if self._context is not None and key == self._ctx_key:
             return self._context
         if self._context is not None:
+            if (
+                getattr(self, "_gdn_serving_ready", False)
+                and getattr(self, "use_full_cuda_graph", False)
+                and getattr(self, "_captured_context", None) is not None
+                and not self._capturing
+            ):
+                raise RuntimeError(
+                    "GDN KV binding changed after graph capture; the native "
+                    "model graph must be invalidated and recaptured before serving"
+                )
             logger.warning(
                 "Ascend GDN RecoverSSM: KV cache re-bound, rebuilding the commit "
                 "context (stale pointers would write to freed device memory)."
@@ -318,10 +288,17 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             # Records are only written by real requests; the padded graph rows are
             # skipped by the kernels, so cap the scratch at max_num_seqs.
             record_rows=min(
-                max_rows, int(self.vllm_config.scheduler_config.max_num_seqs or max_rows)
+                max_rows,
+                int(self.vllm_config.scheduler_config.max_num_seqs or max_rows),
             ),
+            num_key_heads=self._record_key_heads(layers[0]),
+            key_dtype=getattr(self.vllm_config.model_config, "dtype", torch.float32),
         )
         self._ctx_key = key
+        self._prepared_group_bucket = None
+        # Keep the binding objects alive; neither container identity nor a raw
+        # pointer alone is a reliable storage/layout invalidation protocol.
+        self._ctx_bindings = tuple(tuple(layer.kv_cache) for layer in layers)
         logger.info(
             "Ascend GDN RecoverSSM commit context: %d layers, spec_query_len=%d, "
             "state tensors per layer=%d, replay shape=%s, plan rows=%d",
@@ -364,6 +341,12 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         n = min(int(meta.num_spec_decodes), qsl_rows)
         if n <= 0:
             return meta
+
+        context = self._get_context()
+        if context is None:
+            raise RuntimeError(
+                "speculative verify requires a bound GDN recovery context"
+            )
 
         # Only the checkpoint column is meaningful under RecoverSSM.
         state_indices = meta.spec_state_indices_tensor[:n, 0]
@@ -413,57 +396,14 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             num_computed = m.compute_num_computed_tokens()
             block_size = self.kv_cache_spec.block_size
 
-        # ``spec_sequence_masks`` is indexed by **batch row** and
-        # ``spec_state_indices_tensor`` was gathered with
-        # ``nonzero(spec_sequence_masks)``, so spec row i corresponds to batch row
-        # ``nonzero(masks)[i]``. The commit plan needs exactly that mapping:
-        # identity here is only correct when the spec rows happen to be the first
-        # n rows, which is false as soon as chunked prefill puts a prefill row in
-        # front of a decode row.
-        request_indices = None
-        masks = meta.spec_sequence_masks
-        if masks is not None and masks.numel() > 0:
-            # Resolve the mapping on the HOST. ``nonzero`` on a device tensor has a
-            # data-dependent shape, so it synchronises the whole step; the native
-            # builder keeps a pinned CPU copy of this very mask
-            # (``spec_sequence_masks_cpu``, filled in its build) precisely to avoid
-            # that. Using the device copy here added a sync per metadata group per
-            # step -- three groups, every step.
-            rows = _spec_rows_from_host_copy(self, masks)
-            if rows.numel() < n:
-                # Never guess: a wrong mapping folds another request's records
-                # into this request's checkpoint (silent corruption).
-                logger.warning(
-                    "Ascend GDN RecoverSSM: %d spec rows but only %d carry the "
-                    "spec mask; skipping the commit for this step.",
-                    n,
-                    rows.numel(),
-                )
-                return meta
-            # The mapping is resolved on the host, but every consumer (the plan
-            # kernel and the align bookkeeping) indexes device tensors, so it must
-            # live on the same device. This is a tiny H2D copy (one int32 per spec
-            # row), not a sync.
-            request_indices = rows[:n].to(torch.int32).to(state_indices.device)
-            if not self._mapping_logged:
-                self._mapping_logged = True
-                identity = bool(
-                    torch.equal(
-                        request_indices,
-                        torch.arange(n, dtype=torch.int32, device=request_indices.device),
-                    )
-                )
-                if not identity:
-                    logger.info(
-                        "Ascend GDN RecoverSSM: spec rows are not the batch "
-                        "prefix; commit maps rows %s", request_indices.tolist()
-                    )
-        elif n > 0:
-            logger.warning(
-                "Ascend GDN RecoverSSM: no spec mask on the metadata; skipping the "
-                "commit for this step."
-            )
-            return meta
+        request_indices, request_rows = _native_spec_rows(self, n, state_indices.device)
+        # All groups see the same scheduler batch, but own distinct physical
+        # tables. Keep a CPU geometry identity so the coordinator can validate
+        # row agreement without reading any device value.
+        host_qsl = m.query_start_loc_cpu.tolist()
+        query_lens = tuple(
+            int(host_qsl[row + 1]) - int(host_qsl[row]) for row in request_rows
+        )
 
         commit = AscendGDNRecoverSSMCommitMetadata(
             state_indices=state_indices,
@@ -472,6 +412,8 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             block_table=block_table,
             num_computed_tokens=num_computed,
             block_size=block_size,
+            request_rows=request_rows,
+            query_lens=query_lens,
         )
 
         base = {f.name: getattr(meta, f.name) for f in fields(meta)}
@@ -480,6 +422,7 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             **base,
             recoverssm_commit=commit,
             recoverssm_builder=self,
+            recoverssm_context=context,
         )
         # The Ascend builder attaches descriptors that are *not* dataclass
         # fields (``spec_decode_metadata``, ``non_spec_prefill_metadata``,
@@ -492,10 +435,14 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
                 setattr(out, key, value)
         return out
 
-    def build_for_cudagraph_capture(self, common_attn_metadata: CommonAttentionMetadata):
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ):
         self._capturing = True
         try:
-            return super().build_for_cudagraph_capture(common_attn_metadata)
+            result = super().build_for_cudagraph_capture(common_attn_metadata)
+            self._captured_context = self._context
+            return result
         finally:
             self._capturing = False
 
@@ -509,7 +456,22 @@ class AscendGDNRecoverSSMBackend(AscendGDNAttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type[AscendGDNRecoverSSMMetadataBuilder]:
+        # Preserve the native backend *factory* decision. Calling super().build
+        # does not restore the HostMetadataBuilder class attribute.
+        from vllm_ascend.ops import gdn_attn_builder as native
+
+        factory = getattr(native, "AscendGDNFusedAttentionBackend", None)
+        if factory is not None:
+            selected = factory.get_builder_cls()
+            if not selected.build_device_chunk_metadata:
+                return AscendGDNRecoverSSMHostMetadataBuilder
         return AscendGDNRecoverSSMMetadataBuilder
+
+
+class AscendGDNRecoverSSMHostMetadataBuilder(AscendGDNRecoverSSMMetadataBuilder):
+    """RecoverSSM plus native fused-prefill host-only descriptors."""
+
+    build_device_chunk_metadata = False
 
 
 __all__ = [
@@ -517,4 +479,5 @@ __all__ = [
     "AscendGDNRecoverSSMCommitMetadata",
     "AscendGDNRecoverSSMMetadata",
     "AscendGDNRecoverSSMMetadataBuilder",
+    "AscendGDNRecoverSSMHostMetadataBuilder",
 ]
