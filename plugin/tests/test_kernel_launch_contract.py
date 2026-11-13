@@ -213,6 +213,59 @@ def check_local_use_before_assignment() -> list[str]:
     return problems
 
 
+def check_no_nested_tuples_in_kernels() -> list[str]:
+    """Triton-Ascend 3.2.2 cannot build a tuple whose elements are tuples.
+
+    A staged window written as ``staged = (load(t0), load(t1), ...)`` where
+    ``load`` returns a 5-tuple makes the device compiler fail at capture time:
+
+        TypeError: cannot convert (<tensor>, ...) of type <class 'tuple'> to tensor
+
+    Only the NPU compiler rejects it, so it is checked statically here: inside a
+    ``triton.jit`` kernel, a tuple literal must not contain a nested tuple literal
+    and must not contain a call to a function that returns a tuple.
+    """
+    tree = ast.parse(KERNELS.read_text())
+
+    tuple_returning = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Tuple):
+                    tuple_returning.add(node.name)
+                    break
+
+    problems: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        is_kernel = any(
+            (isinstance(d, ast.Call) and getattr(d.func, "attr", "") == "jit")
+            or (isinstance(d, ast.Attribute) and d.attr == "jit")
+            for d in node.decorator_list
+        ) or node.name.endswith("_kernel")
+        if not is_kernel:
+            continue
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Tuple):
+                continue
+            for elt in sub.elts:
+                if isinstance(elt, ast.Tuple):
+                    problems.append(
+                        f"{node.name}: nested tuple literal at line {elt.lineno}"
+                    )
+                elif (
+                    isinstance(elt, ast.Call)
+                    and isinstance(elt.func, ast.Name)
+                    and elt.func.id in tuple_returning
+                ):
+                    problems.append(
+                        f"{node.name}: tuple element calls tuple-returning "
+                        f"{elt.func.id}() at line {elt.lineno}"
+                    )
+    return problems
+
+
 def check_dataclass_field_order() -> list[str]:
     """No dataclass field with a default may precede one without.
 
@@ -252,7 +305,10 @@ def check_dataclass_field_order() -> list[str]:
 
 def test_kernel_launch_contract() -> None:
     problems = (
-        check() + check_local_use_before_assignment() + check_dataclass_field_order()
+        check()
+        + check_local_use_before_assignment()
+        + check_dataclass_field_order()
+        + check_no_nested_tuples_in_kernels()
     )
     assert not problems, "\n".join(problems)
 
