@@ -1,5 +1,7 @@
 # 原启动命令不变的完整验收
 
+当前若使用 `op-dev` / `0.3.0.dev0`，还需按 [AscendC 分支说明](ASCENDC_OP_DEV.md) 检查构建、自检和实际模型 AC 路径。它是尚待 CANN/NPU 验证的开发分支，不能将本页历史 Triton 验证当作 AC 已通过。
+
 本轮补丁以整批请求完成时间为目标。保持服务器已经使用的完整启动命令和环境不变：TP、MTP、async scheduling、prefix caching、align、max-num-seqs、max-num-batched-tokens、max-model-len、图模式及全部 capture sizes 都沿用原值。插件不修改这些参数，也不新增试验开关。
 
 开发改动、原因、接口合同及后续安排见[DS 开发交接](DS_HANDOFF_E2E_20261113.md)。

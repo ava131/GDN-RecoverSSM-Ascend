@@ -1339,6 +1339,12 @@ class _LaunchSpec:
     grid: tuple
 
     def launch(self) -> None:
+        from .ascendc_backend import select
+
+        native = select(self)
+        if native is not None:
+            native.launch()
+            return
         self.kernel[self.grid](*self.args, **self.kwargs)
 
     def compile_only(self) -> Any:
@@ -1350,6 +1356,11 @@ class _LaunchSpec:
         the binary, and a failed registration can surface as zero handles rather
         than an exception, so the handles are checked explicitly.
         """
+        from .ascendc_backend import select
+
+        native = select(self)
+        if native is not None:
+            return native.compile_only()
         compiled = self.kernel.run(
             *self.args, grid=self.grid, warmup=True, **self.kwargs
         )

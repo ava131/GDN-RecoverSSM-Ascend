@@ -343,6 +343,13 @@ def _prepare(worker) -> None:
             "refusing startup readiness without verify/commit preparation"
         )
 
+    # op-dev uses an ahead-of-time AscendC library for verify/grouped fold.
+    # Build/load before capture. A compiler/registration failure must not turn
+    # this deployment silently back into the old Triton implementation.
+    from . import ascendc_backend
+
+    ascendc_backend.initialize()
+
     total_rows = 0
     verify_variants = 0
     actual_record_bytes = 0
@@ -438,6 +445,9 @@ def _prepare(worker) -> None:
     )
 
     if not _SELFTEST_DONE:
+        from . import ascendc_selftest
+
+        ascendc_selftest.run(device=builders[0]._get_context().checkpoints[0].device)
         context = builders[0]._get_context()
         ckpt = context.checkpoints[0]
         ok = selftest.run(
@@ -490,7 +500,8 @@ def _prepare(worker) -> None:
             value_dim=int(ckpt.shape[2]),
             spec_query_len=int(context.spec_query_len),
         )
-        _SELFTEST_DONE = True
+    ascendc_backend.assert_ready()
+    _SELFTEST_DONE = True
     worker._gdn_patch_prepared = True
 
 

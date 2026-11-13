@@ -1,5 +1,7 @@
 # gdn-recoverssm-ascend
 
+`op-dev` / `0.3.0.dev0` contains the experimental AscendC verify and grouped-fold path. It builds during worker startup and requires the existing CANN development toolchain. NPU compilation, numerical behavior, graph stability and speed are not yet verified. See the [branch runbook](../docs/ASCENDC_OP_DEV.md).
+
 **RecoverSSM for Gated DeltaNet on Ascend NPU — shipped as a vLLM plugin. No source changes.**
 
 `--use-replayssm` makes a speculative GDN model verify a window of `Q = 1 + MTP`

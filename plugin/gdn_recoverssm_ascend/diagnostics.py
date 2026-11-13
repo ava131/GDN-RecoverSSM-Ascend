@@ -21,7 +21,7 @@ from vllm.logger import init_logger
 from .metrics_math import padding_fraction
 
 logger = init_logger("vllm.gdn_recoverssm_ascend.perf")
-PATCH_ID = "e2e-20261112-v1"
+PATCH_ID = "ascendc-op-dev-v1"
 REPORT_STEPS = 200
 _INSTALLED = False
 _READY = False
@@ -93,11 +93,14 @@ def configure(worker):
 def source_fingerprint():
     """Identify installed source contents, including editable installations."""
     digest = hashlib.sha256()
-    paths = sorted(Path(__file__).resolve().parent.glob("*.py"))
+    root = Path(__file__).resolve().parent
+    paths = sorted(
+        [*root.glob("*.py")] + [p for p in (root / "csrc").rglob("*") if p.is_file()]
+    )
     if not paths:
         return "source-unavailable"
     for path in paths:
-        digest.update(path.name.encode())
+        digest.update(path.relative_to(root).as_posix().encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()[:16]
 

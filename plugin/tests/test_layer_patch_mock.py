@@ -717,6 +717,10 @@ def test_startup_preparation_runs_before_warmup(monkeypatch):
     monkeypatch.setattr(startup_patch, "_log_context_geometry", lambda *args: 0)
     monkeypatch.setattr(startup_patch, "_log_versions", lambda: None)
     monkeypatch.setattr(startup_patch, "_SELFTEST_DONE", True)
+    from gdn_recoverssm_ascend import ascendc_backend
+
+    monkeypatch.setattr(ascendc_backend, "initialize", lambda: None)
+    monkeypatch.setattr(ascendc_backend, "assert_ready", lambda: None)
     startup_patch._prepare(worker)
     assert events == [("prepare", 8, 4, True)], events
 

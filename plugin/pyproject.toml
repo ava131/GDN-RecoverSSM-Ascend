@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gdn-recoverssm-ascend"
-version = "0.2.0"
+version = "0.3.0.dev0"
 description = "RecoverSSM for Gated DeltaNet on Ascend NPU (vLLM plugin, no source changes)"
 requires-python = ">=3.10"
 dependencies = []
@@ -17,3 +17,6 @@ gdn_recoverssm_ascend = "gdn_recoverssm_ascend:install"
 
 [tool.setuptools]
 packages = ["gdn_recoverssm_ascend"]
+
+[tool.setuptools.package-data]
+gdn_recoverssm_ascend = ["csrc/CMakeLists.txt", "csrc/*.h", "csrc/*.cpp", "csrc/**/*.h"]

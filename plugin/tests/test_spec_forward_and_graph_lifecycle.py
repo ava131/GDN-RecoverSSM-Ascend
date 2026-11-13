@@ -384,6 +384,15 @@ def make_config():
 def test_startup_prepares_align_actual_rows_dtype_and_mandatory_selftest(runtime):
     calls = []
     runtime.relative(
+        "ascendc_backend",
+        initialize=lambda: calls.append(("ascendc_load",)),
+        assert_ready=lambda: calls.append(("ascendc_ready",)),
+    )
+    runtime.relative(
+        "ascendc_selftest",
+        run=lambda **kwargs: calls.append(("ascendc_selftest", kwargs)),
+    )
+    runtime.relative(
         "diagnostics", configure=lambda worker: calls.append(("configure",))
     )
     runtime.relative(
@@ -462,6 +471,20 @@ def test_startup_prepares_align_actual_rows_dtype_and_mandatory_selftest(runtime
     assert grouped_test["spec_query_len"] == 4
     assert module._SELFTEST_DONE
     assert worker._gdn_patch_prepared
+
+    # Numerical success alone cannot prove the actual model selected AC.
+    module._SELFTEST_DONE = False
+    backend = sys.modules[module.__package__ + ".ascendc_backend"]
+
+    def missing_route():
+        raise RuntimeError("actual model AC route missing")
+
+    backend.assert_ready = missing_route
+    with pytest.raises(RuntimeError, match="AC route missing"):
+        module._prepare(worker)
+    assert not module._SELFTEST_DONE
+    assert not worker._gdn_patch_prepared
+    backend.assert_ready = lambda: None
 
     module._SELFTEST_DONE = False
     selftest.run = lambda **kwargs: False
