@@ -76,13 +76,27 @@ def _grouped_plan_kernel(
     num_rows,
     plan_capacity,
     null_block_id,
-    SI_STRIDES: tl.constexpr,
-    QSL_STRIDES: tl.constexpr,
-    MAP_STRIDES: tl.constexpr,
-    TABLE_COL_STRIDES: tl.constexpr,
-    COMPUTED_STRIDES: tl.constexpr,
-    NUM_BLOCKS: tl.constexpr,
-    BLOCK_SIZES: tl.constexpr,
+    SI_STRIDES0: tl.constexpr,
+    SI_STRIDES1: tl.constexpr,
+    SI_STRIDES2: tl.constexpr,
+    QSL_STRIDES0: tl.constexpr,
+    QSL_STRIDES1: tl.constexpr,
+    QSL_STRIDES2: tl.constexpr,
+    MAP_STRIDES0: tl.constexpr,
+    MAP_STRIDES1: tl.constexpr,
+    MAP_STRIDES2: tl.constexpr,
+    TABLE_COL_STRIDES0: tl.constexpr,
+    TABLE_COL_STRIDES1: tl.constexpr,
+    TABLE_COL_STRIDES2: tl.constexpr,
+    COMPUTED_STRIDES0: tl.constexpr,
+    COMPUTED_STRIDES1: tl.constexpr,
+    COMPUTED_STRIDES2: tl.constexpr,
+    NUM_BLOCKS0: tl.constexpr,
+    NUM_BLOCKS1: tl.constexpr,
+    NUM_BLOCKS2: tl.constexpr,
+    BLOCK_SIZES0: tl.constexpr,
+    BLOCK_SIZES1: tl.constexpr,
+    BLOCK_SIZES2: tl.constexpr,
     SPEC_QUERY_LEN: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     ALIGN_MODE: tl.constexpr,
@@ -104,6 +118,10 @@ def _grouped_plan_kernel(
                 table_width0,
                 table_row_stride0,
             )
+            num_blocks, block_size = NUM_BLOCKS0, BLOCK_SIZES0
+            si_stride, qsl_stride = SI_STRIDES0, QSL_STRIDES0
+            map_stride, col_stride = MAP_STRIDES0, TABLE_COL_STRIDES0
+            computed_stride = COMPUTED_STRIDES0
         elif group == 1:
             state_p, qsl_p, mapping_p, table_p = state1, qsl1, mapping1, table1
             computed_p, table_width, table_row_stride = (
@@ -111,6 +129,10 @@ def _grouped_plan_kernel(
                 table_width1,
                 table_row_stride1,
             )
+            num_blocks, block_size = NUM_BLOCKS1, BLOCK_SIZES1
+            si_stride, qsl_stride = SI_STRIDES1, QSL_STRIDES1
+            map_stride, col_stride = MAP_STRIDES1, TABLE_COL_STRIDES1
+            computed_stride = COMPUTED_STRIDES1
         else:
             state_p, qsl_p, mapping_p, table_p = state2, qsl2, mapping2, table2
             computed_p, table_width, table_row_stride = (
@@ -118,10 +140,14 @@ def _grouped_plan_kernel(
                 table_width2,
                 table_row_stride2,
             )
-        request = tl.load(mapping_p + row * MAP_STRIDES[group]).to(tl.int64)
-        source = tl.load(state_p + row * SI_STRIDES[group]).to(tl.int64)
-        bos = tl.load(qsl_p + row * QSL_STRIDES[group]).to(tl.int64)
-        eos = tl.load(qsl_p + (row + 1) * QSL_STRIDES[group]).to(tl.int64)
+            num_blocks, block_size = NUM_BLOCKS2, BLOCK_SIZES2
+            si_stride, qsl_stride = SI_STRIDES2, QSL_STRIDES2
+            map_stride, col_stride = MAP_STRIDES2, TABLE_COL_STRIDES2
+            computed_stride = COMPUTED_STRIDES2
+        request = tl.load(mapping_p + row * map_stride).to(tl.int64)
+        source = tl.load(state_p + row * si_stride).to(tl.int64)
+        bos = tl.load(qsl_p + row * qsl_stride).to(tl.int64)
+        eos = tl.load(qsl_p + (row + 1) * qsl_stride).to(tl.int64)
         qlen = eos - bos
         accepted = tl.load(sampled_ptr + request).to(tl.int32)
         count = tl.minimum(tl.maximum(accepted, 0), qlen)
@@ -133,27 +159,27 @@ def _grouped_plan_kernel(
         computed_ok = tl.full((), True, tl.int1)
         if ALIGN_MODE:
             computed = tl.load(
-                computed_p + request * COMPUTED_STRIDES[group]
+                computed_p + request * computed_stride
             ).to(tl.int64)
             computed_ok = computed >= 0
             position = computed + count
             col = tl.minimum(
-                tl.maximum(position - 1, 0) // BLOCK_SIZES[group],
+                tl.maximum(position - 1, 0) // block_size,
                 table_width - 1,
             ).to(tl.int32)
             final = tl.load(
                 table_p
                 + request * table_row_stride
-                + col * TABLE_COL_STRIDES[group]
+                + col * col_stride
             ).to(tl.int64)
-            next_boundary = (computed // BLOCK_SIZES[group] + 1) * BLOCK_SIZES[group]
+            next_boundary = (computed // block_size + 1) * block_size
             crossed = position >= next_boundary
             boundary_len = (next_boundary - computed).to(tl.int32)
-            boundary_col = next_boundary // BLOCK_SIZES[group] - 1
+            boundary_col = next_boundary // block_size - 1
             boundary = tl.load(
                 table_p
                 + request * table_row_stride
-                + boundary_col * TABLE_COL_STRIDES[group],
+                + boundary_col * col_stride,
                 mask=crossed
                 & computed_ok
                 & (boundary_col >= 0)
@@ -161,11 +187,11 @@ def _grouped_plan_kernel(
                 other=null_block_id,
             ).to(tl.int64)
         geometry = (bos >= 0) & (bos <= eos) & (qlen <= SPEC_QUERY_LEN)
-        valid = geometry & (source > null_block_id) & (source < NUM_BLOCKS[group])
-        valid = valid & (final > null_block_id) & (final < NUM_BLOCKS[group])
+        valid = geometry & (source > null_block_id) & (source < num_blocks)
+        valid = valid & (final > null_block_id) & (final < num_blocks)
         valid = valid & (count > 0) & (count <= qlen)
         valid = valid & computed_ok
-        boundary_ok = (boundary > null_block_id) & (boundary < NUM_BLOCKS[group])
+        boundary_ok = (boundary > null_block_id) & (boundary < num_blocks)
         boundary_len = tl.where(boundary_ok, boundary_len, 0)
         # Later kernels use the maximum pool bound across this homogeneous
         # bucket. Canonicalize a group-local invalid boundary now so a larger
@@ -693,6 +719,20 @@ class GroupedCommitBucket:
                 for r in host_rows
             ):
                 raise ValueError("native request mapping exceeds the sampled batch")
+        def _slots(values, fill=0):
+            out = list(values)
+            while len(out) < 3:
+                out.append(out[-1] if out else fill)
+            return out[:3]
+
+        si = _slots([x.state_indices.stride(0) for x in p])
+        qsl = _slots([x.query_start_loc.stride(0) for x in p])
+        mp = _slots([x.request_indices.stride(0) for x in p])
+        tc = _slots([x.block_table.stride(1) if align else 0 for x in p])
+        cs = _slots([x.num_computed_tokens.stride(0) if align else 0 for x in p])
+        nb = _slots([c.num_blocks for c in contexts])
+        bs = _slots([int(x.block_size) if align else 1 for x in p])
+
         plan = _LaunchSpec(
             kernel=_grouped_plan_kernel,
             args=(
@@ -719,17 +759,31 @@ class GroupedCommitBucket:
                 NULL_BLOCK_ID,
             ),
             kwargs={
-                "SI_STRIDES": tuple(x.state_indices.stride(0) for x in p),
-                "QSL_STRIDES": tuple(x.query_start_loc.stride(0) for x in p),
-                "MAP_STRIDES": tuple(x.request_indices.stride(0) for x in p),
-                "TABLE_COL_STRIDES": tuple(
-                    x.block_table.stride(1) if align else 0 for x in p
-                ),
-                "COMPUTED_STRIDES": tuple(
-                    x.num_computed_tokens.stride(0) if align else 0 for x in p
-                ),
-                "NUM_BLOCKS": tuple(c.num_blocks for c in contexts),
-                "BLOCK_SIZES": tuple(int(x.block_size) if align else 1 for x in p),
+                # Triton-Ascend's constexpr is not subscriptable, so the
+                # per-group strides, pool bound and block size are passed as
+                # three explicit scalars and chosen by a compile-time branch
+                # inside the kernel.
+                "SI_STRIDES0": si[0],
+                "SI_STRIDES1": si[1],
+                "SI_STRIDES2": si[2],
+                "QSL_STRIDES0": qsl[0],
+                "QSL_STRIDES1": qsl[1],
+                "QSL_STRIDES2": qsl[2],
+                "MAP_STRIDES0": mp[0],
+                "MAP_STRIDES1": mp[1],
+                "MAP_STRIDES2": mp[2],
+                "TABLE_COL_STRIDES0": tc[0],
+                "TABLE_COL_STRIDES1": tc[1],
+                "TABLE_COL_STRIDES2": tc[2],
+                "COMPUTED_STRIDES0": cs[0],
+                "COMPUTED_STRIDES1": cs[1],
+                "COMPUTED_STRIDES2": cs[2],
+                "NUM_BLOCKS0": nb[0],
+                "NUM_BLOCKS1": nb[1],
+                "NUM_BLOCKS2": nb[2],
+                "BLOCK_SIZES0": bs[0],
+                "BLOCK_SIZES1": bs[1],
+                "BLOCK_SIZES2": bs[2],
                 "SPEC_QUERY_LEN": self.spec_query_len,
                 "NUM_GROUPS": len(p),
                 "ALIGN_MODE": align,
