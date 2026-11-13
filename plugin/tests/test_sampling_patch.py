@@ -103,7 +103,7 @@ def test_baseline_is_inert_and_shape_budget_is_bounded(sampling, monkeypatch):
         sampling.chunk_rows(0, 1)
 
 
-def test_handwritten_padding_math():
+def test_padding_fraction_helper():
     path = Path(__file__).parents[1] / "gdn_recoverssm_ascend" / "metrics_math.py"
     spec = importlib.util.spec_from_file_location("_test_metrics_math", path)
     module = importlib.util.module_from_spec(spec)

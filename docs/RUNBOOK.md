@@ -2,6 +2,8 @@
 
 本轮补丁以整批请求完成时间为目标。保持服务器已经使用的完整启动命令和环境不变：TP、MTP、async scheduling、prefix caching、align、max-num-seqs、max-num-batched-tokens、max-model-len、图模式及全部 capture sizes 都沿用原值。插件不修改这些参数，也不新增试验开关。
 
+开发改动、原因、接口合同及后续安排见[DS 开发交接](DS_HANDOFF_E2E_20261113.md)。
+
 先更新并安装本仓库的 plugin，然后用原命令启动。不要把本工作区的 v0.23.0 参考源码安装到服务器；适配参考仍是现场 vLLM 0.30 系列 / vllm-ascend 0.30rc1 的 MRV2 接口。
 
 ## 安装与版本记录
@@ -88,12 +90,12 @@ grep -E 'Traceback|OutOfMemory|MISMATCH|MTE accesses|SUSPECT REMOTE|507899|56100
 
 CPU 测试覆盖接口、所有权、分组索引、布局/公式及错误传播。开发环境无 Ascend NPU时，测试通过不能宣传为 NPU 数值、CANN 图稳定性或端到端加速已经通过。上面的自动启动检查和完整原负载用于在部署侧一次性完成实际验证；不要求反复关功能或更换批量二分。
 
-## 想亲手实现一个小函数
+## 日志比例函数已经完整实现
 
-可以手敲 `plugin/gdn_recoverssm_ascend/metrics_math.py` 的 `padding_fraction(actual_tokens, captured_tokens)`。它只有参数校验、零长度处理和一个除法；例如实际100、捕获108，应得到8/108。它只用于日志比例，不选择图、不调整capture sizes、不影响采样或state。
+`plugin/gdn_recoverssm_ascend/metrics_math.py` 的 `padding_fraction(actual_tokens, captured_tokens)` 已含完整参数校验、零长度处理和计算逻辑，没有待填写的函数体。实际100、捕获108时返回8/108。它只用于日志比例，不选择图、不调整capture sizes、不影响采样或state。
 
 ```bash
 .venv/bin/python -m pytest plugin/tests/test_metrics_math.py -q
 ```
 
-手敲后只运行这个CPU测试即可确认该函数；服务器启动命令仍保持原样。
+上述CPU测试用于后续维护回归；用户无需补写代码，服务器启动命令仍保持原样。
