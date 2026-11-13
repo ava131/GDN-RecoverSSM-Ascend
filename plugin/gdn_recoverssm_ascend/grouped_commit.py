@@ -685,7 +685,12 @@ class GroupedCommitBucket:
         p = tuple(e.payload for e in entries)
         rows = int(p[0].state_indices.shape[0])
         if not 0 < rows <= self.capacity:
-            raise ValueError("grouped recovery rows exceed the record capacity")
+            raise ValueError(
+                "grouped recovery rows out of range: "
+                f"rows={rows}, record capacity={self.capacity}, "
+                f"groups={len(p)}, state_indices shapes="
+                f"{[tuple(x.state_indices.shape) for x in p]}"
+            )
         if any(int(x.state_indices.shape[0]) != rows for x in p):
             raise ValueError("grouped recovery row counts differ")
         align = p[0].block_table is not None
@@ -1043,11 +1048,17 @@ def prepare_grouped_commit(builders, block_tables=None, *, num_computed_tokens=N
             dev = bucket.device
             q = context.spec_query_len
             native_state_table = getattr(builder, "spec_state_indices_tensor", None)
-            table = (
-                native_state_table[:1]
-                if native_state_table is not None
-                else torch.empty((1, q), dtype=torch.int32, device=dev)
-            )
+            # The native table may not be materialised yet at startup (notably on
+            # the eager path, where it is only filled once a batch is built), so a
+            # zero-row buffer is not a usable signature source: the preparation
+            # needs exactly one row to compile against.
+            if (
+                native_state_table is not None
+                and getattr(native_state_table, "shape", (0,))[0] >= 1
+            ):
+                table = native_state_table[:1]
+            else:
+                table = torch.empty((1, q), dtype=torch.int32, device=dev)
             align = builder.vllm_config.cache_config.mamba_cache_mode == "align"
             block_size = int(builder.kv_cache_spec.block_size)
             if align:
@@ -1063,14 +1074,36 @@ def prepare_grouped_commit(builders, block_tables=None, *, num_computed_tokens=N
                 bound_table = bound[group_id][:1]
             else:
                 bound_table = None
+            # Every buffer the preparation borrows must actually hold the rows it
+            # is sliced by: on the eager path these native buffers can still be
+            # empty at startup, and a zero-row slice compiles a different (and
+            # unusable) signature.
+            def _at_least(tensor, rows, *, dtype=torch.int32):
+                if tensor is not None and getattr(tensor, "shape", (0,))[0] >= rows:
+                    return tensor[:rows]
+                return torch.empty(
+                    (rows,) if getattr(tensor, "dim", lambda: 1)() == 1 else (rows, q),
+                    dtype=dtype,
+                    device=dev,
+                )
+
+            qsl = _at_least(
+                getattr(builder, "spec_query_start_loc", None), 2,
+                dtype=getattr(
+                    getattr(builder, "spec_query_start_loc", None), "dtype", torch.int32
+                ),
+            )
             payload = SimpleNamespace(
                 state_indices=table[:, 0],
-                query_start_loc=(
-                    builder.spec_query_start_loc[:2]
-                    if getattr(builder, "spec_query_start_loc", None) is not None
-                    else torch.empty(2, dtype=torch.int32, device=dev)
+                query_start_loc=qsl,
+                request_indices=_at_least(
+                    getattr(builder, "spec_sequence_indices", None), 1,
+                    dtype=getattr(
+                        getattr(builder, "spec_sequence_indices", None),
+                        "dtype",
+                        torch.int32,
+                    ),
                 ),
-                request_indices=builder.spec_sequence_indices[:1],
                 block_table=bound_table,
                 num_computed_tokens=(
                     num_computed_tokens[:1]
