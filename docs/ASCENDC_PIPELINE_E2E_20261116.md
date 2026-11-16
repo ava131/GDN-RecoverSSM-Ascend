@@ -1,6 +1,6 @@
 # AscendC 第二轮：降低等待，补齐容量与吞吐建模日志
 
-日期：2026-11-16。开发分支：`op-dev`；改动基线：`9c5ce344d33f94ac0416e2ba1c12ea2ae587a467`。PATCH_ID：`ascendc-op-dev-pipeline-v2`。本文供后续开发者和部署方交接。
+日期：2026-11-16。开发分支：`op-dev`；改动基线：`9c5ce344d33f94ac0416e2ba1c12ea2ae587a467`。PATCH_ID：`ascendc-op-dev-pipeline-v2`。本文供后续开发者和部署方交接。后续已补齐两条native full-graph路线的观测，见[新结果复审](ISSUE4_PERF_REVIEW_20261116.md)。
 
 ## 1. 目标与验收口径
 
@@ -80,7 +80,7 @@ verify增加了11,488 B，仍在192KiB预算内。`common.h`集中定义Host/Dev
 
 每个scope首次以及每128次采样，记录均值/最小/最大：
 
-- `target_fullgraph_host_submit`：原生updatable graph提交范围，包含整张target图的相关主机工作，不是纯GDN verify。
+- `target_fullgraph_host_submit`：原生`run_fullgraph`提交范围，覆盖updatable与legacy两条路线，包含整张target图的相关主机工作，不是纯GDN verify。
 - `target_to_recovery_host`：prepare结束到postprocess入口的主机区间，包含target和sampling等路径，不包含随后drafter。
 - `recovery_host_submit`：原协调器提交恢复工作的主机区间。
 

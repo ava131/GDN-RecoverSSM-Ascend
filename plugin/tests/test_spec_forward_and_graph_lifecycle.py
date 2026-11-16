@@ -224,7 +224,7 @@ class Descriptor:
     cg_mode: str = "FULL"
 
 
-def graph_setup(runtime, *, fail=False, capture_missing=False):
+def graph_setup(runtime, *, fail=False, capture_missing=False, updatable=True):
     graph_module = None
     saved_meta = object()
 
@@ -248,6 +248,11 @@ def graph_setup(runtime, *, fail=False, capture_missing=False):
             return "captured"
 
         def run_fullgraph(self, desc):
+            if not updatable:
+                self.calls += 1
+                if self.fail:
+                    raise RuntimeError("native fullgraph failure after submission")
+                return "native-graph-ok"
             return self._updatable_graph_replay(
                 desc, self.model_runner.model_state.attn_metadata
             )
@@ -300,6 +305,36 @@ def test_failed_graph_is_never_automatically_repeated(runtime):
     with pytest.raises(RuntimeError, match="unusable"):
         manager._updatable_graph_replay(desc, {})
     assert manager.calls == 1
+
+
+@pytest.mark.parametrize("updatable", [False, True])
+def test_both_native_fullgraph_routes_are_observed_exactly_once(runtime, updatable):
+    module, manager, _ = graph_setup(runtime, updatable=updatable)
+    diagnostics = sys.modules[module.__package__ + ".diagnostics"]
+    observed, intervals = [], []
+    diagnostics.observe_graph = lambda *args: observed.append(args)
+    diagnostics.phase_begin = lambda *args, **kwargs: "sample"
+    diagnostics.phase_end = lambda sample, **kwargs: intervals.append((sample, kwargs))
+    desc = next(iter(manager.graphs))
+    result = manager.run_fullgraph(desc)
+    assert result == ("ok" if updatable else "native-graph-ok")
+    assert manager.calls == 1
+    assert len(observed) == 1
+    assert observed[0] == (desc, manager.model_runner.model_state.attn_metadata)
+    assert intervals == [("sample", {"failed": False})]
+
+
+def test_failed_native_graph_is_not_counted_as_a_successful_replay(runtime):
+    module, manager, _ = graph_setup(runtime, updatable=False, fail=True)
+    diagnostics = sys.modules[module.__package__ + ".diagnostics"]
+    observed, intervals = [], []
+    diagnostics.observe_graph = lambda *args: observed.append(args)
+    diagnostics.phase_begin = lambda *args, **kwargs: "sample"
+    diagnostics.phase_end = lambda sample, **kwargs: intervals.append((sample, kwargs))
+    with pytest.raises(RuntimeError, match="native fullgraph failure"):
+        manager.run_fullgraph(next(iter(manager.graphs)))
+    assert not observed
+    assert intervals == [("sample", {"failed": True})]
 
 
 def test_incomplete_capture_cannot_report_server_ready(runtime):

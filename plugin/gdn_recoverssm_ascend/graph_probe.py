@@ -66,6 +66,32 @@ def install() -> None:
     from vllm_ascend.worker.v2 import aclgraph_utils
 
     cls = aclgraph_utils.ModelAclGraphManager
+    original_fullgraph = cls.run_fullgraph
+
+    @functools.wraps(original_fullgraph)
+    def run_fullgraph(self, desc):
+        if not _ENABLED:
+            return original_fullgraph(self, desc)
+        # rc1 dispatches both updatable and legacy full graphs through here.
+        # Observing only _updatable_graph_replay silently misses _graph_relay.
+        state = getattr(getattr(self, "model_runner", None), "model_state", None)
+        metadata = getattr(state, "attn_metadata", None)
+        from . import diagnostics
+
+        sample = diagnostics.phase_begin(
+            "target_fullgraph_host_submit",
+            step=diagnostics.step_for_metadata(metadata),
+        )
+        failed = True
+        try:
+            result = original_fullgraph(self, desc)
+            failed = False
+            diagnostics.observe_graph(desc, metadata)
+            return result
+        finally:
+            diagnostics.phase_end(sample, failed=failed)
+
+    cls.run_fullgraph = run_fullgraph
     original = cls._updatable_graph_replay
 
     @functools.wraps(original)
@@ -79,18 +105,8 @@ def install() -> None:
                 f"{_describe(desc)}; original={_FAILED[key]}"
             )
         _log_replay_attempt(self, desc, attn_metadata)
-        from . import diagnostics
-
-        sample = diagnostics.phase_begin(
-            "target_fullgraph_host_submit",
-            step=diagnostics.step_for_metadata(attn_metadata),
-        )
-        failed = True
         try:
-            result = original(self, desc, attn_metadata)
-            failed = False
-            diagnostics.observe_graph(desc, attn_metadata)
-            return result
+            return original(self, desc, attn_metadata)
         except Exception as exc:
             _FAILED[key] = f"{type(exc).__name__}: {exc}"
             logger.error(
@@ -99,9 +115,6 @@ def install() -> None:
                 _describe(desc),
             )
             raise
-        finally:
-            diagnostics.phase_end(sample, failed=failed)
-
     cls._updatable_graph_replay = _updatable_graph_replay
     original_capture = getattr(cls, "capture", None)
     if original_capture is not None:
