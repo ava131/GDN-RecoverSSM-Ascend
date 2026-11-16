@@ -40,6 +40,18 @@ if(NOT gdn_kernel_header)
   message(FATAL_ERROR "kernel_operator.h is missing from the CANN development toolkit")
 endif()
 
+# PlatformAscendCManager is provided by the AscendC tiling API, not by
+# libplatform alone. Resolve both direct dependencies from the same SDK as the
+# headers/compiler instead of accepting an unrelated system library.
+find_library(gdn_tiling_api NAMES tiling_api
+  PATHS "${GDN_CANN_ROOT}/lib64" "${cann_arch}/lib64"
+  NO_DEFAULT_PATH REQUIRED)
+find_library(gdn_platform NAMES platform
+  PATHS "${GDN_CANN_ROOT}/lib64" "${cann_arch}/lib64"
+  NO_DEFAULT_PATH REQUIRED)
+message(STATUS "GDN AscendC tiling API: ${gdn_tiling_api}")
+message(STATUS "GDN AscendC platform: ${gdn_platform}")
+
 add_library(gdn_recoverssm_ac SHARED ops.cpp)
 # BiSheng's AscendC mixed host/device mode, as used by CANN 9.1 fast launch.
 # Do not replace with CUDA flags or enable fast-math: state arithmetic matters.
@@ -52,7 +64,10 @@ target_include_directories(gdn_recoverssm_ac PRIVATE
 target_link_directories(gdn_recoverssm_ac PRIVATE
   "${GDN_TORCH_NPU_ROOT}/lib" "${GDN_CANN_ROOT}/lib64" "${cann_arch}/lib64")
 target_link_libraries(gdn_recoverssm_ac PRIVATE
-  ${TORCH_LIBRARIES} torch_npu ascendcl runtime platform)
+  ${TORCH_LIBRARIES} torch_npu ascendcl runtime ${gdn_tiling_api} ${gdn_platform})
+# Fail here for missing direct symbols instead of publishing an unloadable .so.
+# Do not require closure of indirect DSOs: torch_npu can use interpreter symbols.
+target_link_options(gdn_recoverssm_ac PRIVATE "-Wl,--no-undefined")
 set_target_properties(gdn_recoverssm_ac PROPERTIES
   PREFIX "lib" SUFFIX ".so" OUTPUT_NAME "gdn_recoverssm_ac"
   LIBRARY_OUTPUT_DIRECTORY "${GDN_OUTPUT_DIR}"

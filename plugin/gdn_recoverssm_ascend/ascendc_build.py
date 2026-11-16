@@ -357,7 +357,20 @@ def ensure_loaded() -> BuildArtifact:
         except Exception as exc:
             raise AscendCBuildError(
                 f"AscendC registration failed for {artifact.library_path}; "
-                f"compiler log: {artifact.log_path}; {exc}"
+                f"compiler log: {artifact.log_path}; "
+                f"GDN_ASCENDC_LOAD_FAILURE: {_loader_details(exc)}"
             ) from exc
         _LOADED = artifact
         return artifact
+
+
+def _loader_details(error: BaseException) -> str:
+    """Keep dlopen's missing symbol when Torch wraps it in a generic OSError."""
+    details, seen = [], set()
+    while error is not None and id(error) not in seen and len(details) < 8:
+        seen.add(id(error))
+        details.append(f"{type(error).__name__}: {str(error)[:3000]}")
+        error = error.__cause__ or (
+            None if error.__suppress_context__ else error.__context__
+        )
+    return " <- ".join(details)

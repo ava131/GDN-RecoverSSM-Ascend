@@ -330,9 +330,22 @@ def test_load_once_and_registration_failure_never_marks_loaded(
     build._LOADED = None
 
     def fail(_):
-        raise RuntimeError("undefined symbol")
+        try:
+            raise OSError(
+                "undefined symbol: _ZN16platform_ascendc22PlatformAscendCManager15platformInitMtxE"
+            )
+        except OSError as exc:
+            raise OSError("Could not load this library: kernel.so") from exc
 
     fake_torch.ops.load_library = fail
-    with pytest.raises(build.AscendCBuildError, match="registration failed"):
+    with pytest.raises(build.AscendCBuildError, match="registration failed") as caught:
         build.ensure_loaded()
+    assert "GDN_ASCENDC_LOAD_FAILURE" in str(caught.value)
+    assert "PlatformAscendCManager15platformInitMtxE" in str(caught.value)
     assert build._LOADED is None
+
+
+def test_loader_diagnostics_are_bounded_and_cycle_safe(build):
+    error = RuntimeError("x" * 10000)
+    error.__cause__ = error
+    assert len(build._loader_details(error)) < 3100
