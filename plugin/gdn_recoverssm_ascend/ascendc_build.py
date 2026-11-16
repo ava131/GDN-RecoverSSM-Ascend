@@ -13,14 +13,16 @@ import importlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-_RECIPE_VERSION = 1
+_RECIPE_VERSION = 2
 _ARCH = "dav-2201"
 _LIBRARY = "libgdn_recoverssm_ac.so"
 _LOADED = None
@@ -188,13 +190,66 @@ def _run(command: list[str], log) -> None:
     subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT)
 
 
+def _compiler_summary(path: Path) -> str:
+    """Keep the first diagnostic and the tail in the worker traceback.
+
+    The complete log stays on disk. Streaming bounds memory even when a
+    compiler emits a long template backtrace; reporting must never hide the
+    original failure if the log is missing or cannot be decoded.
+    """
+    head, context, following = [], [], []
+    diagnostic = None
+    previous, tail = deque(maxlen=5), deque(maxlen=24)
+    after = 0
+    error = re.compile(
+        r"fatal error|\berror\s*[:#]|CMake Error|undefined reference|"
+        r"undefined symbol|cannot find -l|no such file|killed signal|"
+        r"linker command failed",
+        re.IGNORECASE,
+    )
+    try:
+        with path.open(encoding="utf-8", errors="replace") as log:
+            for number, raw in enumerate(log, 1):
+                line = re.sub(r"\x1b\[[0-9;]*m", "", raw.rstrip())[:2000]
+                entry = f"{number}: {line}"
+                if len(head) < 8:
+                    head.append(entry)
+                if diagnostic is None and error.search(line):
+                    diagnostic = entry
+                    context = list(previous)
+                    after = 12
+                elif after:
+                    following.append(entry)
+                    after -= 1
+                previous.append(entry)
+                tail.append(entry)
+    except OSError as exc:
+        return f"compiler log unavailable: {exc}"
+    sections = []
+    if diagnostic is not None:
+        # The actual error goes first. Long include/template context must never
+        # consume the excerpt budget and push the root diagnostic out of view.
+        sections.append("FIRST DIAGNOSTIC\n" + diagnostic)
+        if context:
+            sections.append("PRECEDING CONTEXT\n" + "\n".join(context)[-1500:])
+        if following:
+            sections.append("FOLLOWING CONTEXT\n" + "\n".join(following)[:3500])
+    else:
+        sections.append(
+            "LOG START (no recognized diagnostic)\n" + "\n".join(head)[:3000]
+        )
+    sections.append("LOG TAIL\n" + "\n".join(tail)[-5000:])
+    return "\n".join(sections)
+
+
 def _build(
     source: Path, directory: Path, fingerprint: str, toolchain: Toolchain
 ) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     log_path = directory / "build.log"
+    stage = "configure"
     try:
-        with log_path.open("w") as log:
+        with log_path.open("w", encoding="utf-8") as log:
             _run(
                 [
                     toolchain.cmake,
@@ -213,16 +268,19 @@ def _build(
             )
             # Serial compilation bounds memory when every TP worker starts at
             # once. Only one process per cache fingerprint reaches this command.
+            stage = "compile/link"
             _run(
                 [
                     toolchain.cmake,
                     "--build",
                     str(directory / "build"),
+                    "--verbose",
                     "--parallel",
                     "1",
                 ],
                 log,
             )
+        stage = "artifact"
         library = directory / _LIBRARY
         if not library.is_file() or library.stat().st_size == 0:
             raise AscendCBuildError("CMake did not produce a nonempty AscendC library")
@@ -242,7 +300,9 @@ def _build(
         )
     except (OSError, subprocess.SubprocessError, AscendCBuildError) as exc:
         raise AscendCBuildError(
-            f"AscendC build failed before worker READY; full compiler log: {log_path}; {exc}"
+            f"AscendC build failed before worker READY; stage={stage}; "
+            f"full compiler log: {log_path}; {exc}\n"
+            f"GDN_ASCENDC_BUILD_FAILURE\n{_compiler_summary(log_path)}"
         ) from exc
 
 

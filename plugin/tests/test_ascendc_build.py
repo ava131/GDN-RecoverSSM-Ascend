@@ -77,6 +77,69 @@ def test_import_does_not_load_device_packages(build, monkeypatch):
     assert build.BuildArtifact is not None
 
 
+def test_first_compiler_error_reaches_worker_even_with_long_template_trace(
+    build, tmp_path
+):
+    path = tmp_path / "build.log"
+    lines = [f"include context {i} " + "x" * 3000 for i in range(20)]
+    lines += ["ops.cpp:56:9: error: reinterpret_cast from void* to GM is not allowed"]
+    lines += [f"template instantiation {i}" for i in range(300)]
+    lines += ["gmake: *** all Error 2"]
+    path.write_text("\n".join(lines))
+    summary = build._compiler_summary(path)
+    assert "FIRST DIAGNOSTIC\n21: ops.cpp:56:9: error:" in summary
+    assert "reinterpret_cast from void* to GM is not allowed" in summary
+    assert "gmake: *** all Error 2" in summary
+    assert len(summary) < 15000
+
+
+def test_compile_stage_and_first_error_are_in_exception(
+    build, source, toolchain, tmp_path, monkeypatch
+):
+    def run(command, **kwargs):
+        if "--build" in command:
+            kwargs["stdout"].write("ops.cpp:47: error: bad address-space conversion\n")
+            raise subprocess.CalledProcessError(2, command)
+        kwargs["stdout"].write("Configuring done\n")
+
+    monkeypatch.setattr(build.subprocess, "run", run)
+    with pytest.raises(build.AscendCBuildError) as caught:
+        build._build(source, tmp_path / "failed", "key", toolchain)
+    message = str(caught.value)
+    assert "stage=compile/link" in message
+    assert "GDN_ASCENDC_BUILD_FAILURE" in message
+    assert "ops.cpp:47: error: bad address-space conversion" in message
+    assert "--verbose" in message
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",
+        "note: no recognized error\n",
+        "\x1b[31merror: broken\x1b[0m\n",
+        b"error: bad byte \xff\n",
+    ],
+)
+def test_diagnostic_summary_handles_empty_ansi_and_invalid_encoding(
+    build, tmp_path, content
+):
+    path = tmp_path / "build.log"
+    if isinstance(content, bytes):
+        path.write_bytes(content)
+    else:
+        path.write_text(content)
+    summary = build._compiler_summary(path)
+    assert "LOG TAIL" in summary
+    assert "\x1b" not in summary
+
+
+def test_diagnostic_reporting_cannot_mask_missing_log(build, tmp_path):
+    assert "compiler log unavailable" in build._compiler_summary(
+        tmp_path / "missing.log"
+    )
+
+
 def test_fingerprint_tracks_source_and_toolchain(build, source, toolchain):
     first = build._fingerprint(source, toolchain)
     assert first == build._fingerprint(source, toolchain)

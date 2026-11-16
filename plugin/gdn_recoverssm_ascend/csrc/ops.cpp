@@ -44,7 +44,10 @@ uint32_t Blocks(int64_t work) {
     TORCH_CHECK(cores > 0 && work > 0, "GDN AscendC invalid work/core count");
     return static_cast<uint32_t>(std::min(cores, work));
 }
-#define PTR(tensor) reinterpret_cast<GM_ADDR>((tensor).data_ptr())
+// BiSheng GM_ADDR carries the __gm__ address-space qualifier. C++
+// reinterpret_cast cannot cross from Tensor's generic void* to that space;
+// the explicit AscendC kernel-launch cast preserves the device address.
+#define PTR(tensor) ((GM_ADDR)((tensor).data_ptr()))
 
 template<class A, class S, class B>
 void LaunchVerify(uint32_t blocks, aclrtStream stream,

@@ -64,6 +64,8 @@ Torch schema声明verify的checkpoint只读、四个输出可修改。fold通过
 
 ## 5. 构建与缓存
 
+2026-11-16已修复首次构建的Host指针地址空间转换错误，详见[现场根因与更新说明](ASCENDC_BUILD_FIX_20261116.md)。构建失败的server traceback现在自动附带 `GDN_ASCENDC_BUILD_FAILURE`、首个诊断及日志尾部；不再只有CMake退出码。
+
 服务器原环境需要已有CANN开发工具链（BiSheng、AscendC headers）、CMake、Torch和Torch-NPU。保持既有环境设置，不新增构建开关。
 
 启动自动：
