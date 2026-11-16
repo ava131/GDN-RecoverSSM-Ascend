@@ -28,7 +28,8 @@ class FoldEngine {
     // Brcb expands each scalar into a 32-byte block, one block per state row.
     static constexpr uint32_t kBroadcastBytes = kDim * 32;
     static constexpr uint32_t kUbBytes = kBroadcastOffset + kBroadcastBytes;
-    static_assert(kUbBytes + 2048 <= 192 * 1024, "fold UB exceeds the A2 limit");
+    static_assert(kUbBytes == kFoldUbBytes, "fold host/device UB budget mismatch");
+    static_assert(kUbBytes + kUbGuardBytes <= 192 * 1024, "fold UB exceeds the A2 limit");
 
 public:
     __aicore__ inline FoldEngine(const FoldTiling &td) : td_(td) {}
@@ -107,7 +108,6 @@ private:
 
     __aicore__ inline void LoadState(int64_t slot, int64_t head, int64_t blockStride)
     {
-        InputFree();
         AscendC::DataCopyExtParams params{
             kDim, static_cast<uint32_t>(kDim * sizeof(State)),
             static_cast<uint32_t>((td_.state_v_stride - kDim) * sizeof(State)), 0, 0};
@@ -120,7 +120,10 @@ private:
             AscendC::DataCopyPad(ub_.template GetWithOffset<State>(kElements, kIoOffset),
                                 state_[offset], params, pad);
         }
-        AwaitInput();
+    }
+
+    __aicore__ inline void ConvertState()
+    {
         if constexpr (!std::is_same<State, float>::value) {
             AscendC::Cast(ub_.template GetWithOffset<float>(kElements, 0),
                           ub_.template GetWithOffset<State>(kElements, kIoOffset),
@@ -133,7 +136,6 @@ private:
         int64_t row, int64_t head, int32_t accepted,
         int64_t corrBlockStride, int64_t keyBlockStride)
     {
-        InputFree();
         const int64_t corrOffset = row * corrBlockStride + head * td_.corr_head_stride;
         const int64_t keyHead = head / (td_.heads / td_.key_heads);
         const int64_t keyOffset = row * keyBlockStride + keyHead * td_.key_head_stride;
@@ -154,7 +156,10 @@ private:
             AscendC::DataCopyPad(ub_.template GetWithOffset<Key>(kWindow * kDim, kRawKeysOffset),
                                 keys_[keyOffset], keyParams, keyPad);
         }
-        AwaitInput();
+    }
+
+    __aicore__ inline void ConvertKeys(int32_t accepted)
+    {
         if constexpr (!std::is_same<Key, float>::value) {
             AscendC::Cast(ub_.template GetWithOffset<float>(kWindow * kDim, kKeysOffset),
                           ub_.template GetWithOffset<Key>(kWindow * kDim, kRawKeysOffset),
@@ -205,8 +210,16 @@ private:
         const int32_t boundaryLength = boundaryLengths_.GetValue(plan);
         const bool saveBoundary = boundary > td_.null_block && boundary < td_.blocks &&
                                   boundary != final && boundaryLength > 0 && boundaryLength <= accepted;
+        InputFree();
+        // State, correction and key raw buffers are disjoint. Publish one
+        // MTE2->Vector dependency for the whole task instead of waiting once
+        // after state and again after records. Snapshot output waits remain
+        // unchanged because source/final/boundary pages are allowed to alias.
         LoadState(source, head, stateBlockStride);
         LoadRecords(row, head, accepted, corrBlockStride, keyBlockStride);
+        AwaitInput();
+        ConvertState();
+        ConvertKeys(accepted);
         auto state = ub_.template GetWithOffset<float>(kElements, 0);
         auto broadcast = ub_.template GetWithOffset<float>(kDim * 8, kBroadcastOffset);
         for (int32_t token = 0; token < accepted; ++token) {

@@ -79,10 +79,16 @@ def install() -> None:
                 f"{_describe(desc)}; original={_FAILED[key]}"
             )
         _log_replay_attempt(self, desc, attn_metadata)
+        from . import diagnostics
+
+        sample = diagnostics.phase_begin(
+            "target_fullgraph_host_submit",
+            step=diagnostics.step_for_metadata(attn_metadata),
+        )
+        failed = True
         try:
             result = original(self, desc, attn_metadata)
-            from . import diagnostics
-
+            failed = False
             diagnostics.observe_graph(desc, attn_metadata)
             return result
         except Exception as exc:
@@ -93,6 +99,8 @@ def install() -> None:
                 _describe(desc),
             )
             raise
+        finally:
+            diagnostics.phase_end(sample, failed=failed)
 
     cls._updatable_graph_replay = _updatable_graph_replay
     original_capture = getattr(cls, "capture", None)

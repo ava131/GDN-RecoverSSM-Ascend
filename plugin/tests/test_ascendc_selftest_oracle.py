@@ -125,3 +125,42 @@ def test_numerical_guard_rejects_real_errors_and_nonfinite_values():
         )
     with pytest.raises(ValueError, match="BF16/FP32"):
         oracle.make_case(4, torch.float16, torch.float32, torch.float32)
+
+
+def test_reuse_stress_covers_partial_windows_and_interleaved_null_rows():
+    case = oracle.make_case(
+        4,
+        torch.bfloat16,
+        torch.float32,
+        torch.float32,
+        key_heads=4,
+        repeats=4,
+        partial=True,
+    )
+    assert case["rows"] * case["value_heads"] == 336
+    assert case["heads"] == 4 and case["value_heads"] == 12
+    assert len(case["valid_rows"]) == 20
+    assert len(case["invalid_rows"]) == 8
+    lengths = case["qsl"][1:] - case["qsl"][:-1]
+    assert set(lengths[list(case["valid_rows"])].tolist()) == {1, 2, 3, 4}
+    assert set(lengths[list(case["invalid_rows"])].tolist()) == {0, 4}
+    assert any(r < max(case["valid_rows"]) for r in case["invalid_rows"])
+    assert all(case["indices"][r] == 0 for r in case["invalid_rows"])
+    for row in case["valid_rows"]:
+        source, final, boundary, _ = oracle.fold_targets(row, case["rows"], 3)
+        assert 0 < min(source, final, boundary)
+        assert max(source, final, boundary) < case["state"].shape[0]
+
+
+def test_startup_plan_includes_boundary_overwriting_source_before_final():
+    source, final, boundary, length = oracle.fold_targets(3, 7, 3)
+    assert boundary == source and final != source
+    assert 0 < length < 3
+    # A boundary write at token1 must not replace the recurrence's live token3
+    # state. A separate final page checks precisely that continued update.
+    initial = torch.ones(3, 2, 2)
+    keys = torch.ones(1, 3, 2)
+    corr = torch.ones(3, 3, 2)
+    decays = torch.full((3, 3), 0.5)
+    states = oracle.fold_reference(initial, keys, corr, decays, 3)
+    assert not torch.equal(states[length], states[-1])

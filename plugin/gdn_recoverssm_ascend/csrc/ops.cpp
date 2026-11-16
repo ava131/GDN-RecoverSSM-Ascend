@@ -38,7 +38,8 @@ uint32_t Blocks(int64_t work) {
         TORCH_CHECK(platform != nullptr, "GDN AscendC platform unavailable");
         uint64_t ubBytes=0;
         platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB,ubBytes);
-        TORCH_CHECK(ubBytes>=156800+2048, "GDN AscendC device UB is too small");
+        TORCH_CHECK(ubBytes>=kRequiredUbBytes, "GDN AscendC device UB is too small: required ",
+                    kRequiredUbBytes, " bytes, available ", ubBytes);
         return static_cast<int64_t>(platform->GetCoreNumAiv());
     }();
     TORCH_CHECK(cores > 0 && work > 0, "GDN AscendC invalid work/core count");

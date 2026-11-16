@@ -62,5 +62,10 @@ struct FoldTiling {
 };
 #undef GDN_INT_FIELD
 constexpr int64_t kAbiVersion = 1;
+// Host launch validation and device layouts must agree after pipeline changes.
+constexpr uint32_t kVerifyUbBytes = 168288;
+constexpr uint32_t kFoldUbBytes = 112640;
+constexpr uint32_t kUbGuardBytes = 2048;
+constexpr uint32_t kRequiredUbBytes = kVerifyUbBytes + kUbGuardBytes;
 } // namespace gdn_ac
 

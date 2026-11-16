@@ -1,10 +1,10 @@
 # AscendC 算子开发分支：op-dev
 
-基线：main `406b7b014fb5bd0273d4ac2adfbc073221ad796f`。本分支插件版本为 `0.3.0.dev0`，PATCH_ID 为 `ascendc-op-dev-v1`。main 与稳定快照不改动。
+基线：main `406b7b014fb5bd0273d4ac2adfbc073221ad796f`。本分支插件版本为 `0.3.0.dev0`，PATCH_ID 为 `ascendc-op-dev-pipeline-v2`。main 与稳定快照不改动。最新改动、日志与验收口径见[第二轮流水优化交接](ASCENDC_PIPELINE_E2E_20261116.md)。
 
 ## 当前交付与证据边界
 
-已经实现 AscendC verify 与 grouped fold、Torch-NPU 注册、启动构建缓存、真实 LaunchSpec 分派和强制数值自检。这是可供部署验证的开发实现；开发机没有 CANN/NPU，尚未证明 BiSheng 编译通过、NPU 数值通过、FULL graph 稳定或端到端提速。不要将本分支直接称为已验证稳定版。
+已经实现 AscendC verify 与 grouped fold、Torch-NPU 注册、启动构建缓存、真实 LaunchSpec 分派和强制数值自检。用户已报告前版成功运行并给出747.65秒的端到端结果；当前第二轮改动尚无新的设备结果，开发机也没有CANN/NPU，不将其称为已验证稳定版。
 
 plan、conv compaction、align publisher 继续使用现有 Triton，实现与物理页规则不变。原生 vLLM、vllm-ascend、FLA 源码未编辑。没有新增用户开关、改变原启动参数、限制 batch 或调整 capture sizes。
 
@@ -55,11 +55,11 @@ Torch schema声明verify的checkpoint只读、四个输出可修改。fold通过
 
 ## 4. 设备资源与同步
 
-- verify固定UB布局156800字节，另留2048字节检查余量。
+- verify固定UB布局168288字节，另留2048字节检查余量，Host/Device预算一致性由共享常量及static_assert保护。
 - fold固定UB布局112640字节，另留2048字节检查余量。
 - 使用向量乘、归约、广播及乘加；不是标量矩阵循环。
 - 明确保护MTE2→Vector、Scalar↔Vector、Vector→MTE3及缓冲复用。
-- 首版verify每token等待本核的输出搬运完成；这是设备内依赖，不是Host同步。后续可研究双输出bank重叠，但本轮不提前认领流水收益。
+- verify为各token保留独立输出源槽，窗口结束统一等待输出完成；输入也统一加载后等待。fold合并输入等待，boundary/final输出保护保留。尚不认领设备加速倍数。
 - 跨编译器不承诺位级相同，使用CPU FP64数值参考及现有严格/低精度容差检查；MulAddDst名称本身不是FMA舍入等价的证明。
 
 ## 5. 构建与缓存
@@ -104,7 +104,7 @@ grep -E 'Traceback|AscendCBuildError|MISMATCH|SELFTEST FAIL|MTE accesses|507899|
 证据顺序：
 
 - `GDN_ASCENDC loaded`：库已加载，记录fingerprint、位置和cache_hit；不是数值PASS。
-- AC专项自检：固定36次小型设备调用，覆盖BF16/FP32全部编译实例、Q1/4/8、GQA3、accept0..Q、null/padding、两层两组地址路由及source/boundary/final alias。
+- AC专项自检：20组、40次verify/fold设备调用，覆盖BF16/FP32全部编译实例、Q1/4/8、GQA3、accept0..Q、null/padding、两层两组地址路由及source/boundary/final alias；新增336任务的部分窗口和交错空行复用压力检查。
 - 原有完整窗口verify/state、conv和grouped检查继续执行。
 - `GDN_ASCENDC_SELFTEST PASS`：AC核实际启动过，实际模型签名也已prepare；不是端到端加速证明。
 - 四个worker最终 `GDN_READY ... STARTUP_COMPLETE`：全部保护及原生warmup/capture完成。

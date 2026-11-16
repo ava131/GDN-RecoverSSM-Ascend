@@ -180,8 +180,8 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         self._ctx_unbound_logged = False
         self._capturing = False
         # A full-graph replay re-uses the addresses captured at capture time, so
-        # the accepted-token input must live in one **persistent** buffer that is
-        # rewritten in place. Allocating a clone per step (the previous
+        # this neutral convolution input lives in one persistent, read-only
+        # buffer initialized once. Allocating a clone per step (the previous
         # behaviour) hands the graph a fresh address every step while the
         # captured kernel keeps reading the old one; the old storage can even be
         # freed and reused. Neutral value is 1: the checkpoint already holds the
@@ -356,7 +356,7 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         # conv update must start from the compacted window: one accepted token.
         # Allocate from the actual tensor shape: the spec index table can be
         # sized by the graph batch, which may exceed max_num_seqs.
-        # Stable address + in-place neutral value (see __init__). Every row gets 1:
+        # Stable address + immutable neutral value (see __init__). Every row is 1:
         # real spec rows because the checkpoint is compacted, padding rows because
         # the framework's dummy value is 1 as well.
         #
@@ -373,8 +373,12 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
                 "sized before graph capture; recapture with a larger "
                 "decode_cudagraph_max_bs instead of growing it here"
             )
+        # The pinned Ascend rc1 builder pads its OWN num_accepted_tokens buffer
+        # inside super().build, before this replacement. FLA's convolution only
+        # reads the replacement (ReadNumAcceptedTokens); neither it nor recovery
+        # writes it. Re-filling here would submit one redundant device kernel
+        # per GDN group per step, even when the target runs as a full graph.
         num_accepted = self._accepted_buffer[:need]
-        num_accepted.fill_(1)
 
         # The layer's convolution reads the **nested** descriptor, which the base
         # builder created before we rewrote the top-level tensor. Rebinding both
@@ -477,7 +481,7 @@ class AscendGDNRecoverSSMHostMetadataBuilder(AscendGDNRecoverSSMMetadataBuilder)
 __all__ = [
     "AscendGDNRecoverSSMBackend",
     "AscendGDNRecoverSSMCommitMetadata",
+    "AscendGDNRecoverSSMHostMetadataBuilder",
     "AscendGDNRecoverSSMMetadata",
     "AscendGDNRecoverSSMMetadataBuilder",
-    "AscendGDNRecoverSSMHostMetadataBuilder",
 ]

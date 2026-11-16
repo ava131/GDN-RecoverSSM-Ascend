@@ -71,7 +71,16 @@ def _values(shape, *, offset=0, amplitude=0.1):
     return ((values - 18) * (amplitude / 18)).reshape(shape)
 
 
-def make_case(query_len, activation_dtype, state_dtype, beta_dtype):
+def make_case(
+    query_len,
+    activation_dtype,
+    state_dtype,
+    beta_dtype,
+    *,
+    key_heads=1,
+    repeats=1,
+    partial=False,
+):
     """Build CPU inputs covering every prefix, null and zero-length padding."""
     if query_len not in (1, 4, 8):
         raise ValueError("probe query length must be 1, 4, or 8")
@@ -82,10 +91,25 @@ def make_case(query_len, activation_dtype, state_dtype, beta_dtype):
         raise ValueError("AscendC probes cover BF16/FP32 only")
     if beta_dtype not in (activation_dtype, torch.float32):
         raise ValueError("beta must match activation or be FP32")
-    real_rows = query_len + 1
-    rows = real_rows + 2
-    tokens = (real_rows + 1) * query_len
-    heads, value_heads, dim = 1, 3, 128
+    if key_heads < 1 or repeats < 1:
+        raise ValueError("probe key_heads and repeats must be positive")
+    rows_per_repeat = query_len + 3
+    rows = repeats * rows_per_repeat
+    valid_rows = tuple(r for r in range(rows) if r % rows_per_repeat <= query_len)
+    invalid_rows = tuple(r for r in range(rows) if r not in valid_rows)
+    real_rows = len(valid_rows)
+    lengths = []
+    for row in range(rows):
+        position = row % rows_per_repeat
+        if position == rows_per_repeat - 1:
+            length = 0
+        elif partial and position < query_len:
+            length = position + 1
+        else:
+            length = query_len
+        lengths.append(length)
+    tokens = sum(lengths)
+    heads, value_heads, dim = key_heads, 3 * key_heads, 128
     q = _values((1, tokens, heads, dim), offset=1)
     k = _values((1, tokens, heads, dim), offset=9)
     q = (q / q.square().sum(-1, keepdim=True).sqrt()).to(activation_dtype)
@@ -95,29 +119,34 @@ def make_case(query_len, activation_dtype, state_dtype, beta_dtype):
     beta = (0.3 + _values((tokens, value_heads), offset=7, amplitude=0.04)).to(
         beta_dtype
     )
-    qsl = torch.arange(rows + 1, dtype=torch.int32) * query_len
-    qsl[-1] = qsl[-2]  # Padding has no token segment.
+    qsl = torch.tensor([0] + lengths, dtype=torch.int32).cumsum(0).to(torch.int32)
     indices = torch.arange(1, rows + 1, dtype=torch.int32)
-    indices[-2:] = 0
-    blocks = 3 * real_rows + 1
+    indices[list(invalid_rows)] = 0
+    blocks = 3 * rows + 1
     state = _values((blocks, value_heads, dim, dim), offset=5, amplitude=0.01).to(
         state_dtype
     )
-    return dict(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        qsl=qsl,
-        indices=indices,
-        state=state,
-        rows=rows,
-        real_rows=real_rows,
-        tokens=tokens,
-        query_len=query_len,
-        scale=dim**-0.5,
-    )
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": g,
+        "beta": beta,
+        "qsl": qsl,
+        "indices": indices,
+        "state": state,
+        "rows": rows,
+        "real_rows": real_rows,
+        "valid_rows": valid_rows,
+        "invalid_rows": invalid_rows,
+        "rows_per_repeat": rows_per_repeat,
+        "repeats": repeats,
+        "heads": heads,
+        "value_heads": value_heads,
+        "tokens": tokens,
+        "query_len": query_len,
+        "scale": dim**-0.5,
+    }
 
 
 def sequential_reference(checkpoint, q, k, v, g, beta, scale):
@@ -238,6 +267,18 @@ def _assert_close(got, expected, *, label, dtype):
         )
 
 
+def fold_targets(row, rows, accepted):
+    """Disjoint pages plus each supported alias, including source overwrite."""
+    source = row + 1
+    alias = row % 4
+    final = source if alias == 0 else rows + source
+    boundary = (
+        source if alias in (0, 3) else (final if alias == 1 else 2 * rows + source)
+    )
+    boundary_length = accepted if alias == 1 else max(1, accepted // 2)
+    return source, final, boundary, boundary_length
+
+
 def _probe(case, device):
     from .ascendc_backend import AscendCSpec
 
@@ -247,11 +288,14 @@ def _probe(case, device):
         for name in ("q", "k", "v", "g", "beta", "state", "qsl", "indices")
     )
     rows, query_len = case["rows"], case["query_len"]
+    heads, value_heads = case["heads"], case["value_heads"]
     corr = torch.full(
-        (rows, 3, query_len, 128), -17.0, dtype=torch.float32, device=device
+        (rows, value_heads, query_len, 128), -17.0, dtype=torch.float32, device=device
     )
-    key = torch.full((rows, 1, query_len, 128), -16.0, dtype=k.dtype, device=device)
-    decay = torch.full((rows, 3, query_len), -19.0, dtype=torch.float32, device=device)
+    key = torch.full((rows, heads, query_len, 128), -16.0, dtype=k.dtype, device=device)
+    decay = torch.full(
+        (rows, value_heads, query_len), -19.0, dtype=torch.float32, device=device
+    )
     out = torch.full_like(v, -23.0)
     tensors = (q, k, v, g, beta, state, corr, key, decay, out, qsl, indices)
     AscendCSpec("verify", tensors, verify_config(case, tensors), case["scale"]).launch()
@@ -262,8 +306,8 @@ def _probe(case, device):
         raise RuntimeError(
             "GDN_ASCENDC_SELFTEST verify changed the resident checkpoint"
         )
-    for row in range(case["real_rows"]):
-        start, end = row * query_len, (row + 1) * query_len
+    for row in case["valid_rows"]:
+        start, end = map(int, cpu["qsl"][row : row + 2])
         outputs, _, corrections, decays = sequential_reference(
             cpu["state"][row + 1],
             cpu["q"][0, start:end],
@@ -279,29 +323,46 @@ def _probe(case, device):
         # Verify records are consumed by a separate operator: check their actual
         # values, not just the combined verify/fold final state.
         _assert_close(
-            corr_cpu[row].transpose(0, 1),
+            corr_cpu[row, :, : end - start].transpose(0, 1),
             corrections,
             label="correction",
             dtype=torch.float32,
         )
         _assert_close(
-            decay_cpu[row].transpose(0, 1), decays, label="decay", dtype=torch.float32
+            decay_cpu[row, :, : end - start].transpose(0, 1),
+            decays,
+            label="decay",
+            dtype=torch.float32,
         )
-        if not torch.equal(key_cpu[row, 0], cpu["k"][0, start:end, 0]):
+        if not torch.equal(
+            key_cpu[row, :, : end - start], cpu["k"][0, start:end].transpose(0, 1)
+        ):
             raise RuntimeError(
                 "GDN_ASCENDC_SELFTEST key record did not preserve input bits"
             )
-    null_start = case["real_rows"] * query_len
-    if not torch.equal(
-        out_cpu[:, null_start:], torch.zeros_like(out_cpu[:, null_start:])
-    ):
-        raise RuntimeError("GDN_ASCENDC_SELFTEST null output was not zero")
+        for name, values, sentinel in (
+            ("correction", corr_cpu, -17),
+            ("key", key_cpu, -16),
+            ("decay", decay_cpu, -19),
+        ):
+            unused = values[row, :, end - start :]
+            if not torch.equal(unused, torch.full_like(unused, sentinel)):
+                raise RuntimeError(
+                    f"GDN_ASCENDC_SELFTEST partial row wrote unused {name}"
+                )
+    for row in case["invalid_rows"]:
+        start, end = map(int, cpu["qsl"][row : row + 2])
+        if not torch.equal(
+            out_cpu[:, start:end], torch.zeros_like(out_cpu[:, start:end])
+        ):
+            raise RuntimeError("GDN_ASCENDC_SELFTEST null output was not zero")
     for name, values, sentinel in (
         ("correction", corr_cpu, -17),
         ("key", key_cpu, -16),
         ("decay", decay_cpu, -19),
     ):
-        if not torch.equal(values[-2:], torch.full_like(values[-2:], sentinel)):
+        invalid = values[list(case["invalid_rows"])]
+        if not torch.equal(invalid, torch.full_like(invalid, sentinel)):
             raise RuntimeError(f"GDN_ASCENDC_SELFTEST invalid rows wrote {name}")
 
     # Two independent layer owners and two distinct plan groups. Layer 1 uses
@@ -322,16 +383,11 @@ def _probe(case, device):
     expected = [x.clone() for x in states_cpu]
     changed = [set(), set()]
     for layer in range(2):
-        for row in range(case["real_rows"]):
-            source = row + 1
-            accepted = row if layer == 0 else query_len - row
-            final = source if row % 3 == 0 else case["real_rows"] + source
-            boundary = (
-                source
-                if row % 3 == 0
-                else (final if row % 3 == 1 else 2 * case["real_rows"] + source)
-            )
-            boundary_length = accepted if row % 3 == 1 else max(1, accepted // 2)
+        for row in case["valid_rows"]:
+            prefix = row % case["rows_per_repeat"]
+            available = int(cpu["qsl"][row + 1] - cpu["qsl"][row])
+            accepted = min(prefix if layer == 0 else query_len - prefix, available)
+            source, final, boundary, boundary_length = fold_targets(row, rows, accepted)
             for name, value in (
                 ("source", source),
                 ("length", accepted),
@@ -412,10 +468,31 @@ def run(device):
                 for beta in dict.fromkeys((activation, torch.float32)):
                     _probe(make_case(query_len, activation, state, beta), device)
                     calls += 1
+    # More than one grid-stride wave on the supported A2 devices, with null
+    # rows interleaved between valid groups. Exercise both packed-output and
+    # FP32-output bank reuse, using the deployed GQA head geometry (4/12).
+    for activation, state in (
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.bfloat16),
+    ):
+        _probe(
+            make_case(
+                4,
+                activation,
+                state,
+                torch.float32,
+                key_heads=4,
+                repeats=4,
+                partial=True,
+            ),
+            device,
+        )
+        calls += 1
     init_logger("vllm.gdn_recoverssm_ascend.ascendc").info(
         "GDN_ASCENDC_SELFTEST PASS cases=%d verify_calls=%d fold_calls=%d "
         "Q=1,4,8 activation=fp32,bf16 state=fp32,bf16 beta=fp32,activation "
         "GQA=3 prefix=0..Q null_padding=PASS readonly=PASS key_bits=PASS "
+        "reuse_stress_tasks=336 interleaved_null=PASS partial_rows=PASS "
         "boundary_source_final_alias=PASS tolerance_fp32=%g tolerance_bf16=%g",
         calls,
         calls,

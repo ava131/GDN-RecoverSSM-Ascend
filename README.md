@@ -1,6 +1,6 @@
 # GDN-RecoverSSM-Ascend
 
-当前 `op-dev` 为 AscendC 算子开发分支（`0.3.0.dev0`）。verify/grouped fold 已接入 AC，尚待 CANN 编译和 NPU 验证；部署及验收见 [AscendC 分支说明](docs/ASCENDC_OP_DEV.md)。main 保持原稳定基线。
+当前 `op-dev` 为 AscendC 算子开发分支（`0.3.0.dev0`）。verify/grouped fold 已接入 AC，本轮继续优化窗口搬运并补充自动建模日志；新改动尚待设备验收。部署见 [AscendC 分支说明](docs/ASCENDC_OP_DEV.md)，改动与日志解释见[第二轮交接](docs/ASCENDC_PIPELINE_E2E_20261116.md)。main 保持原稳定基线。
 
 在 Ascend A2（910B）上为 **GDN** 实现 **RecoverSSM**（投机解码只保留 1 份检查点 + 紧凑记录，
 采样后重建被接受的状态），目标配置 **MTP3（Q=4）+ prefix cache（align）**。

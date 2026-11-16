@@ -159,7 +159,7 @@ def spec_setup(runtime):
 
 
 def test_pure_spec_writes_actual_output_and_preserves_padding(runtime):
-    module, layer, meta, inputs, native = spec_setup(runtime)
+    module, layer, meta, inputs, _native = spec_setup(runtime)
     assert module.try_spec_forward(layer, *inputs)
     output = inputs[-1].data
     np.testing.assert_array_equal(output[:8], 7)
@@ -189,7 +189,7 @@ def test_pure_spec_writes_actual_output_and_preserves_padding(runtime):
 
 @pytest.mark.parametrize("kind", ["prefill", "ordinary", "profile", "changed_abi"])
 def test_fallback_happens_before_any_stateful_helper(runtime, kind):
-    module, layer, meta, inputs, native = spec_setup(runtime)
+    module, layer, meta, inputs, _native = spec_setup(runtime)
     extra = {}
     if kind == "prefill":
         meta.num_prefills = 1
@@ -204,7 +204,7 @@ def test_fallback_happens_before_any_stateful_helper(runtime, kind):
 
 
 def test_partial_stateful_failure_is_propagated_without_fallback(runtime):
-    module, layer, meta, inputs, native = spec_setup(runtime)
+    module, layer, _meta, inputs, native = spec_setup(runtime)
     calls = []
 
     def broken(*args, **kwargs):
@@ -264,7 +264,12 @@ def graph_setup(runtime, *, fail=False, capture_missing=False):
     worker_v2.aclgraph_utils = native
     runtime.monkeypatch.setitem(sys.modules, "vllm_ascend.worker.v2", worker_v2)
     runtime.monkeypatch.setitem(sys.modules, native.__name__, native)
-    runtime.relative("diagnostics", observe_graph=lambda *args: None)
+    runtime.relative(
+        "diagnostics", observe_graph=lambda *args: None,
+        phase_begin=lambda *args, **kwargs: None,
+        phase_end=lambda *args, **kwargs: None,
+        step_for_metadata=lambda *args: None,
+    )
     graph_module = runtime.load("graph_probe")
     graph_module.enable()
     graph_module.install()
@@ -286,7 +291,7 @@ def test_capture_metadata_is_startup_owned_and_released(runtime):
 
 
 def test_failed_graph_is_never_automatically_repeated(runtime):
-    module, manager, saved = graph_setup(runtime, fail=True)
+    _module, manager, _saved = graph_setup(runtime, fail=True)
     desc = next(iter(manager.graphs))
     with pytest.raises(RuntimeError, match="partial work"):
         manager._updatable_graph_replay(desc, {})

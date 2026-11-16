@@ -26,14 +26,18 @@ class Verify {
     static constexpr uint32_t kVOffset = kKOffset + kWindowBytes;
     static constexpr uint32_t kRawOffset = kVOffset + kWindowBytes;
     static constexpr uint32_t kRawKeyOffset = kRawOffset + kWindowBytes;
-    static constexpr uint32_t kCorrectionOffset = kRawKeyOffset + kWindowBytes;
-    static constexpr uint32_t kOutputOffset = kCorrectionOffset + kDim * sizeof(float);
-    static constexpr uint32_t kBroadcastOffset = kOutputOffset + kDim * sizeof(float);
+    static constexpr uint32_t kRawValueOffset = kRawKeyOffset + kWindowBytes;
+    static constexpr uint32_t kCorrectionOffset = kRawValueOffset + kWindowBytes;
+    static constexpr uint32_t kOutputOffset = kCorrectionOffset + kWindowBytes;
+    static constexpr uint32_t kBroadcastOffset = kOutputOffset + kWindowBytes;
     static constexpr uint32_t kBetaRawOffset = kBroadcastOffset + kDim * 32;
     static constexpr uint32_t kMetaOffset = kBetaRawOffset + 32;
     static constexpr uint32_t kDecayOffset = kMetaOffset + 2 * kWindow * sizeof(float);
-    static constexpr uint32_t kUbBytes = kDecayOffset + 32;
-    static_assert(kUbBytes + 2048 <= 192 * 1024, "verify UB exceeds A2 capacity");
+    // Every token owns its output/correction/decay DMA sources until the whole
+    // window drains. A 32-byte decay slot is required for each scalar transfer.
+    static constexpr uint32_t kUbBytes = kDecayOffset + kWindow * 32;
+    static_assert(kUbBytes == kVerifyUbBytes, "verify host/device UB budget mismatch");
+    static_assert(kUbBytes + kUbGuardBytes <= 192 * 1024, "verify UB exceeds A2 capacity");
     static_assert(std::is_same<Key, Activation>::value || std::is_same<Key, float>::value,
                   "records must preserve normalized key precision");
 
@@ -158,7 +162,6 @@ private:
 
     __aicore__ inline void LoadMatrix(int64_t slot, int64_t head)
     {
-        ReuseInput();
         const int64_t offset = slot * td_.state_block_stride + head * td_.state_head_stride;
         DataCopyExtParams copy{
             kDim, kDim * static_cast<uint32_t>(sizeof(State)),
@@ -171,9 +174,13 @@ private:
             auto packed = ub_.GetWithOffset<State>(kElements, kMatrixBytes);
             DataCopyPad(packed, state_[offset], copy, padding);
         }
-        InputReady();
+    }
+
+    __aicore__ inline void ConvertMatrix()
+    {
         if constexpr (!std::is_same<State, float>::value) {
-            Cast(current, ub_.GetWithOffset<State>(kElements, kMatrixBytes),
+            Cast(ub_.GetWithOffset<float>(kElements, 0),
+                 ub_.GetWithOffset<State>(kElements, kMatrixBytes),
                  RoundMode::CAST_NONE, kElements);
             PipeBarrier<PIPE_V>();
         }
@@ -181,17 +188,20 @@ private:
 
     __aicore__ inline void LoadWindow(GlobalTensor<Activation> source,
                                       int64_t offset, int64_t stride,
-                                      uint32_t count, uint32_t raw_offset,
-                                      uint32_t float_offset)
+                                      uint32_t count, uint32_t raw_offset)
     {
-        ReuseInput();
         auto raw = ub_.GetWithOffset<Activation>(kWindowElements, raw_offset);
         DataCopyExtParams copy{
             static_cast<uint16_t>(count), kDim * static_cast<uint32_t>(sizeof(Activation)),
             static_cast<uint32_t>((stride - kDim) * sizeof(Activation)), 0, 0};
         DataCopyPadExtParams<Activation> padding{false, 0, 0, 0};
         DataCopyPad(raw, source[offset], copy, padding);
-        InputReady();
+    }
+
+    __aicore__ inline void ConvertWindow(uint32_t count, uint32_t raw_offset,
+                                         uint32_t float_offset)
+    {
+        auto raw = ub_.GetWithOffset<Activation>(kWindowElements, raw_offset);
         auto values = ub_.GetWithOffset<float>(kWindowElements, float_offset);
         if constexpr (std::is_same<Activation, float>::value) {
             Muls(values, raw, 1.0f, count * kDim);
@@ -246,10 +256,12 @@ private:
                                      int64_t key_head, int64_t token,
                                      uint32_t t, float decay)
     {
-        auto correction = ub_.GetWithOffset<float>(kDim, kCorrectionOffset);
-        auto output = ub_.GetWithOffset<float>(kDim, kOutputOffset);
-        auto raw = ub_.GetWithOffset<Activation>(kDim, kRawOffset);
-        auto decay_value = ub_.GetWithOffset<float>(8, kDecayOffset);
+        auto correction = ub_.GetWithOffset<float>(kWindowElements, kCorrectionOffset)[t * kDim];
+        auto output = ub_.GetWithOffset<float>(kWindowElements, kOutputOffset)[t * kDim];
+        // All input conversion has finished before recurrence begins. The raw
+        // query window can now hold disjoint packed output slots for all tokens.
+        auto raw = ub_.GetWithOffset<Activation>(kWindowElements, kRawOffset)[t * kDim];
+        auto decay_value = ub_.GetWithOffset<float>(kWindow * 8, kDecayOffset)[t * 8];
         Duplicate(decay_value, decay, 8);
         if constexpr (!std::is_same<Activation, float>::value) {
             Cast(raw, output, RoundMode::CAST_RINT, kDim);
@@ -278,31 +290,40 @@ private:
                     ub_.GetWithOffset<float>(kWindowElements, kKOffset)[t * kDim]);
             }
         }
-        AfterOutput();
+        // Do not wait here: later tokens only touch their own DMA source slots.
+        // RunTask drains MTE3 once before any task reuses this UB allocation.
     }
 
     __aicore__ inline void RunTask(int64_t row, int64_t head, int64_t slot,
                                    int64_t begin, uint32_t count)
     {
         const int64_t key_head = head / (td_.value_heads / td_.heads);
+        ReuseInput();
+        // All four DMA destinations are disjoint. Enqueue them together, then
+        // publish the single MTE2->Vector dependency before any conversion.
         LoadMatrix(slot, head);
         LoadWindow(q_, begin * td_.q_token_stride + key_head * kDim,
-                   td_.q_token_stride, count, kRawOffset, kQOffset);
+                   td_.q_token_stride, count, kRawOffset);
         LoadWindow(k_, begin * td_.k_token_stride + key_head * kDim,
-                   td_.k_token_stride, count, kRawKeyOffset, kKOffset);
+                   td_.k_token_stride, count, kRawKeyOffset);
         LoadWindow(v_, begin * td_.v_token_stride + head * kDim,
-                   td_.v_token_stride, count, kRawOffset, kVOffset);
+                   td_.v_token_stride, count, kRawValueOffset);
+        InputReady();
+        ConvertMatrix();
+        ConvertWindow(count, kRawOffset, kQOffset);
+        ConvertWindow(count, kRawKeyOffset, kKOffset);
+        ConvertWindow(count, kRawValueOffset, kVOffset);
         LoadMeta(head, begin, count);
         auto query = ub_.GetWithOffset<float>(kWindowElements, kQOffset);
         Muls(query, query, td_.scale, count * kDim);
         PipeBarrier<PIPE_V>();
-        auto corr = ub_.GetWithOffset<float>(kDim, kCorrectionOffset);
-        auto result = ub_.GetWithOffset<float>(kDim, kOutputOffset);
         auto broadcast = ub_.GetWithOffset<float>(kDim * 8, kBroadcastOffset);
         auto gates = ub_.GetWithOffset<float>(kWindow, kMetaOffset);
         auto betas = ub_.GetWithOffset<float>(kWindow, kMetaOffset + 32);
         uint32_t bank = 0;
         for (uint32_t t = 0; t < count; ++t) {
+            auto corr = ub_.GetWithOffset<float>(kWindowElements, kCorrectionOffset)[t * kDim];
+            auto result = ub_.GetWithOffset<float>(kWindowElements, kOutputOffset)[t * kDim];
             auto previous = ub_.GetWithOffset<float>(kElements, bank * kMatrixBytes);
             auto next = ub_.GetWithOffset<float>(kElements, (1 - bank) * kMatrixBytes);
             auto key = ub_.GetWithOffset<float>(kWindowElements, kKOffset)[t * kDim];
@@ -329,6 +350,7 @@ private:
             SaveToken(row, head, key_head, begin + t, t, decay);
             bank = 1 - bank;
         }
+        AfterOutput();
     }
 
     VerifyTiling td_;

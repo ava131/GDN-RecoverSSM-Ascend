@@ -130,13 +130,21 @@ class _RecoverCommitProxy:
             self._inner._gdn_commit_coordinator = coordinator
         start = perf_counter_ns()
         if gdn:
-            coordinator.commit(
-                gdn,
-                sampled,
-                mapping,
-                kwargs.get("state_indices"),
-                kwargs.get("num_accepted_tokens"),
+            sample = diagnostics.phase_begin(
+                "recovery_host_submit", step=diagnostics.step_for_metadata(gdn)
             )
+            failed = True
+            try:
+                coordinator.commit(
+                    gdn,
+                    sampled,
+                    mapping,
+                    kwargs.get("state_indices"),
+                    kwargs.get("num_accepted_tokens"),
+                )
+                failed = False
+            finally:
+                diagnostics.phase_end(sample, failed=failed)
             diagnostics.host_commit(
                 (perf_counter_ns() - start) / 1000.0,
                 coordinator.last_group_count,
@@ -251,7 +259,7 @@ def install() -> None:
             from . import graph_probe
 
             graph_probe.remember_metadata(self, args, kwargs, attn_metadata)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - completeness is checked before READY.
             pass
         recoverssm = getattr(self, "recoverssm", None)
         if recoverssm is None:
@@ -270,13 +278,25 @@ def install() -> None:
 
             batch = args[0] if args else kwargs.get("input_batch")
             rows = None
+            context = None
             for meta in attn_metadata.values():
                 commit = getattr(meta, "recoverssm_commit", None)
                 if commit is not None:
                     rows = commit.request_rows
+                    context = getattr(meta, "recoverssm_context", None)
                     break
             if batch is not None:
-                diagnostics.note_step(rows, int(batch.num_tokens), int(batch.num_reqs))
+                snapshot = diagnostics.note_step(
+                    rows, int(batch.num_tokens), int(batch.num_reqs), batch=batch
+                )
+                diagnostics.bind_step(attn_metadata, snapshot)
+                diagnostics.note_layout(context)
+                previous = getattr(self, "_gdn_perf_precommit_interval", None)
+                if previous is not None:
+                    diagnostics.phase_end(previous, failed=True)
+                self._gdn_perf_precommit_interval = diagnostics.phase_begin(
+                    "target_to_recovery_host", step=snapshot
+                )
 
         return attn_metadata
 
@@ -292,6 +312,11 @@ def install() -> None:
 
     @functools.wraps(original_postprocess)
     def postprocess_state(self, *args, **kwargs):
+        from . import diagnostics
+
+        interval = getattr(self, "_gdn_perf_precommit_interval", None)
+        self._gdn_perf_precommit_interval = None
+        diagnostics.phase_end(interval)
         rec = getattr(self, "recoverssm", None)
         if rec is None:
             return original_postprocess(self, *args, **kwargs)
@@ -329,7 +354,7 @@ def _is_capturing() -> bool:
         return False
     try:
         return bool(npu.is_current_stream_capturing())
-    except Exception:
+    except Exception:  # noqa: BLE001 - retain compatibility with unavailable capture APIs.
         return False
 
 
