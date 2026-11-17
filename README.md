@@ -1,55 +1,48 @@
 # GDN-RecoverSSM-Ascend
 
-当前 `op-dev` 为 AscendC 算子开发分支（`0.3.0.dev0`）。verify/grouped fold 已接入 AC，尚待 CANN 编译和 NPU 验证；部署及验收见 [AscendC 分支说明](docs/ASCENDC_OP_DEV.md)。main 保持原稳定基线。
+以 vLLM 插件形式在 Ascend A2（910B）上实现 GDN RecoverSSM：投机验证只读 checkpoint，保存紧凑记录，采样后重建被接受的状态。目标是降低状态缓存需求并缩短端到端时间。
 
-在 Ascend A2（910B）上为 **GDN** 实现 **RecoverSSM**（投机解码只保留 1 份检查点 + 紧凑记录，
-采样后重建被接受的状态），目标配置 **MTP3（Q=4）+ prefix cache（align）**。
+当前分支关系：
 
-**交付形态：vLLM 插件。不改 vLLM / vllm-ascend 任何源码**（两棵树的 `git status` 都是干净的）。
+- `main`：`9c5ce34`，现阶段已有运行结果的基线。
+- `op-dev-v2`：从上述 main 新建，本轮 AscendC 优化；CPU 检查已通过，设备编译、数值、图运行和性能仍待部署验证。
+- `op-dev`：保留原开发历史，本轮未在该分支继续叠加。
 
-## 目录
+本轮说明见 [设计与交接](docs/OPDEV_V2_DESIGN.md) 和 [正常启动及日志验收](docs/OPDEV_V2_SERVER_VALIDATION.md)。沿用现有完整启动命令，无新增用户开关。
+
+## 执行路径
+
+```text
+投机验证：checkpoint 只读 → UB 中递推 Q 步 → 输出及 typed-SoA records
+采样之后：按接受长度折叠 records → final checkpoint 及需要的 align 边界
+```
+
+correction、decay 使用 FP32；key 保留 activation dtype，并在 GQA value heads 间共享。resident state 页数由原生缓存模式和物理页规则决定，不能把 align 模式的整个状态池简单视为每请求固定一页。实际 dtype、shape、stride 和 records 字节数见 `GDN_PREPARED_CONTEXT`。
+
+AscendC 实现 verify 和 grouped fold；plan、conv compaction、align publisher 继续使用已有 Triton 实现。代码只在 `plugin/` 内接入，不修改 vLLM、vllm-ascend 或 FLA 源码。
+
+## 安装和检查
+
+```bash
+python -m pip install -e ./plugin --no-deps
+# 随后使用保存的原 Replay server 启动命令。
+```
+
+AscendC 库在 server 启动时按源码和工具链指纹自动构建或命中缓存；构建、自检错误阻止 ready。开发机没有 NPU/CANN，本地测试不能替代设备验证。
+
+```bash
+.venv/bin/python -m pytest plugin/tests -q
+```
+
+## 文档
 
 | 路径 | 内容 |
 |---|---|
-| **`plugin/`** | ⭐ 实现本体：`pip install -e plugin` 即生效，见 [`plugin/README.md`](plugin/README.md) |
-| `docs/FEASIBILITY.md` | 可行性验证（8 条逐项核过源码）+ 插件架构 + 风险 |
-| `docs/RUNBOOK.md` | 上机手册：装插件、先基线后开关、6 条验收、回退方案 |
-| `docs/KERNEL_NOTES.md` | 内核移植说明：与上游的逐函数对应 + 10 条 Triton-Ascend fallback + UB 预算 |
-| `docs/GDN-RecoverSSM-实现方案.md` | 原理与公式、issue #19987 要求、KDA 现状、工作量、Qwen3.8-27B 收益量化 |
-| `docs/PLAN.md` | 早期规划（按里程碑），已被插件方案取代，保留作历史 |
-| `docs/七个算法汇总.md` | 背景：7 个方案横向对比 |
-| `docs/ReplaySSM-2610.13778.pdf` | 论文原文 |
-| `docs/reference/` | vendor 的参考实现（含 0.30.0 缺失的 Ascend KDA 与上游 GDN 实现） |
-| `vllm/` `vllm-ascend/` | 基线源码，v0.30.0，**未改动** |
+| `plugin/` | 插件和测试 |
+| [OPDEV_V2_DESIGN.md](docs/OPDEV_V2_DESIGN.md) | 本轮改动、数学、同步合同和交接 |
+| [OPDEV_V2_SERVER_VALIDATION.md](docs/OPDEV_V2_SERVER_VALIDATION.md) | 原配置运行时的日志检查与验收 |
+| [ASCENDC_OP_DEV.md](docs/ASCENDC_OP_DEV.md) | 初版 AC 设计历史，版本和资源数字以 v2 文档为准 |
+| [GDN-RecoverSSM-实现方案.md](docs/GDN-RecoverSSM-实现方案.md) | 原理、RFC、KDA 和收益建模背景 |
+| `docs/reference/` | 参考实现 |
 
-## 它做了什么
-
-```
-投机验证：读 1 份 checkpoint（只读）→ 寄存器里连推 Q 步
-         → 写输出 + 每 token 一条 FP32 记录 [corr(V), k̂(K), decay(1)]
-采样之后：commit 只折叠被接受前缀 → 写回 1 份 checkpoint（+ align 模式下的块边界状态）
-```
-
-状态槽从 **Q 份降到 1 份**（`num_speculative_blocks = 0` 由上游 `--use-replayssm` 自动生效）。
-
-## 快速开始
-
-```bash
-cd plugin && python -m pip install -e .
-# 上机步骤见 docs/RUNBOOK.md
-```
-
-## 本地可跑的验证（无需 NPU）
-
-```bash
-cd plugin
-python tests/test_math_oracle.py       # 4 项：记录布局、任意接受长度的提交、align 边界算术
-PYTHONPATH=. python tests/test_layer_patch_mock.py   # 3 项：插件接线
-```
-
-两套都已通过（`4 oracle checks passed` / `3 wiring checks passed`）。
-
-## 状态
-
-- ✅ 可行性验证、内核移植（1175 行）、插件接线、本地数值/接线测试
-- ⏳ 待上机：kernel 编译、Q=1 逐位一致、align 边界、图捕获、端到端精度与性能
+较早的 runbook、规划及性能审查保留作历史记录；本分支的部署步骤以 v2 验收文档为准。

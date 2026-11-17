@@ -238,7 +238,7 @@ def _assert_close(got, expected, *, label, dtype):
         )
 
 
-def _probe(case, device):
+def _probe(case, device, *, fused=False):
     from .ascendc_backend import AscendCSpec
 
     cpu = case
@@ -254,7 +254,19 @@ def _probe(case, device):
     decay = torch.full((rows, 3, query_len), -19.0, dtype=torch.float32, device=device)
     out = torch.full_like(v, -23.0)
     tensors = (q, k, v, g, beta, state, corr, key, decay, out, qsl, indices)
-    AscendCSpec("verify", tensors, verify_config(case, tensors), case["scale"]).launch()
+    if fused:
+        q, k, g, beta = (
+            cpu[name].to(device) for name in ("raw_q", "raw_k", "raw_a", "raw_b")
+        )
+        tensors = (q, k, v, g, beta, state, corr, key, decay, out, qsl, indices)
+        fused_tensors = (*tensors, cpu["A_log"].to(device), cpu["dt_bias"].to(device))
+        AscendCSpec(
+            "verify_fused", fused_tensors, verify_config(case, tensors), case["scale"]
+        ).launch()
+    else:
+        AscendCSpec(
+            "verify", tensors, verify_config(case, tensors), case["scale"]
+        ).launch()
     # Startup-owned copies synchronize naturally; no request path is involved.
     state_cpu, out_cpu = state.cpu(), out.cpu()
     corr_cpu, key_cpu, decay_cpu = corr.cpu(), key.cpu(), decay.cpu()
@@ -287,7 +299,14 @@ def _probe(case, device):
         _assert_close(
             decay_cpu[row].transpose(0, 1), decays, label="decay", dtype=torch.float32
         )
-        if not torch.equal(key_cpu[row, 0], cpu["k"][0, start:end, 0]):
+        if fused:
+            _assert_close(
+                key_cpu[row, 0],
+                cpu["k"][0, start:end, 0],
+                label="fused normalized key",
+                dtype=k.dtype,
+            )
+        elif not torch.equal(key_cpu[row, 0], cpu["k"][0, start:end, 0]):
             raise RuntimeError(
                 "GDN_ASCENDC_SELFTEST key record did not preserve input bits"
             )
@@ -401,6 +420,39 @@ def _probe(case, device):
                 )
 
 
+def make_fused_case(query_len, activation_dtype, state_dtype, beta_dtype):
+    """Raw inputs and independently rounded rc1 preprocessing reference."""
+    case = make_case(query_len, activation_dtype, state_dtype, beta_dtype)
+    case["raw_q"] = _values(case["q"].shape, offset=3).to(activation_dtype)
+    case["raw_k"] = _values(case["k"].shape, offset=11).to(activation_dtype)
+    # Exercise epsilon, zero reductions and a single live component in both
+    # the smallest window and the multi-token specializations.
+    case["raw_q"][0, 0] = 0
+    case["raw_k"][0, 1] = 0
+    case["raw_q"][0, 2] = 0
+    case["raw_q"][0, 2, 0, 0] = 1e-5
+    for name in ("q", "k"):
+        raw = case["raw_" + name].float()
+        case[name] = (raw / (raw.square().sum(-1, keepdim=True) + 1e-6).sqrt()).to(
+            activation_dtype
+        )
+    shape = case["g"].shape
+    case["raw_a"] = _values(shape, offset=5, amplitude=2.0).to(activation_dtype)
+    case["raw_b"] = _values(shape, offset=7, amplitude=2.0).to(beta_dtype)
+    case["raw_a"].flatten()[::7] = 25.0  # softplus linear branch
+    case["raw_a"].flatten()[1::7] = -25.0
+    case["raw_b"].flatten()[::7] = 20.0
+    case["raw_b"].flatten()[1::7] = -20.0
+    case["A_log"] = torch.tensor([-1.0, -0.5, 0.0], dtype=torch.float32)
+    case["dt_bias"] = torch.tensor([-0.2, 0.1, 0.3], dtype=torch.float32)
+    x = case["raw_a"].float() + case["dt_bias"]
+    case["g"] = -case["A_log"].exp() * torch.where(
+        x <= 20.0, torch.log(1.0 + x.exp()), x
+    )
+    case["beta"] = case["raw_b"].float().sigmoid().to(beta_dtype)
+    return case
+
+
 def run(device):
     """Execute every BF16/FP32 entry-point specialization before graph capture."""
     from vllm.logger import init_logger
@@ -412,14 +464,27 @@ def run(device):
                 for beta in dict.fromkeys((activation, torch.float32)):
                     _probe(make_case(query_len, activation, state, beta), device)
                     calls += 1
+    fused_calls = 0
+    for query_len in (1, 4, 8):
+        for activation in (torch.float32, torch.bfloat16):
+            for state in (torch.float32, torch.bfloat16):
+                for beta in dict.fromkeys((activation, torch.float32)):
+                    _probe(
+                        make_fused_case(query_len, activation, state, beta),
+                        device,
+                        fused=True,
+                    )
+                    fused_calls += 1
     init_logger("vllm.gdn_recoverssm_ascend.ascendc").info(
         "GDN_ASCENDC_SELFTEST PASS cases=%d verify_calls=%d fold_calls=%d "
+        "fused_verify_calls=%d norm_gate_roundtrip=PASS fused_key_tolerance=PASS "
         "Q=1,4,8 activation=fp32,bf16 state=fp32,bf16 beta=fp32,activation "
-        "GQA=3 prefix=0..Q null_padding=PASS readonly=PASS key_bits=PASS "
+        "GQA=3 prefix=0..Q null_padding=PASS readonly=PASS prenormalized_key_bits=PASS "
         "boundary_source_final_alias=PASS tolerance_fp32=%g tolerance_bf16=%g",
+        calls + fused_calls,
         calls,
-        calls,
-        calls,
+        calls + fused_calls,
+        fused_calls,
         TOL_FP32,
         TOL_BF16,
     )

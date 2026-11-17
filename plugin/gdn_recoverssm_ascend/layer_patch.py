@@ -276,7 +276,9 @@ def install() -> None:
                     rows = commit.request_rows
                     break
             if batch is not None:
-                diagnostics.note_step(rows, int(batch.num_tokens), int(batch.num_reqs))
+                diagnostics.note_step(
+                    rows, int(batch.num_tokens), int(batch.num_reqs), batch=batch
+                )
 
         return attn_metadata
 
@@ -471,6 +473,19 @@ def _verify(layer, q, k, v, ssm_state, kwargs, out=None):
     _COUNTERS["verify_calls"] += 1
     _COUNTERS["last_rows"] = rows
     _COUNTERS["last_tokens"] = total
+
+    raw_fused = kwargs.get("raw_fused")
+    if raw_fused is not None:
+        from .ascendc_backend import launch_fused_verify
+
+        out = launch_fused_verify(
+            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+            kwargs["g"], kwargs["beta"], *raw_fused,
+            kv_cache[1], records, query_start_loc, checkpoint_indices,
+            spec_query_len=layer.num_spec + 1,
+            scale=kwargs.get("scale"), out=out,
+        )
+        return out.squeeze(0)
 
     out = gdn_recoverssm_verify(
         kwargs["g"],

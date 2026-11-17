@@ -3,6 +3,7 @@
 
 #include <type_traits>
 #include "common.h"
+#include "fusion.h"
 #include "kernel_operator.h"
 
 namespace gdn_ac {
@@ -13,7 +14,7 @@ using namespace AscendC;
 // alternate as recurrence state and reduction scratch. QKV are loaded once per
 // short window; checkpoint GM is read-only throughout this kernel.
 template <typename Activation, typename State, typename Key, typename Beta,
-          typename Index, typename Qsl>
+          typename Index, typename Qsl, bool Fused = false>
 class Verify {
     static constexpr uint32_t kDim = 128;
     static constexpr uint32_t kElements = kDim * kDim;
@@ -27,13 +28,14 @@ class Verify {
     static constexpr uint32_t kRawOffset = kVOffset + kWindowBytes;
     static constexpr uint32_t kRawKeyOffset = kRawOffset + kWindowBytes;
     static constexpr uint32_t kCorrectionOffset = kRawKeyOffset + kWindowBytes;
-    static constexpr uint32_t kOutputOffset = kCorrectionOffset + kDim * sizeof(float);
-    static constexpr uint32_t kBroadcastOffset = kOutputOffset + kDim * sizeof(float);
+    static constexpr uint32_t kOutputOffset = kCorrectionOffset + kWindowBytes;
+    static constexpr uint32_t kBroadcastOffset = kOutputOffset + kWindowBytes;
     static constexpr uint32_t kBetaRawOffset = kBroadcastOffset + kDim * 32;
     static constexpr uint32_t kMetaOffset = kBetaRawOffset + 32;
     static constexpr uint32_t kDecayOffset = kMetaOffset + 2 * kWindow * sizeof(float);
     static constexpr uint32_t kUbBytes = kDecayOffset + 32;
-    static_assert(kUbBytes + 2048 <= 192 * 1024, "verify UB exceeds A2 capacity");
+    static_assert(kUbBytes == kVerifyUbBytes, "verify host/device UB budget mismatch");
+    static_assert(kUbBytes + kUbGuardBytes <= 192 * 1024, "verify UB exceeds A2 capacity");
     static_assert(std::is_same<Key, Activation>::value || std::is_same<Key, float>::value,
                   "records must preserve normalized key precision");
 
@@ -43,12 +45,18 @@ public:
     __aicore__ inline void Init(
         GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta,
         GM_ADDR state, GM_ADDR correction, GM_ADDR key_record,
-        GM_ADDR decay_record, GM_ADDR out, GM_ADDR qsl, GM_ADDR indices)
+        GM_ADDR decay_record, GM_ADDR out, GM_ADDR qsl, GM_ADDR indices,
+        GM_ADDR A_log = nullptr, GM_ADDR dt_bias = nullptr)
     {
         q_.SetGlobalBuffer(reinterpret_cast<__gm__ Activation *>(q));
         k_.SetGlobalBuffer(reinterpret_cast<__gm__ Activation *>(k));
         v_.SetGlobalBuffer(reinterpret_cast<__gm__ Activation *>(v));
         g_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(g));
+        if constexpr (Fused) {
+            raw_a_.SetGlobalBuffer(reinterpret_cast<__gm__ Activation *>(g));
+            A_log_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(A_log));
+            dt_bias_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(dt_bias));
+        }
         beta_.SetGlobalBuffer(reinterpret_cast<__gm__ Beta *>(beta));
         state_.SetGlobalBuffer(reinterpret_cast<__gm__ State *>(state));
         correction_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(correction));
@@ -62,6 +70,7 @@ public:
         inputFree_ = pipe_.AllocEventID<HardEvent::V_MTE2>();
         outputReady_ = pipe_.AllocEventID<HardEvent::V_MTE3>();
         outputFree_ = pipe_.AllocEventID<HardEvent::MTE3_V>();
+        outputScalarFree_ = pipe_.AllocEventID<HardEvent::MTE3_S>();
         scalarReady_ = pipe_.AllocEventID<HardEvent::S_V>();
         scalarResult_ = pipe_.AllocEventID<HardEvent::V_S>();
     }
@@ -89,6 +98,7 @@ public:
         pipe_.ReleaseEventID<HardEvent::V_MTE2>(inputFree_);
         pipe_.ReleaseEventID<HardEvent::V_MTE3>(outputReady_);
         pipe_.ReleaseEventID<HardEvent::MTE3_V>(outputFree_);
+        pipe_.ReleaseEventID<HardEvent::MTE3_S>(outputScalarFree_);
         pipe_.ReleaseEventID<HardEvent::S_V>(scalarReady_);
         pipe_.ReleaseEventID<HardEvent::V_S>(scalarResult_);
     }
@@ -116,6 +126,10 @@ private:
     {
         SetFlag<HardEvent::MTE3_V>(outputFree_);
         WaitFlag<HardEvent::MTE3_V>(outputFree_);
+        // LoadMeta uses Scalar SetValue on gates, now also a DMA source. A
+        // Vector-only wait cannot protect its next-task scalar overwrite.
+        SetFlag<HardEvent::MTE3_S>(outputScalarFree_);
+        WaitFlag<HardEvent::MTE3_S>(outputScalarFree_);
     }
 
     __aicore__ inline void VectorToScalar()
@@ -242,43 +256,104 @@ private:
         PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline void SaveToken(int64_t row, int64_t head,
-                                     int64_t key_head, int64_t token,
-                                     uint32_t t, float decay)
+    // Accumulate complete window outputs in disjoint slots. No DMA starts
+    // until all scalar/vector work and activation casts have finished.
+    __aicore__ inline void StageToken(uint32_t t)
     {
-        auto correction = ub_.GetWithOffset<float>(kDim, kCorrectionOffset);
-        auto output = ub_.GetWithOffset<float>(kDim, kOutputOffset);
-        auto raw = ub_.GetWithOffset<Activation>(kDim, kRawOffset);
-        auto decay_value = ub_.GetWithOffset<float>(8, kDecayOffset);
-        Duplicate(decay_value, decay, 8);
         if constexpr (!std::is_same<Activation, float>::value) {
+            auto output = ub_.GetWithOffset<float>(kWindowElements, kOutputOffset)[t * kDim];
+            auto raw = ub_.GetWithOffset<Activation>(kWindowElements, kRawOffset)[t * kDim];
             Cast(raw, output, RoundMode::CAST_RINT, kDim);
+            PipeBarrier<PIPE_V>();
         }
-        PipeBarrier<PIPE_V>();
-        BeforeOutput();
-        const int64_t out_offset = token * td_.out_token_stride + head * kDim;
-        if constexpr (std::is_same<Activation, float>::value) {
-            StoreRow(out_, out_offset, output);
+    }
+
+    template <typename T>
+    __aicore__ inline void StoreWindow(GlobalTensor<T> target, int64_t offset,
+                                       int64_t token_stride, LocalTensor<T> values,
+                                       uint32_t count)
+    {
+        // The public ABI permits token padding and arbitrary legal strides.
+        // Multi-block UB->GM uses byte gaps; retain row stores for layouts
+        // whose gap cannot be represented by that instruction.
+        if (token_stride >= kDim &&
+            static_cast<uint64_t>(token_stride - kDim) <= 0xFFFFFFFFULL / sizeof(T)) {
+            DataCopyExtParams copy{
+                static_cast<uint16_t>(count), kDim * static_cast<uint32_t>(sizeof(T)),
+                0, static_cast<uint32_t>((token_stride - kDim) * sizeof(T)), 0};
+            DataCopyPad(target[offset], values, copy);
         } else {
-            StoreRow(out_, out_offset, raw);
+            for (uint32_t t = 0; t < count; ++t) {
+                StoreRow(target, offset + t * token_stride, values[t * kDim]);
+            }
         }
-        StoreRow(correction_, row * td_.corr_row_stride + head * td_.corr_head_stride +
-                 t * td_.corr_token_stride, correction);
-        DataCopyExtParams scalar_copy{1, sizeof(float), 0, 0, 0};
-        DataCopyPad(decays_[row * td_.decay_row_stride + head * td_.decay_head_stride +
-                           t * td_.decay_token_stride], decay_value, scalar_copy);
+    }
+
+    __aicore__ inline void SaveWindow(int64_t row, int64_t head,
+                                      int64_t key_head, int64_t begin,
+                                      uint32_t count)
+    {
+        PipeBarrier<PIPE_V>();
+        // Exactly one publication/completion pair per task. In particular an
+        // event ID is not re-issued across tokens while an earlier DMA waits
+        // for the same ID. All sources remain immutable until AfterOutput.
+        BeforeOutput();
+        const int64_t out_offset = begin * td_.out_token_stride + head * kDim;
+        if constexpr (std::is_same<Activation, float>::value) {
+            StoreWindow(out_, out_offset, td_.out_token_stride,
+                        ub_.GetWithOffset<float>(kWindowElements, kOutputOffset), count);
+        } else {
+            StoreWindow(out_, out_offset, td_.out_token_stride,
+                        ub_.GetWithOffset<Activation>(kWindowElements, kRawOffset), count);
+        }
+        StoreWindow(correction_, row * td_.corr_row_stride + head * td_.corr_head_stride,
+                    td_.corr_token_stride,
+                    ub_.GetWithOffset<float>(kWindowElements, kCorrectionOffset), count);
+        // gates is already contiguous FP32 exp(g), unlike padded scalar DMA
+        // slots. Copy only count floats: padding to 32B would overwrite records.
+        DataCopyExtParams scalar_copy{1, count * static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
+        DataCopyPad(decays_[row * td_.decay_row_stride + head * td_.decay_head_stride],
+                    ub_.GetWithOffset<float>(kWindow, kMetaOffset), scalar_copy);
         if (head % (td_.value_heads / td_.heads) == 0) {
-            const int64_t key_offset = row * td_.key_row_stride + key_head * td_.key_head_stride +
-                t * td_.key_token_stride;
+            const int64_t key_offset = row * td_.key_row_stride + key_head * td_.key_head_stride;
             if constexpr (std::is_same<Key, Activation>::value) {
-                StoreRow(keys_, key_offset,
-                    ub_.GetWithOffset<Activation>(kWindowElements, kRawKeyOffset)[t * kDim]);
+                StoreWindow(keys_, key_offset, td_.key_token_stride,
+                            ub_.GetWithOffset<Activation>(kWindowElements, kRawKeyOffset), count);
             } else {
-                StoreRow(keys_, key_offset,
-                    ub_.GetWithOffset<float>(kWindowElements, kKOffset)[t * kDim]);
+                StoreWindow(keys_, key_offset, td_.key_token_stride,
+                            ub_.GetWithOffset<float>(kWindowElements, kKOffset), count);
             }
         }
         AfterOutput();
+    }
+
+    __aicore__ inline void LastOutput(LocalTensor<float> result,
+                                      LocalTensor<float> decayed_state,
+                                      LocalTensor<float> query,
+                                      LocalTensor<float> key,
+                                      LocalTensor<float> correction,
+                                      LocalTensor<float> scratch)
+    {
+        // The checkpoint is read-only and commit consumes records, so the
+        // final temporary S'=D+u*k^T has no consumer. Compute D*q+u*(k^T*q).
+        // This changes FP32 association; numerical device self-tests validate
+        // tolerances rather than claiming bitwise identity to the old formula.
+        DotRows(result, decayed_state, query, scratch);
+        Mul(scratch, key, query, kDim);
+        PipeBarrier<PIPE_V>();
+        Add(scratch, scratch, scratch[64], 64);
+        PipeBarrier<PIPE_V>();
+        auto dot = ub_.GetWithOffset<float>(kDim * 8, kBroadcastOffset);
+        WholeReduceSum(dot, scratch, 64, 1, 1, 1, 8);
+        PipeBarrier<PIPE_V>();
+        VectorToScalar();
+        const float key_query_dot = dot.GetValue(0);
+        SetFlag<HardEvent::S_V>(scalarReady_);
+        WaitFlag<HardEvent::S_V>(scalarReady_);
+        Muls(dot, correction, key_query_dot, kDim);
+        PipeBarrier<PIPE_V>();
+        Add(result, result, dot, kDim);
+        PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void RunTask(int64_t row, int64_t head, int64_t slot,
@@ -292,17 +367,34 @@ private:
                    td_.k_token_stride, count, kRawKeyOffset, kKOffset);
         LoadWindow(v_, begin * td_.v_token_stride + head * kDim,
                    td_.v_token_stride, count, kRawOffset, kVOffset);
-        LoadMeta(head, begin, count);
+        if constexpr (Fused) {
+            auto scratch = ub_.GetWithOffset<float>(kElements, kMatrixBytes);
+            NormalizeFusedWindow<Activation>(
+                ub_.GetWithOffset<float>(kWindowElements, kQOffset),
+                ub_.GetWithOffset<float>(kWindowElements, kKOffset),
+                ub_.GetWithOffset<Activation>(kWindowElements, kRawOffset),
+                ub_.GetWithOffset<Activation>(kWindowElements, kRawKeyOffset),
+                scratch, count);
+            LoadFusedMeta<Activation, Beta>(
+                raw_a_, beta_, A_log_, dt_bias_,
+                ub_.GetWithOffset<float>(kWindow, kMetaOffset),
+                ub_.GetWithOffset<float>(kWindow, kMetaOffset + 32),
+                ub_.GetWithOffset<Beta>(kWindow, kBetaRawOffset),
+                scratch, head, begin, count, td_.g_token_stride,
+                td_.beta_token_stride, scalarReady_, scalarResult_);
+        } else {
+            LoadMeta(head, begin, count);
+        }
         auto query = ub_.GetWithOffset<float>(kWindowElements, kQOffset);
         Muls(query, query, td_.scale, count * kDim);
         PipeBarrier<PIPE_V>();
-        auto corr = ub_.GetWithOffset<float>(kDim, kCorrectionOffset);
-        auto result = ub_.GetWithOffset<float>(kDim, kOutputOffset);
         auto broadcast = ub_.GetWithOffset<float>(kDim * 8, kBroadcastOffset);
         auto gates = ub_.GetWithOffset<float>(kWindow, kMetaOffset);
         auto betas = ub_.GetWithOffset<float>(kWindow, kMetaOffset + 32);
         uint32_t bank = 0;
         for (uint32_t t = 0; t < count; ++t) {
+            auto corr = ub_.GetWithOffset<float>(kWindowElements, kCorrectionOffset)[t * kDim];
+            auto result = ub_.GetWithOffset<float>(kWindowElements, kOutputOffset)[t * kDim];
             auto previous = ub_.GetWithOffset<float>(kElements, bank * kMatrixBytes);
             auto next = ub_.GetWithOffset<float>(kElements, (1 - bank) * kMatrixBytes);
             auto key = ub_.GetWithOffset<float>(kWindowElements, kKOffset)[t * kDim];
@@ -318,30 +410,36 @@ private:
             PipeBarrier<PIPE_V>();
             Muls(corr, corr, beta, kDim);
             PipeBarrier<PIPE_V>();
-            Brcb(broadcast, corr, 16, {1, 8});
-            PipeBarrier<PIPE_V>();
-            for (uint32_t column = 0; column != kDim; column += 64) {
-                MulAddDst(next[column], key[column], broadcast, 64, kDim,
-                          {1, 1, 0, 16, 0, 1});
+            if (t + 1 == count) {
+                LastOutput(result, next, query[t * kDim], key, corr, previous);
+            } else {
+                Brcb(broadcast, corr, 16, {1, 8});
+                PipeBarrier<PIPE_V>();
+                for (uint32_t column = 0; column != kDim; column += 64) {
+                    MulAddDst(next[column], key[column], broadcast, 64, kDim,
+                              {1, 1, 0, 16, 0, 1});
+                }
+                PipeBarrier<PIPE_V>();
+                DotRows(result, next, query[t * kDim], previous);
             }
-            PipeBarrier<PIPE_V>();
-            DotRows(result, next, query[t * kDim], previous);
-            SaveToken(row, head, key_head, begin + t, t, decay);
+            StageToken(t);
             bank = 1 - bank;
         }
+        SaveWindow(row, head, key_head, begin, count);
     }
 
     VerifyTiling td_;
     TPipe pipe_;
     TBuf<TPosition::VECCALC> ub_;
     GlobalTensor<Activation> q_, k_, v_, out_;
-    GlobalTensor<float> g_, correction_, decays_;
+    GlobalTensor<float> g_, correction_, decays_, A_log_, dt_bias_;
+    GlobalTensor<Activation> raw_a_;
     GlobalTensor<State> state_;
     GlobalTensor<Key> keys_;
     GlobalTensor<Beta> beta_;
     GlobalTensor<Index> indices_;
     GlobalTensor<Qsl> qsl_;
-    TEventID inputReady_, inputFree_, outputReady_, outputFree_, scalarReady_, scalarResult_;
+    TEventID inputReady_, inputFree_, outputReady_, outputFree_, outputScalarFree_, scalarReady_, scalarResult_;
 };
 } // namespace verify_detail
 
@@ -355,6 +453,20 @@ __global__ __aicore__ void VerifyKernel(
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     verify_detail::Verify<Activation, State, Key, Beta, Index, Qsl> op(tiling);
     op.Init(q, k, v, g, beta, state, correction, key_record, decay_record, out, qsl, indices);
+    op.Process();
+}
+template <typename Activation, typename State, typename Key, typename Beta,
+          typename Index, typename Qsl>
+__global__ __aicore__ void VerifyFusedKernel(
+    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR a, GM_ADDR b, GM_ADDR state,
+    GM_ADDR correction, GM_ADDR key_record, GM_ADDR decay_record,
+    GM_ADDR out, GM_ADDR qsl, GM_ADDR indices, GM_ADDR A_log, GM_ADDR dt_bias,
+    VerifyTiling tiling)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    verify_detail::Verify<Activation, State, Key, Beta, Index, Qsl, true> op(tiling);
+    op.Init(q, k, v, a, b, state, correction, key_record, decay_record,
+            out, qsl, indices, A_log, dt_bias);
     op.Process();
 }
 } // namespace gdn_ac

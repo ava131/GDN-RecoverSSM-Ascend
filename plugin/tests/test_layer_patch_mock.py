@@ -608,6 +608,9 @@ def test_graph_probe_logs_task_count():
         def __init__(self):
             self.graphs = {}
 
+        def run_fullgraph(self, desc):
+            return self._updatable_graph_replay(desc, None)
+
         def _updatable_graph_replay(self, desc, attn_metadata):
             calls["replay"] += 1
             return "ok"
@@ -768,6 +771,9 @@ def test_replay_probe_does_not_touch_the_device():
             def __init__(self):
                 self.graphs = {}
 
+            def run_fullgraph(self, desc):
+                return self._updatable_graph_replay(desc, None)
+
             def _updatable_graph_replay(self, desc, attn_metadata):
                 calls["replay"] += 1
                 return "ok"
@@ -821,6 +827,9 @@ def test_arbitrary_replay_failure_is_not_retried():
         class ModelAclGraphManager:
             def __init__(self):
                 self.graphs = {}
+
+            def run_fullgraph(self, desc):
+                return self._updatable_graph_replay(desc, None)
 
             def _updatable_graph_replay(self, desc, attn_metadata):
                 state["calls"] += 1

@@ -66,6 +66,21 @@ def install() -> None:
     from vllm_ascend.worker.v2 import aclgraph_utils
 
     cls = aclgraph_utils.ModelAclGraphManager
+    original_fullgraph = cls.run_fullgraph
+
+    @functools.wraps(original_fullgraph)
+    def run_fullgraph(self, desc):
+        result = original_fullgraph(self, desc)
+        if _ENABLED:
+            # Both legacy and updatable graphs use this dispatcher in rc1.
+            # Count successful replays exactly once, without device timing.
+            state = getattr(getattr(self, "model_runner", None), "model_state", None)
+            from . import diagnostics
+
+            diagnostics.observe_graph(desc, getattr(state, "attn_metadata", None))
+        return result
+
+    cls.run_fullgraph = run_fullgraph
     original = cls._updatable_graph_replay
 
     @functools.wraps(original)
@@ -80,11 +95,7 @@ def install() -> None:
             )
         _log_replay_attempt(self, desc, attn_metadata)
         try:
-            result = original(self, desc, attn_metadata)
-            from . import diagnostics
-
-            diagnostics.observe_graph(desc, attn_metadata)
-            return result
+            return original(self, desc, attn_metadata)
         except Exception as exc:
             _FAILED[key] = f"{type(exc).__name__}: {exc}"
             logger.error(

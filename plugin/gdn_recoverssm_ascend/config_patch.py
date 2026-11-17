@@ -134,7 +134,7 @@ def _provenance() -> str:
 
         parts.append(f"vllm={getattr(vllm, '__version__', '?')}")
         parts.append(f"vllm_at={os.path.dirname(getattr(vllm, '__file__', '') or '')}")
-    except Exception:
+    except Exception:  # noqa: BLE001 - provenance logging is best-effort.
         parts.append("vllm=?")
     try:
         import vllm_ascend
@@ -145,7 +145,7 @@ def _provenance() -> str:
         parts.append(
             f"vllm_ascend_at={os.path.dirname(getattr(vllm_ascend, '__file__', '') or '')}"
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 - provenance logging is best-effort.
         parts.append("vllm_ascend=?")
     return " ".join(parts)
 
@@ -155,11 +155,17 @@ def _summary(config, query_len: int) -> str:
     hf = config.model_config.hf_text_config
     tp = config.parallel_config.tensor_parallel_size
     hv = getattr(hf, "linear_num_value_heads", None)
+    hk = getattr(hf, "linear_num_key_heads", None)
     k = getattr(hf, "linear_key_head_dim", None)
     v = getattr(hf, "linear_value_head_dim", None)
-    if hv and k and v and hv % tp == 0:
-        replay = f"{hv // tp} heads x {query_len} x {v + k + 1} fp32 (scratch)"
-        states = "2 per layer (conv, checkpoint); records outside the cache"
+    if hv and hk and k and v and hv % tp == 0 and hk % tp == 0:
+        key_dtype = str(getattr(config.model_config, "dtype", "runtime"))
+        replay = (
+            f"typed-SoA scratch: correction={hv // tp}x{query_len}x{v} fp32, "
+            f"shared_key={hk // tp}x{query_len}x{k} {key_dtype}, "
+            f"decay={hv // tp}x{query_len} fp32; actual bytes in GDN_PREPARED_CONTEXT"
+        )
+        states = "conv/checkpoint components; resident slots follow native cache mode"
     else:
         replay = "?"
         states = "?"

@@ -38,7 +38,7 @@ uint32_t Blocks(int64_t work) {
         TORCH_CHECK(platform != nullptr, "GDN AscendC platform unavailable");
         uint64_t ubBytes=0;
         platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB,ubBytes);
-        TORCH_CHECK(ubBytes>=156800+2048, "GDN AscendC device UB is too small");
+        TORCH_CHECK(ubBytes>=kVerifyUbBytes+kUbGuardBytes, "GDN AscendC device UB is too small");
         return static_cast<int64_t>(platform->GetCoreNumAiv());
     }();
     TORCH_CHECK(cores > 0 && work > 0, "GDN AscendC invalid work/core count");
@@ -82,6 +82,44 @@ void VerifyState(uint32_t blocks, aclrtStream stream,
     
     else { RUN_STATE(bfloat16_t); }
 #undef RUN_STATE
+}
+
+template<class A, class S, class B>
+void LaunchVerifyFused(uint32_t blocks, aclrtStream stream,
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+    const Tensor& beta, const Tensor& state, const Tensor& correction,
+    const Tensor& key, const Tensor& decay, const Tensor& out,
+    const Tensor& qsl, const Tensor& indices, const Tensor& A_log,
+    const Tensor& dt_bias, VerifyTiling t) {
+    VerifyFusedKernel<A,S,A,B,int32_t,int32_t><<<blocks,nullptr,stream>>>(
+        PTR(q),PTR(k),PTR(v),PTR(g),PTR(beta),PTR(state),PTR(correction),
+        PTR(key),PTR(decay),PTR(out),PTR(qsl),PTR(indices),PTR(A_log),PTR(dt_bias),t);
+}
+template<class A, class S>
+void VerifyFusedBeta(uint32_t blocks, aclrtStream stream,
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+    const Tensor& beta, const Tensor& state, const Tensor& correction,
+    const Tensor& key, const Tensor& decay, const Tensor& out,
+    const Tensor& qsl, const Tensor& indices, const Tensor& A_log,
+    const Tensor& dt_bias, VerifyTiling t) {
+    if (beta.scalar_type()==at::kFloat) {
+        LaunchVerifyFused<A,S,float>(blocks,stream,q,k,v,g,beta,state,correction,key,decay,out,qsl,indices,A_log,dt_bias,t);
+    } else {
+        LaunchVerifyFused<A,S,A>(blocks,stream,q,k,v,g,beta,state,correction,key,decay,out,qsl,indices,A_log,dt_bias,t);
+    }
+}
+template<class A>
+void VerifyFusedState(uint32_t blocks, aclrtStream stream,
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+    const Tensor& beta, const Tensor& state, const Tensor& correction,
+    const Tensor& key, const Tensor& decay, const Tensor& out,
+    const Tensor& qsl, const Tensor& indices, const Tensor& A_log,
+    const Tensor& dt_bias, VerifyTiling t) {
+    if (state.scalar_type()==at::kFloat) {
+        VerifyFusedBeta<A,float>(blocks,stream,q,k,v,g,beta,state,correction,key,decay,out,qsl,indices,A_log,dt_bias,t);
+    } else {
+        VerifyFusedBeta<A,bfloat16_t>(blocks,stream,q,k,v,g,beta,state,correction,key,decay,out,qsl,indices,A_log,dt_bias,t);
+    }
 }
 
 void Verify(const Tensor& q,const Tensor& k,const Tensor& v,const Tensor& g,
@@ -145,12 +183,83 @@ void Verify(const Tensor& q,const Tensor& k,const Tensor& v,const Tensor& g,
     auto launch=[=]() -> int {
 #define RUN_ACT(A) VerifyState<A>(blocks,stream,q,k,v,g,beta,state,correction,key,decay,out,qsl,indices,t)
         if(q.scalar_type()==at::kFloat) { RUN_ACT(float); }
-        
         else { RUN_ACT(bfloat16_t); }
 #undef RUN_ACT
         return 0;
     };
     at_npu::native::OpCommand::RunOpApi("GDNReplayVerifyAC",launch);
+}
+void VerifyFused(const Tensor& q,const Tensor& k,const Tensor& v,const Tensor& g,
+    const Tensor& beta,const Tensor& state,const Tensor& correction,const Tensor& key,
+    const Tensor& decay,const Tensor& out,const Tensor& qsl,const Tensor& indices,
+    const Tensor& A_log,const Tensor& dt_bias,at::IntArrayRef config,double scale) {
+    TORCH_CHECK(config.size() == kVerifyFields, "GDN AscendC verify tiling ABI");
+    VerifyTiling t{}; size_t field=0;
+#define ASSIGN(name) t.name = config[field++];
+    GDN_VERIFY_FIELDS(ASSIGN)
+#undef ASSIGN
+    t.scale = static_cast<float>(scale);
+    TORCH_CHECK(t.null_block==0, "GDN AscendC reserves physical page zero");
+    TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "GDN AscendC requires NPU tensors");
+    for (const Tensor* x : {&k,&v,&g,&beta,&state,&correction,&key,&decay,&out,&qsl,&indices}) CheckNpu(*x,q);
+    CheckFloat(q.scalar_type()); CheckFloat(state.scalar_type());
+    TORCH_CHECK(k.scalar_type()==q.scalar_type() && v.scalar_type()==q.scalar_type()
+        && key.scalar_type()==q.scalar_type() && out.scalar_type()==q.scalar_type(), "GDN AscendC activation/key dtype");
+    TORCH_CHECK(beta.scalar_type()==q.scalar_type() || beta.scalar_type()==at::kFloat, "GDN AscendC beta dtype");
+    TORCH_CHECK(g.scalar_type()==q.scalar_type() && correction.scalar_type()==at::kFloat && decay.scalar_type()==at::kFloat,
+                "GDN AscendC raw-a activation dtype and FP32 correction/decay required");
+    TORCH_CHECK(qsl.scalar_type()==at::kInt && indices.scalar_type()==at::kInt, "GDN AscendC INT32 row metadata required");
+    TORCH_CHECK(q.dim()==4 && k.sizes()==q.sizes() && v.dim()==4 && out.sizes()==v.sizes(), "GDN AscendC activation shape");
+    TORCH_CHECK(q.size(0)==1 && q.size(3)==128 && v.size(3)==128 && q.size(1)==v.size(1), "GDN AscendC K=V=128");
+    TORCH_CHECK(t.rows>0 && t.tokens>=0 && t.tokens==q.size(1) && t.heads==q.size(2)
+        && t.value_heads==v.size(2) && t.heads>0 && t.value_heads%t.heads==0
+        && t.query_len>0 && t.query_len<=8 && t.tokens<=t.rows*t.query_len, "GDN AscendC verify geometry");
+    TORCH_CHECK(state.dim()==4 && state.size(0)==t.blocks && state.size(1)==t.value_heads
+        && state.size(2)==128 && state.size(3)==128 && state.stride(3)==1 && state.stride(2)>=128,
+        "GDN AscendC state geometry");
+    TORCH_CHECK(qsl.dim()==1 && qsl.numel()>=t.rows+1 && indices.dim()==1 && indices.numel()>=t.rows,
+                "GDN AscendC row capacity");
+    TORCH_CHECK(correction.dim()==4 && key.dim()==4 && decay.dim()==3 && t.record_rows==correction.size(0)
+        && correction.size(1)==t.value_heads && correction.size(2)==t.query_len && correction.size(3)==128
+        && key.size(0)==t.record_rows && key.size(1)==t.heads && key.size(2)==t.query_len && key.size(3)==128
+        && decay.size(0)==t.record_rows && decay.size(1)==t.value_heads && decay.size(2)==t.query_len,
+        "GDN AscendC record geometry");
+    TORCH_CHECK(correction.stride(3)==1 && key.stride(3)==1 && decay.stride(2)==1,
+                "GDN AscendC contiguous record elements required");
+    TORCH_CHECK(g.dim()==2 && beta.dim()==2 && g.size(0)==t.tokens && beta.size(0)==t.tokens
+        && g.size(1)==t.value_heads && beta.size(1)==t.value_heads && g.stride(1)==1 && beta.stride(1)==1,
+        "GDN AscendC gate geometry");
+    TORCH_CHECK(q.stride(3)==1 && q.stride(2)==128 && k.stride(3)==1 && k.stride(2)==128
+        && v.stride(3)==1 && v.stride(2)==128 && out.stride(3)==1 && out.stride(2)==128,
+        "GDN AscendC activation elements");
+    CheckDmaGap(state.stride(2),state.element_size());
+    CheckDmaGap(q.stride(1),q.element_size());
+    CheckDmaGap(k.stride(1),k.element_size());
+    CheckDmaGap(v.stride(1),v.element_size());
+    TORCH_CHECK(t.q_token_stride==q.stride(1) && t.k_token_stride==k.stride(1) && t.v_token_stride==v.stride(1)
+        && t.g_token_stride==g.stride(0) && t.beta_token_stride==beta.stride(0)
+        && t.state_block_stride==state.stride(0) && t.state_head_stride==state.stride(1) && t.state_v_stride==state.stride(2)
+        && t.corr_row_stride==correction.stride(0) && t.corr_head_stride==correction.stride(1) && t.corr_token_stride==correction.stride(2)
+        && t.key_row_stride==key.stride(0) && t.key_head_stride==key.stride(1) && t.key_token_stride==key.stride(2)
+        && t.decay_row_stride==decay.stride(0) && t.decay_head_stride==decay.stride(1) && t.decay_token_stride==decay.stride(2)
+        && t.out_token_stride==out.stride(1) && t.qsl_stride==qsl.stride(0) && t.index_stride==indices.stride(0),
+        "GDN AscendC verify config does not match tensor strides");
+    for (const Tensor* x : {&A_log,&dt_bias}) {
+        CheckNpu(*x,q);
+        TORCH_CHECK(x->scalar_type()==at::kFloat && x->dim()==1 && x->numel()==t.value_heads && x->is_contiguous(),
+                    "GDN AscendC fused gate parameters must be contiguous FP32 heads");
+    }
+    const c10::OptionalDeviceGuard guard(q.device());
+    const auto stream=c10_npu::getCurrentNPUStream().stream(false);
+    const auto blocks=Blocks(t.rows*t.value_heads);
+    auto launch=[=]() -> int {
+#define RUN_ACT(A) VerifyFusedState<A>(blocks,stream,q,k,v,g,beta,state,correction,key,decay,out,qsl,indices,A_log,dt_bias,t)
+        if(q.scalar_type()==at::kFloat) { RUN_ACT(float); }
+        else { RUN_ACT(bfloat16_t); }
+#undef RUN_ACT
+        return 0;
+    };
+    at_npu::native::OpCommand::RunOpApi("GDNReplayVerifyFusedAC",launch);
 }
 
 template<class S,class K>
@@ -243,16 +352,22 @@ void Fold(const Tensor& state,const Tensor& correction,const Tensor& key,const T
 TORCH_LIBRARY(gdn_recoverssm_ac,m) {
     m.def("abi_version() -> int", []() -> int64_t { return gdn_ac::kAbiVersion; });
     m.def("verify(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state, Tensor(a!) correction, Tensor(b!) key, Tensor(c!) decay, Tensor(d!) out, Tensor qsl, Tensor indices, int[] config, float scale) -> ()");
+    m.def("verify_fused(Tensor q, Tensor k, Tensor v, Tensor a, Tensor b, Tensor state, Tensor(a!) correction, Tensor(b!) key, Tensor(c!) decay, Tensor(d!) out, Tensor qsl, Tensor indices, Tensor A_log, Tensor dt_bias, int[] config, float scale) -> ()");
     m.def("fold(Tensor(a!) state, Tensor correction, Tensor key, Tensor decay, Tensor state_addrs, Tensor state_block_strides, Tensor corr_addrs, Tensor corr_block_strides, Tensor key_addrs, Tensor key_block_strides, Tensor decay_addrs, Tensor decay_block_strides, Tensor layer_groups, Tensor source, Tensor lengths, Tensor final_indices, Tensor boundary_indices, Tensor boundary_lengths, int[] config) -> ()");
 }
 TORCH_LIBRARY_IMPL(gdn_recoverssm_ac,PrivateUse1,m) {
     m.impl("verify",TORCH_FN(gdn_ac::Verify));
+    m.impl("verify_fused",TORCH_FN(gdn_ac::VerifyFused));
     m.impl("fold",TORCH_FN(gdn_ac::Fold));
 }
 TORCH_LIBRARY_IMPL(gdn_recoverssm_ac,Meta,m) {
     m.impl("verify", [](const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,
         const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,
         const at::Tensor&,const at::Tensor&,const at::Tensor&,at::IntArrayRef,double) {});
+    m.impl("verify_fused", [](const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,
+        const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,
+        const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,
+        at::IntArrayRef,double) {});
     m.impl("fold", [](const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,const at::Tensor&,at::IntArrayRef) {});
 }
 

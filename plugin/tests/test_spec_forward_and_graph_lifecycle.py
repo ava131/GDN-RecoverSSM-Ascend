@@ -165,7 +165,7 @@ def test_pure_spec_writes_actual_output_and_preserves_padding(runtime):
     np.testing.assert_array_equal(output[:8], 7)
     np.testing.assert_array_equal(output[8:], 0)
     np.testing.assert_array_equal(layer.kv_cache[1].data, 0)
-    operations = [event[0] for event in runtime.events]
+    operations = [event[0] for event in runtime.events if event[0] != "info"]
     assert operations == [
         "wait",
         "fence",
@@ -224,7 +224,7 @@ class Descriptor:
     cg_mode: str = "FULL"
 
 
-def graph_setup(runtime, *, fail=False, capture_missing=False):
+def graph_setup(runtime, *, fail=False, capture_missing=False, legacy=False):
     graph_module = None
     saved_meta = object()
 
@@ -248,6 +248,9 @@ def graph_setup(runtime, *, fail=False, capture_missing=False):
             return "captured"
 
         def run_fullgraph(self, desc):
+            if legacy:
+                self.calls += 1
+                return "legacy-ok"
             return self._updatable_graph_replay(
                 desc, self.model_runner.model_state.attn_metadata
             )
@@ -283,6 +286,18 @@ def test_capture_metadata_is_startup_owned_and_released(runtime):
     assert module._CAPTURE_META == {}
     assert not module._COLLECTING
     assert module.metrics()["warmed_graphs"] == 1
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_both_fullgraph_paths_observe_success_exactly_once(runtime, legacy):
+    _module, manager, saved = graph_setup(runtime, legacy=legacy)
+    observed = []
+    runtime.relative("diagnostics", observe_graph=lambda *args: observed.append(args))
+    desc = next(iter(manager.graphs))
+    result = manager.run_fullgraph(desc)
+    assert result == ("legacy-ok" if legacy else "ok")
+    assert manager.calls == 1
+    assert observed == [(desc, saved)]
 
 
 def test_failed_graph_is_never_automatically_repeated(runtime):

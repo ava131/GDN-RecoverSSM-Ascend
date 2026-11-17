@@ -27,7 +27,8 @@ class FoldEngine {
     static constexpr uint32_t kBroadcastOffset = kRawKeysOffset + kRawKeyBytes;
     // Brcb expands each scalar into a 32-byte block, one block per state row.
     static constexpr uint32_t kBroadcastBytes = kDim * 32;
-    static constexpr uint32_t kUbBytes = kBroadcastOffset + kBroadcastBytes;
+    static constexpr uint32_t kDecayOffset = kBroadcastOffset + kBroadcastBytes;
+    static constexpr uint32_t kUbBytes = kDecayOffset + kWindow * sizeof(float);
     static_assert(kUbBytes + 2048 <= 192 * 1024, "fold UB exceeds the A2 limit");
 
 public:
@@ -57,6 +58,7 @@ public:
         boundaryLengths_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(boundary_lengths));
         pipe_.InitBuffer(ub_, kUbBytes);
         loadReady_ = pipe_.AllocEventID<AscendC::HardEvent::MTE2_V>();
+        metadataReady_ = pipe_.AllocEventID<AscendC::HardEvent::MTE2_S>();
         inputFree_ = pipe_.AllocEventID<AscendC::HardEvent::V_MTE2>();
         outputReady_ = pipe_.AllocEventID<AscendC::HardEvent::V_MTE3>();
         outputDone_ = pipe_.AllocEventID<AscendC::HardEvent::MTE3_V>();
@@ -85,6 +87,7 @@ public:
             RunTask(layer, row, head, source, final, accepted, plan);
         }
         pipe_.ReleaseEventID<AscendC::HardEvent::MTE2_V>(loadReady_);
+        pipe_.ReleaseEventID<AscendC::HardEvent::MTE2_S>(metadataReady_);
         pipe_.ReleaseEventID<AscendC::HardEvent::V_MTE2>(inputFree_);
         pipe_.ReleaseEventID<AscendC::HardEvent::V_MTE3>(outputReady_);
         pipe_.ReleaseEventID<AscendC::HardEvent::MTE3_V>(outputDone_);
@@ -131,7 +134,7 @@ private:
 
     __aicore__ inline void LoadRecords(
         int64_t row, int64_t head, int32_t accepted,
-        int64_t corrBlockStride, int64_t keyBlockStride)
+        int64_t corrBlockStride, int64_t keyBlockStride, int64_t decayBlockStride)
     {
         InputFree();
         const int64_t corrOffset = row * corrBlockStride + head * td_.corr_head_stride;
@@ -154,6 +157,17 @@ private:
             AscendC::DataCopyPad(ub_.template GetWithOffset<Key>(kWindow * kDim, kRawKeysOffset),
                                 keys_[keyOffset], keyParams, keyPad);
         }
+        // The adapter requires contiguous decay tokens. Load only the accepted
+        // prefix, never neighbouring heads/rows, into one aligned 32-byte UB bank.
+        AscendC::DataCopyExtParams decayParams{
+            1, static_cast<uint32_t>(accepted * sizeof(float)), 0, 0, 0};
+        AscendC::DataCopyPad(ub_.template GetWithOffset<float>(kWindow, kDecayOffset),
+                            decays_[row * decayBlockStride + head * td_.decay_head_stride],
+                            decayParams, corrPad);
+        // GetValue below is a Scalar consumer: MTE2_V alone does not publish
+        // these bytes to it. Finish this dependency before entering recurrence.
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(metadataReady_);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(metadataReady_);
         AwaitInput();
         if constexpr (!std::is_same<Key, float>::value) {
             AscendC::Cast(ub_.template GetWithOffset<float>(kWindow * kDim, kKeysOffset),
@@ -206,12 +220,12 @@ private:
         const bool saveBoundary = boundary > td_.null_block && boundary < td_.blocks &&
                                   boundary != final && boundaryLength > 0 && boundaryLength <= accepted;
         LoadState(source, head, stateBlockStride);
-        LoadRecords(row, head, accepted, corrBlockStride, keyBlockStride);
+        LoadRecords(row, head, accepted, corrBlockStride, keyBlockStride, decayBlockStride);
         auto state = ub_.template GetWithOffset<float>(kElements, 0);
         auto broadcast = ub_.template GetWithOffset<float>(kDim * 8, kBroadcastOffset);
+        auto decayWindow = ub_.template GetWithOffset<float>(kWindow, kDecayOffset);
         for (int32_t token = 0; token < accepted; ++token) {
-            const float decay = decays_.GetValue(row * decayBlockStride +
-                head * td_.decay_head_stride + token * td_.decay_token_stride);
+            const float decay = decayWindow.GetValue(token);
             AscendC::SetFlag<AscendC::HardEvent::S_V>(scalarReady_);
             AscendC::WaitFlag<AscendC::HardEvent::S_V>(scalarReady_);
             auto key = ub_.template GetWithOffset<float>(kDim, kKeysOffset + token * kDim * sizeof(float));
@@ -247,7 +261,7 @@ private:
     AscendC::GlobalTensor<State> state_;
     AscendC::GlobalTensor<float> corrections_, decays_;
     AscendC::GlobalTensor<Key> keys_;
-    AscendC::TEventID loadReady_, inputFree_, outputReady_, outputDone_, scalarReady_;
+    AscendC::TEventID loadReady_, metadataReady_, inputFree_, outputReady_, outputDone_, scalarReady_;
 };
 
 template <typename State, typename Key>

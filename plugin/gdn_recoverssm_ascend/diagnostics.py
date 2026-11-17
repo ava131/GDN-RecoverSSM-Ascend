@@ -14,6 +14,7 @@ import json
 import threading
 import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 from vllm.logger import init_logger
@@ -21,7 +22,7 @@ from vllm.logger import init_logger
 from .metrics_math import padding_fraction
 
 logger = init_logger("vllm.gdn_recoverssm_ascend.perf")
-PATCH_ID = "ascendc-op-dev-v1"
+PATCH_ID = "ascendc-op-dev-v2-window-fused"
 REPORT_STEPS = 200
 _INSTALLED = False
 _READY = False
@@ -30,12 +31,30 @@ _LATEST = None
 _LOCK = threading.Lock()
 _COUNTS = Counter()
 _GRAPHS = Counter()
+_BATCHES = Counter()
+_ACCEPTED = Counter()
 _START = None
 _LAST_CONFIG = None
 _IDLE_THREAD = None
 _LAST_OUTPUT_AT = None
 _LAST_REPORTED_STEPS = 0
 _STOP_REPORTING = threading.Event()
+
+
+@dataclass(frozen=True)
+class StepSnapshot:
+    spec_rows: tuple | None
+    num_tokens: int
+    num_reqs: int
+    phase: str = "unknown"
+    context_sum: int = 0
+    context_max: int = 0
+    context_rows: int = 0
+
+
+def _cpu_array(value):
+    # Never convert an unknown Tensor: numpy/cpu/item can synchronize the NPU.
+    return value if hasattr(value, "__array_interface__") else None
 
 
 def _enabled():
@@ -65,6 +84,8 @@ def launch_manifest(worker):
         "prefix_caching": cache.enable_prefix_caching,
         "mamba_cache_mode": cache.mamba_cache_mode,
         "mamba_block_size": cache.mamba_block_size,
+        "mamba_ssm_cache_dtype": str(getattr(cache, "mamba_ssm_cache_dtype", "unavailable")),
+        "recovery_algorithm": "per_step_recover",
     }
 
 
@@ -129,13 +150,27 @@ def _shutdown_reporting():
     report()
 
 
-def note_step(spec_rows, num_tokens, num_reqs):
+def note_step(spec_rows, num_tokens, num_reqs, *, batch=None):
     """Snapshot CPU-known batch-row indices before output-copy construction."""
     global _LATEST, _START
-    _LATEST = (
+    num_reqs = int(num_reqs)
+    phase, context_sum, context_max, context_rows = "unknown", 0, 0, 0
+    flags = _cpu_array(getattr(batch, "is_prefilling_np", None))
+    if flags is not None and len(flags) >= num_reqs:
+        prefill = int(flags[:num_reqs].sum())
+        phase = "decode" if prefill == 0 else (
+            "prefill" if prefill == num_reqs else "mixed"
+        )
+    computed = _cpu_array(getattr(batch, "num_computed_tokens_np", None))
+    if computed is not None and len(computed) >= num_reqs and num_reqs:
+        values = computed[:num_reqs]
+        context_sum = int(values.sum())
+        context_max = int(values.max())
+        context_rows = num_reqs
+    _LATEST = StepSnapshot(
         None if spec_rows is None else tuple(spec_rows),
         int(num_tokens),
-        int(num_reqs),
+        num_reqs, phase, context_sum, context_max, context_rows,
     )
     if _READY:
         with _LOCK:
@@ -176,6 +211,7 @@ def observe_graph(desc, attn_metadata):
         _GRAPHS[(actual, captured)] += 1
         _COUNTS["graph_actual_tokens"] += actual
         _COUNTS["graph_padded_tokens"] += max(captured - actual, 0)
+        _COUNTS["graph_observed_steps"] += 1
 
 
 def record_completed(counts, step):
@@ -191,14 +227,29 @@ def record_completed(counts, step):
         _COUNTS["output_steps"] += 1
         _COUNTS["emitted_tokens"] += int(counts.sum())
         if step is not None:
-            spec_rows, num_tokens, num_reqs = step
-            _COUNTS["actual_target_tokens"] += num_tokens
-            _COUNTS["request_rows"] += num_reqs
+            if not isinstance(step, StepSnapshot):
+                step = StepSnapshot(*step)  # Legacy tuple/mock compatibility.
+            spec_rows = step.spec_rows
+            _COUNTS["batch_snapshot_steps"] += 1
+            _COUNTS["actual_target_tokens"] += step.num_tokens
+            _COUNTS["request_rows"] += step.num_reqs
+            _COUNTS["peak_request_rows"] = max(_COUNTS["peak_request_rows"], step.num_reqs)
+            _COUNTS["context_tokens_sum"] += step.context_sum
+            _COUNTS["context_known_rows"] += step.context_rows
+            _COUNTS["context_tokens_max"] = max(_COUNTS["context_tokens_max"], step.context_max)
+            _BATCHES[(step.phase, step.num_reqs)] += 1
             if spec_rows is not None:
-                for row in spec_rows:
-                    if 0 <= row < len(counts):
-                        _COUNTS["spec_rows"] += 1
-                        _COUNTS["spec_emitted_tokens"] += int(counts[row])
+                # These are CPU-owned completed outputs and CPU row identities.
+                # Reduce in NumPy rather than taking a Python scalar per row.
+                import numpy as np
+
+                rows = np.asarray(spec_rows, dtype=np.int64)
+                rows = rows[(rows >= 0) & (rows < len(counts))]
+                values = counts[rows]
+                _COUNTS["spec_rows"] += int(values.size)
+                _COUNTS["spec_emitted_tokens"] += int(values.sum())
+                unique, frequencies = np.unique(values, return_counts=True)
+                _ACCEPTED.update(dict(zip(map(int, unique), map(int, frequencies))))
         emit = (
             _COUNTS["output_steps"] <= 3 or _COUNTS["output_steps"] % REPORT_STEPS == 0
         )
@@ -216,6 +267,11 @@ def report():
             {"actual": a, "captured": b, "steps": n}
             for (a, b), n in _GRAPHS.most_common(8)
         ]
+        batches = [
+            {"phase": phase, "rows": rows, "steps": steps}
+            for (phase, rows), steps in sorted(_BATCHES.items())
+        ]
+        accepted = dict(sorted(_ACCEPTED.items()))
         elapsed = (
             0.0
             if _START is None or _LAST_OUTPUT_AT is None
@@ -230,7 +286,7 @@ def report():
         "GDN_PERF steps=%d emitted_tokens=%d spec_rows=%d "
         "spec_emitted_per_row=%.4f commits=%d host_submit_us_avg=%.1f "
         "kernel_submissions=%d launches_per_commit=%.3f groups_per_commit=%.3f "
-        "graph_padding_tokens=%d graph_padding_fraction=%.6f "
+        "graph_observed_steps=%d graph_padding_tokens=%d graph_padding_fraction=%.6f "
         "worker_observed_s=%.3f graph_hist=%s timing=HOST_ONLY",
         c.get("output_steps", 0),
         c.get("emitted_tokens", 0),
@@ -241,10 +297,37 @@ def report():
         c.get("kernel_submissions", 0),
         c.get("kernel_submissions", 0) / commits if commits else 0.0,
         c.get("groups", 0) / commits if commits else 0.0,
-        padded,
-        padding_fraction(actual, actual + padded),
+        c.get("graph_observed_steps", 0), padded,
+        padding_fraction(actual, actual + padded) if c.get("graph_observed_steps", 0) else -1.0,
         elapsed,
         json.dumps(hist, separators=(",", ":")),
+    )
+    snapshot_steps = c.get("batch_snapshot_steps", 0)
+    context_rows = c.get("context_known_rows", 0)
+    logger.info(
+        "GDN_WORKLOAD steps=%d batch_snapshot_steps=%d mean_rows=%.4f peak_rows=%d "
+        "mean_gdn_rows=%.4f mean_commit_rows=%.4f target_tokens=%d "
+        "mean_computed_context=%.1f max_computed_context=%d context_known_rows=%d "
+        "accepted_output_hist=%s batch_hist=%s "
+        "context_source=CPU_INPUT_MIRROR_MAY_BE_OPTIMISTIC_WITH_ASYNC "
+        "scope=WORKER_CUMULATIVE_CPU_COMPLETED not_client_duration=1",
+        c.get("output_steps", 0), snapshot_steps,
+        c.get("request_rows", 0) / snapshot_steps if snapshot_steps else -1.0,
+        c.get("peak_request_rows", 0) if snapshot_steps else -1,
+        spec_rows / snapshot_steps if snapshot_steps else -1.0,
+        c.get("commit_rows", 0) / commits if commits else 0.0,
+        c.get("actual_target_tokens", 0) if snapshot_steps else -1,
+        c.get("context_tokens_sum", 0) / context_rows if context_rows else -1.0,
+        c.get("context_tokens_max", 0) if context_rows else -1,
+        context_rows, json.dumps(accepted, separators=(",", ":")),
+        json.dumps(batches, separators=(",", ":")),
+    )
+    from . import ascendc_backend
+
+    logger.info(
+        "GDN_PATHS counts=%s scope=HOST_DISPATCH_COUNTS_NOT_GRAPH_EXECUTIONS "
+        "graph_replay_does_not_run_python=1 device_scalar_reads=0 timing_events=0",
+        json.dumps(ascendc_backend.counts(), sort_keys=True, separators=(",", ":")),
     )
 
 

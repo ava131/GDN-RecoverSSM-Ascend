@@ -23,6 +23,7 @@ def perf(monkeypatch):
         "_gdn_perf_test.diagnostics", root / "diagnostics.py"
     )
     module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     return module
 
@@ -153,3 +154,49 @@ def test_idle_summary_does_not_count_idle_time(perf, caplog, monkeypatch):
     with caplog.at_level(logging.INFO):
         perf.report()
     assert "worker_observed_s=10.000" in caplog.text
+
+
+def test_workload_uses_completed_snapshot_and_cpu_context(perf, caplog):
+    first = types.SimpleNamespace(
+        is_prefilling_np=np.array([False, True]),
+        num_computed_tokens_np=np.array([23000, 1000]),
+    )
+    perf._READY = True
+    perf.note_step((0,), 7, 2, batch=first)
+    snapshot = perf._LATEST
+    # The producer is allowed to advance before this output becomes available.
+    first.num_computed_tokens_np[:] = 0
+    perf.note_step((0,), 4, 1)
+    with caplog.at_level(logging.INFO):
+        perf.record_completed(np.array([4, 1], dtype=np.int32), snapshot)
+    assert perf._BATCHES[("mixed", 2)] == 1
+    assert perf._COUNTS["context_tokens_sum"] == 24000
+    assert perf._COUNTS["context_tokens_max"] == 23000
+    assert perf._COUNTS["peak_request_rows"] == 2
+    assert 'accepted_output_hist={"4":1}' in caplog.text
+    assert "mean_computed_context=12000.0" in caplog.text
+    assert "HOST_DISPATCH_COUNTS_NOT_GRAPH_EXECUTIONS" in caplog.text
+
+
+def test_workload_does_not_convert_tensor_fields(perf):
+    class ForbiddenTensor:
+        def __array__(self):
+            raise AssertionError("must not convert device tensors")
+
+        def item(self):
+            raise AssertionError("must not read device tensors")
+
+    batch = types.SimpleNamespace(
+        is_prefilling_np=ForbiddenTensor(),
+        num_computed_tokens_np=ForbiddenTensor(),
+    )
+    perf.note_step((0,), 4, 1, batch=batch)
+    assert perf._LATEST.phase == "unknown"
+    assert perf._LATEST.context_rows == 0
+
+
+def test_no_graph_observations_are_reported_as_unknown(perf, caplog):
+    with caplog.at_level(logging.INFO):
+        perf.report()
+    assert "graph_observed_steps=0" in caplog.text
+    assert "graph_padding_fraction=-1.000000" in caplog.text

@@ -62,5 +62,9 @@ struct FoldTiling {
 };
 #undef GDN_INT_FIELD
 constexpr int64_t kAbiVersion = 1;
+// Verify owns two matrix banks plus eight-token input/output staging. Host
+// launch checks and device static_asserts must agree on this allocation.
+constexpr uint32_t kVerifyUbBytes = 163968;
+constexpr uint32_t kUbGuardBytes = 2048;
 } // namespace gdn_ac
 

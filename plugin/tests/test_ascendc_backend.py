@@ -173,6 +173,9 @@ def test_ready_requires_actual_preparation_and_execution(runtime):
     with pytest.raises(RuntimeError, match="actual model"):
         ac.assert_ready()
     ac._COUNTS.update(prepared_verify=1, prepared_fold=1, verify=1, fold=1)
+    with pytest.raises(RuntimeError, match="verify_fused"):
+        ac.assert_ready()
+    ac._COUNTS["verify_fused"] = 1
     ac.assert_ready()
 
 
