@@ -1,0 +1,59 @@
+{
+  "source": "https://github.com/ava131/GDN-RecoverSSM-Ascend/issues/4#issuecomment-6969969441",
+  "log_scope": "server excerpt; not client benchmark duration",
+  "completed_steps": 2731,
+  "phases": {
+    "decode": {
+      "steps": 1110,
+      "rows": 12290
+    },
+    "mixed": {
+      "steps": 1596,
+      "rows": 28222
+    },
+    "prefill": {
+      "steps": 25,
+      "rows": 27
+    }
+  },
+  "phase_step_percent": {
+    "decode": 40.64445258147199,
+    "mixed": 58.44013181984621,
+    "prefill": 0.9154155986818016
+  },
+  "phase_row_percent": {
+    "decode": 30.31648535977701,
+    "mixed": 69.61691210932682,
+    "prefill": 0.06660253089617404
+  },
+  "total_cpu_snapshot_rows": 40539,
+  "spec_rows": 38782,
+  "spec_emitted_from_hist": 124201,
+  "accepted_output_hist": {
+    "1": 4980,
+    "2": 5388,
+    "3": 5211,
+    "4": 23203
+  },
+  "spec_emitted_per_row": 3.202542416585014,
+  "pure_decode_spec_rows_if_uniform_Q4": 12290,
+  "estimated_mixed_spec_rows_if_uniform_Q4": 26492,
+  "estimated_mixed_spec_percent_if_uniform_Q4": 68.31004074054974,
+  "ordinary_verify_delta": 76608,
+  "mixed_times_48": 76608,
+  "path_identity_all_snapshots": true,
+  "graph_decode_step_identity_all_snapshots": true,
+  "fused_model_host_calls": 3264,
+  "fused_probe_calls_inferred": 36,
+  "worker_observed_s": 800.32,
+  "commits": 2706,
+  "host_submit_us_avg": 830.9,
+  "host_submit_sum_s_approx": 2.2484154,
+  "graph_padding_fraction": 0.053232,
+  "engine_samples": 82,
+  "max_running": 20,
+  "max_kv_usage_percent": 84.7,
+  "post_200_lines": 121,
+  "startup_identity_present": false,
+  "client_duration_present": false
+}

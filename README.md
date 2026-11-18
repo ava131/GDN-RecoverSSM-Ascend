@@ -12,6 +12,8 @@
 
 11月18日已修复首版 v2 错误拒绝 BF16 dt_bias 的融合接入问题，并删除融合路径的 QKV 整段副本。原因、证据与收益边界见 [v2 无明显收益复查](docs/OPDEV_V2_NO_GAIN_REVIEW_20261118.md)。
 
+同日新增server日志已审查：融合已有模型入口证据，下一优化重点是mixed中的spec子集与输出合并，见 [最新日志复查](docs/OPDEV_V2_ISSUE4_LOG_REVIEW_20261118.md)。
+
 ## 执行路径
 
 ```text
