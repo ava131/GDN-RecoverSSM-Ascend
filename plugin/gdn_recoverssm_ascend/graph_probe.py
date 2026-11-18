@@ -70,14 +70,17 @@ def install() -> None:
 
     @functools.wraps(original_fullgraph)
     def run_fullgraph(self, desc):
-        result = original_fullgraph(self, desc)
-        if _ENABLED:
-            # Both legacy and updatable graphs use this dispatcher in rc1.
-            # Count successful replays exactly once, without device timing.
-            state = getattr(getattr(self, "model_runner", None), "model_state", None)
-            from . import diagnostics
+        if not _ENABLED:
+            return original_fullgraph(self, desc)
+        from . import diagnostics
 
-            diagnostics.observe_graph(desc, getattr(state, "attn_metadata", None))
+        timer = diagnostics.timing_start("fullgraph_submit_host")
+        result = original_fullgraph(self, desc)
+        diagnostics.timing_end(timer)
+        # Both legacy and updatable graphs use this dispatcher in rc1.
+        # Count successful replays exactly once, without device timing.
+        state = getattr(getattr(self, "model_runner", None), "model_state", None)
+        diagnostics.observe_graph(desc, getattr(state, "attn_metadata", None))
         return result
 
     cls.run_fullgraph = run_fullgraph

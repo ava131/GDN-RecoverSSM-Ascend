@@ -281,7 +281,10 @@ def graph_setup(runtime, *, fail=False, capture_missing=False, legacy=False):
     worker_v2.aclgraph_utils = native
     runtime.monkeypatch.setitem(sys.modules, "vllm_ascend.worker.v2", worker_v2)
     runtime.monkeypatch.setitem(sys.modules, native.__name__, native)
-    runtime.relative("diagnostics", observe_graph=lambda *args: None)
+    runtime.relative(
+        "diagnostics", observe_graph=lambda *args: None,
+        timing_start=lambda stage: None, timing_end=lambda token: None,
+    )
     graph_module = runtime.load("graph_probe")
     graph_module.enable()
     graph_module.install()
@@ -306,12 +309,17 @@ def test_capture_metadata_is_startup_owned_and_released(runtime):
 def test_both_fullgraph_paths_observe_success_exactly_once(runtime, legacy):
     _module, manager, saved = graph_setup(runtime, legacy=legacy)
     observed = []
-    runtime.relative("diagnostics", observe_graph=lambda *args: observed.append(args))
+    timers = []
+    runtime.relative(
+        "diagnostics", observe_graph=lambda *args: observed.append(args),
+        timing_start=lambda stage: stage, timing_end=timers.append,
+    )
     desc = next(iter(manager.graphs))
     result = manager.run_fullgraph(desc)
     assert result == ("legacy-ok" if legacy else "ok")
     assert manager.calls == 1
     assert observed == [(desc, saved)]
+    assert timers == ["fullgraph_submit_host"]
 
 
 def test_failed_graph_is_never_automatically_repeated(runtime):

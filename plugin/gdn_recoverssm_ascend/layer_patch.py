@@ -267,6 +267,14 @@ def install() -> None:
 
     @functools.wraps(original_prepare_attn)
     def prepare_attn(self, *args, **kwargs):
+        for_capture = bool(
+            kwargs.get("for_capture", args[6] if len(args) > 6 else False)
+        )
+        prepare_timer = None
+        if getattr(self, "recoverssm", None) is not None and not for_capture:
+            from . import diagnostics
+
+            prepare_timer = diagnostics.timing_start("prepare_attn_host", next_step=True)
         attn_metadata = original_prepare_attn(self, *args, **kwargs)
         try:
             from . import graph_probe
@@ -282,9 +290,6 @@ def install() -> None:
             # (input_batch, cudagraph_mode, block_tables, slot_mappings,
             #  attn_groups, kv_cache_config, for_capture=False, ubatch_idx=0)
             attn_groups = args[4] if len(args) > 4 else []
-        for_capture = bool(
-            kwargs.get("for_capture", args[6] if len(args) > 6 else False)
-        )
         recoverssm.record_step(attn_metadata, attn_groups, for_capture=for_capture)
         if not for_capture:
             from . import diagnostics
@@ -297,9 +302,11 @@ def install() -> None:
                     rows = commit.request_rows
                     break
             if batch is not None:
-                diagnostics.note_step(
+                snapshot = diagnostics.note_step(
                     rows, int(batch.num_tokens), int(batch.num_reqs), batch=batch
                 )
+                if snapshot is not None:
+                    diagnostics.timing_end(prepare_timer, step=snapshot)
 
         return attn_metadata
 

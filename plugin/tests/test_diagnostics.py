@@ -1,6 +1,7 @@
 """Completed-output ownership and logging must never require device reads."""
 
 import importlib.util
+import json
 import logging
 import sys
 import types
@@ -52,9 +53,17 @@ def test_completed_output_uses_its_own_step_snapshot(perf, monkeypatch, caplog):
     monkeypatch.setattr(perf, "_enabled", lambda: True)
     perf.install()
     perf._READY = True
-    perf.note_step((1,), 8, 2)
+    perf.note_step(
+        (1,), 8, 2, batch=types.SimpleNamespace(
+            is_prefilling_np=np.array([True, False]),
+        ),
+    )
     first = AsyncOutput(np.array([1, 4], dtype=np.int32))
-    perf.note_step((0,), 4, 1)
+    perf.note_step(
+        (0,), 4, 1, batch=types.SimpleNamespace(
+            is_prefilling_np=np.array([False]),
+        ),
+    )
     second = AsyncOutput(np.array([2], dtype=np.int32))
     with caplog.at_level(logging.INFO):
         assert first.get_output() == "result"
@@ -65,6 +74,8 @@ def test_completed_output_uses_its_own_step_snapshot(perf, monkeypatch, caplog):
     assert perf._COUNTS["spec_rows"] == 2
     assert perf._COUNTS["spec_emitted_tokens"] == 6
     assert perf._COUNTS["emitted_tokens"] == 7
+    assert perf._HOST_TIMINGS["output_get_wall", "mixed"]["samples"] == 1
+    assert perf._HOST_TIMINGS["output_get_wall", "decode"]["samples"] == 1
     assert "timing=HOST_ONLY" in caplog.text
 
 
@@ -203,3 +214,86 @@ def test_no_graph_observations_are_reported_as_unknown(perf, caplog):
         perf.report()
     assert "graph_observed_steps=0" in caplog.text
     assert "graph_padding_fraction=-1.000000" in caplog.text
+
+
+def _phase_reports(caplog):
+    return [
+        json.loads(record.message.split("json=", 1)[1])
+        for record in caplog.records
+        if record.message.startswith("GDN_PHASE_PERF json=")
+    ]
+
+
+def test_phase_tokens_use_actual_per_row_schedule_and_owned_snapshot(perf, caplog):
+    perf._READY = True
+    batch = types.SimpleNamespace(
+        is_prefilling_np=np.array([False, True, False]),
+        num_computed_tokens_np=np.array([3200, 100, 9], dtype=np.int32),
+        num_scheduled_tokens=np.array([3, 5, 1], dtype=np.int32),
+        num_draft_tokens=2,
+    )
+    first = perf.note_step((0,), 9, 3, batch=batch)
+    batch.num_scheduled_tokens.fill(0)  # Advanced producer cannot affect first.
+    batch.num_computed_tokens_np.fill(0)
+    second = perf.note_step(None, 9, 3, batch=batch)  # Inconsistent token sum.
+    with caplog.at_level(logging.INFO):
+        perf.record_completed(np.array([2, 0, 1]), first)
+        perf.record_completed(np.array([0, 0, 0]), second)
+    report = _phase_reports(caplog)[-1]
+    stats = report["phases"]["mixed"]
+    assert report["steps"] == stats["steps"] == 2
+    assert report["first_submit_unix_s"] <= report["last_completed_unix_s"]
+    assert stats["target_tokens"] == 18
+    assert stats["emitted_tokens"] == 3
+    assert stats["target_split_known_steps"] == 1
+    assert stats["prefill_target_tokens"] == 5
+    assert stats["decode_target_tokens"] == 4
+    assert stats["scheduled_draft_tokens"] == 4
+    assert stats["spec_target_tokens"] == 3  # Partial window, not MTP3 x 4.
+    assert stats["spec_target_known_rows"] == 1
+    assert stats["accepted_output_hist"] == {"2": 1}
+    assert stats["context_max_steps"] == {"0": 1, "4096": 1}
+    assert stats["q_context_known_rows"] == 3
+    assert stats["prefill_attention_work_proxy"] == 515
+    assert stats["attention_work_proxy"] == 10131
+
+
+def test_prefill_paths_and_timings_distinguish_dispatches_from_samples(perf, caplog, monkeypatch):
+    perf._READY = True
+    batch = types.SimpleNamespace(is_prefilling_np=np.array([True]))
+    token = perf.timing_start("prepare_attn_host", next_step=True)
+    first = perf.note_step(None, 8, 1, batch=batch)
+    perf.timing_end(token, step=first)
+    state = types.SimpleNamespace(
+        shape=(128, 12, 128, 128),
+        dtype="torch.float32",
+        stride=lambda: (196608, 16384, 128, 1),
+    )
+    perf.prefill_dispatch("fused_chunk", 8, 1, state)
+    token = perf.timing_start("prefill_compute_submit_host")
+    perf.timing_end(token)
+    monkeypatch.setattr(perf, "_SUBMITTED_STEPS", 6)
+    second = perf.note_step(None, 10, 1, batch=batch)
+    assert not perf.timing_active()
+    assert perf.timing_start("prefill_compute_submit_host") is None
+
+    class NoSampleInspection:
+        @property
+        def shape(self):
+            raise AssertionError("unsampled state metadata should not be read")
+
+    perf.prefill_dispatch("fused_chunk", 10, 1, NoSampleInspection())
+    with caplog.at_level(logging.INFO):
+        perf.record_completed(np.array([0]), second)
+    report = _phase_reports(caplog)[-1]
+    branch = report["prefill_paths"]["prefill"]["fused_chunk"]
+    assert branch["calls"] == 2
+    assert branch["layer_target_tokens"] == 18
+    assert branch["layer_request_rows"] == 2
+    assert branch["state_layout_examples"] == [{
+        "shape": [128, 12, 128, 128],
+        "stride": [196608, 16384, 128, 1],
+        "dtype": "torch.float32",
+    }]
+    assert report["host_timings"]["prefill_compute_submit_host"]["prefill"]["samples"] == 1
+    assert report["host_timings"]["prepare_attn_host"]["prefill"]["sampled_steps"] == 1

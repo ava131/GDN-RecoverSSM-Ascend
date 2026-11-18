@@ -11,19 +11,38 @@ import atexit
 import functools
 import hashlib
 import json
+import os
 import threading
 import time
-from collections import Counter
+from bisect import bisect_left
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 from vllm.logger import init_logger
 
 from .metrics_math import padding_fraction
 
 logger = init_logger("vllm.gdn_recoverssm_ascend.perf")
-PATCH_ID = "ascendc-op-dev-v2-mixed-fused"
+PATCH_ID = "ascendc-op-dev-v2-perf-evidence"
 REPORT_STEPS = 200
+TIMING_SAMPLE_BLOCK = 64
+TIMING_FIRST_STEPS = 3
+_CONTEXT_BUCKETS = (0, 1024, 4096, 8192, 16384, 32768, 65536)
+_CONTEXT_LABELS = (*map(str, _CONTEXT_BUCKETS), ">65536")
+_TIMING_SCOPES = {
+    "prepare_attn_host": "native metadata and recovery step preparation on the worker host",
+    "mixed_preflight_host": "mixed layer eligibility checks on the worker host",
+    "mixed_verify_submit_host": "mixed verify binding checks and submission on the worker host",
+    "prefill_state_load_host": "native prefill state load call",
+    "prefill_compute_submit_host": "native prefill compute call",
+    "prefill_state_store_host": "native prefill state store call",
+    "fullgraph_submit_host": "native graph update and replay submission call",
+    "sampler_filter_host": "plugin top-k/top-p filter call",
+    "output_get_wall": "native output get, including its existing copy wait and serialization",
+    "grouped_commit_host": "grouped recovery preparation and submission on the worker host",
+}
 _INSTALLED = False
 _READY = False
 _RANK = 0
@@ -33,8 +52,19 @@ _COUNTS = Counter()
 _GRAPHS = Counter()
 _BATCHES = Counter()
 _ACCEPTED = Counter()
+_PHASES = defaultdict(Counter)
+_PHASE_ACCEPTED = defaultdict(Counter)
+_PHASE_CONTEXT = defaultdict(Counter)
+_PHASE_GRAPHS = defaultdict(Counter)
+_PHASE_COMMITS = defaultdict(Counter)
+_HOST_TIMINGS = {}
+_PREFILL_DISPATCH = {}
+_SUBMITTED_STEPS = 0
 _START = None
+_FIRST_SUBMIT_UNIX = None
+_LAST_COMPLETED_UNIX = None
 _LAST_CONFIG = None
+_SOURCE_FINGERPRINT = None
 _IDLE_THREAD = None
 _LAST_OUTPUT_AT = None
 _LAST_REPORTED_STEPS = 0
@@ -50,11 +80,19 @@ class StepSnapshot:
     context_sum: int = 0
     context_max: int = 0
     context_rows: int = 0
+    prefill_rows: int | None = None
+    prefill_tokens: int | None = None
+    spec_tokens: int | None = None
+    attention_work: int | None = None
+    prefill_attention_work: int | None = None
+    scheduled_drafts: int | None = None
+    step_id: int = 0
+    timing_sampled: bool = False
 
 
 def _cpu_array(value):
     # Never convert an unknown Tensor: numpy/cpu/item can synchronize the NPU.
-    return value if hasattr(value, "__array_interface__") else None
+    return value if isinstance(value, np.ndarray) and value.ndim == 1 else None
 
 
 def _enabled():
@@ -68,6 +106,8 @@ def launch_manifest(worker):
     scheduler = config.scheduler_config
     compilation = config.compilation_config
     cache = config.cache_config
+    parallel = config.parallel_config
+    transfer = getattr(config, "kv_transfer_config", None)
     return {
         "max_num_seqs": scheduler.max_num_seqs,
         "max_num_batched_tokens": scheduler.max_num_batched_tokens,
@@ -79,7 +119,17 @@ def launch_manifest(worker):
         "enforce_eager": config.model_config.enforce_eager,
         "max_model_len": config.model_config.max_model_len,
         "dtype": str(config.model_config.dtype),
-        "tp": config.parallel_config.tensor_parallel_size,
+        "tp": parallel.tensor_parallel_size,
+        "dp": getattr(parallel, "data_parallel_size", 1),
+        "dp_rank": getattr(parallel, "data_parallel_rank", 0),
+        "pp": getattr(parallel, "pipeline_parallel_size", 1),
+        "pcp": getattr(parallel, "prefill_context_parallel_size", 1),
+        "dcp": getattr(parallel, "decode_context_parallel_size", 1),
+        "chunked_prefill": getattr(scheduler, "enable_chunked_prefill", None),
+        "long_prefill_token_threshold": getattr(scheduler, "long_prefill_token_threshold", None),
+        "kv_transfer_configured": transfer is not None,
+        "kv_transfer_role": getattr(transfer, "kv_role", None),
+        "kv_connector": getattr(transfer, "kv_connector", None),
         "num_speculative_tokens": config.num_speculative_tokens,
         "prefix_caching": cache.enable_prefix_caching,
         "mamba_cache_mode": cache.mamba_cache_mode,
@@ -96,16 +146,18 @@ def _fingerprint(manifest):
 
 
 def configure(worker):
-    global _READY, _RANK, _LAST_CONFIG
+    global _READY, _RANK, _LAST_CONFIG, _LATEST, _SOURCE_FINGERPRINT
     _READY = False
+    _LATEST = None
     _RANK = int(getattr(worker, "rank", 0))
     manifest = launch_manifest(worker)
     _LAST_CONFIG = manifest
+    _SOURCE_FINGERPRINT = source_fingerprint()
     logger.info(
         "GDN_CONFIG patch=%s rank=%d source_fingerprint=%s fingerprint=%s parameters=%s",
         PATCH_ID,
         _RANK,
-        source_fingerprint(),
+        _SOURCE_FINGERPRINT,
         _fingerprint(manifest),
         json.dumps(manifest, sort_keys=True, default=str),
     )
@@ -150,32 +202,153 @@ def _shutdown_reporting():
     report()
 
 
+def _sample_timing(step_id):
+    if step_id <= TIMING_FIRST_STEPS:
+        return step_id > 0
+    block, offset = divmod(step_id - 1, TIMING_SAMPLE_BLOCK)
+    # A fixed offset in each block could always miss a phase in a periodic
+    # workload. Vary it deterministically without a random-number generator.
+    return offset == ((block * 2654435761) >> 26) % TIMING_SAMPLE_BLOCK
+
+
+def timing_active(step=None):
+    if not _READY or _RANK != 0:
+        return False
+    snapshot = _LATEST if step is None else step
+    return snapshot is not None and snapshot.timing_sampled
+
+
+def timing_start(stage, phase=None, *, step=None, next_step=False):
+    """Read a host clock on sampled submission steps only."""
+    if next_step:
+        if not _READY or _RANK != 0 or not _sample_timing(_SUBMITTED_STEPS + 1):
+            return None
+        return stage, phase or "unknown", _SUBMITTED_STEPS + 1, time.perf_counter_ns()
+    snapshot = _LATEST if step is None else step
+    if not timing_active(snapshot):
+        return None
+    return stage, phase or snapshot.phase, snapshot.step_id, time.perf_counter_ns()
+
+
+def timing_end(token, *, step=None):
+    if token is None:
+        return
+    stage, phase, step_id, start_ns = token
+    duration_ns = time.perf_counter_ns() - start_ns
+    if step is not None:
+        if step.step_id != step_id:
+            return
+        phase = step.phase
+    with _LOCK:
+        stats = _HOST_TIMINGS.get((stage, phase))
+        if stats is None:
+            stats = _HOST_TIMINGS[stage, phase] = {
+                "samples": 0,
+                "sampled_steps": 0,
+                "sum_ns": 0,
+                "max_ns": 0,
+                "last_step_id": 0,
+            }
+        if stats["last_step_id"] != step_id:
+            stats["sampled_steps"] += 1
+            stats["last_step_id"] = step_id
+        stats["samples"] += 1
+        stats["sum_ns"] += duration_ns
+        stats["max_ns"] = max(stats["max_ns"], duration_ns)
+
+
+def prefill_dispatch(path, tokens, rows, state):
+    """Count layer calls and capture examples of their host cache layout."""
+    if not _READY or _RANK != 0 or _LATEST is None:
+        return
+    key = _LATEST.phase, path
+    with _LOCK:
+        counts = _PREFILL_DISPATCH.get(key)
+        if counts is None:
+            counts = _PREFILL_DISPATCH[key] = {
+                "calls": 0, "layer_target_tokens": 0, "layer_request_rows": 0,
+                "token_known_calls": 0, "row_known_calls": 0, "state_layout_examples": [],
+            }
+        counts["calls"] += 1
+        if isinstance(tokens, (int, np.integer)):
+            counts["layer_target_tokens"] += int(tokens)
+            counts["token_known_calls"] += 1
+        if isinstance(rows, (int, np.integer)):
+            counts["layer_request_rows"] += int(rows)
+            counts["row_known_calls"] += 1
+        layouts = counts["state_layout_examples"]
+        if state is not None and len(layouts) < 4 and (
+            not layouts or _LATEST.timing_sampled
+        ):
+            layout = {
+                "shape": [int(x) for x in state.shape],
+                "stride": [int(x) for x in state.stride()],
+                "dtype": str(state.dtype),
+            }
+            if layout not in layouts:
+                layouts.append(layout)
+
+
 def note_step(spec_rows, num_tokens, num_reqs, *, batch=None):
     """Snapshot CPU-known batch-row indices before output-copy construction."""
-    global _LATEST, _START
+    global _LATEST, _START, _FIRST_SUBMIT_UNIX, _SUBMITTED_STEPS
+    num_tokens = int(num_tokens)
     num_reqs = int(num_reqs)
     phase, context_sum, context_max, context_rows = "unknown", 0, 0, 0
+    prefill_rows = prefill_tokens = spec_tokens = None
+    attention_work = prefill_attention_work = scheduled_drafts = None
     flags = _cpu_array(getattr(batch, "is_prefilling_np", None))
-    if flags is not None and len(flags) >= num_reqs:
-        prefill = int(flags[:num_reqs].sum())
-        phase = "decode" if prefill == 0 else (
-            "prefill" if prefill == num_reqs else "mixed"
+    if flags is not None and flags.dtype.kind == "b" and len(flags) >= num_reqs:
+        flags = flags[:num_reqs]
+        prefill_rows = int(flags.sum())
+        phase = "decode" if prefill_rows == 0 else (
+            "prefill" if prefill_rows == num_reqs else "mixed"
         )
+    else:
+        flags = None
     computed = _cpu_array(getattr(batch, "num_computed_tokens_np", None))
-    if computed is not None and len(computed) >= num_reqs and num_reqs:
+    if computed is not None and computed.dtype.kind in "iu" and len(computed) >= num_reqs and num_reqs:
         values = computed[:num_reqs]
         context_sum = int(values.sum())
         context_max = int(values.max())
         context_rows = num_reqs
+    rows = None if spec_rows is None else tuple(spec_rows)
+    if _READY and _RANK == 0:
+        draft_count = getattr(batch, "num_draft_tokens", None)
+        if isinstance(draft_count, (int, np.integer)) and draft_count >= 0:
+            scheduled_drafts = int(draft_count)
+        scheduled = _cpu_array(getattr(batch, "num_scheduled_tokens", None))
+        if (
+            scheduled is not None and len(scheduled) == num_reqs
+            and scheduled.dtype.kind in "iu" and int(scheduled.sum()) == num_tokens
+        ):
+            if flags is not None:
+                prefill_tokens = int(scheduled.sum(where=flags))
+            if rows and min(rows) >= 0 and max(rows) < num_reqs:
+                spec_tokens = int(scheduled[list(rows)].sum())
+            if context_rows and num_tokens:
+                query = scheduled.astype(np.int64, copy=False)
+                # Dense causal query/key pair estimate from the CPU mirror,
+                # excluding graph padding. Async scheduling may overestimate.
+                pairs = query * (2 * computed[:num_reqs].astype(np.int64, copy=False) + query + 1) // 2
+                attention_work = int(pairs.sum())
+                if flags is not None:
+                    prefill_attention_work = int(pairs.sum(where=flags))
+        _SUBMITTED_STEPS += 1
+    step_id = _SUBMITTED_STEPS
     _LATEST = StepSnapshot(
-        None if spec_rows is None else tuple(spec_rows),
-        int(num_tokens),
+        rows, num_tokens,
         num_reqs, phase, context_sum, context_max, context_rows,
+        prefill_rows, prefill_tokens, spec_tokens, attention_work,
+        prefill_attention_work, scheduled_drafts, step_id, _sample_timing(step_id),
     )
     if _READY:
         with _LOCK:
             if _START is None:
                 _START = time.monotonic()
+            if _FIRST_SUBMIT_UNIX is None:
+                _FIRST_SUBMIT_UNIX = time.time()
+    return _LATEST
 
 
 def host_commit(duration_us, group_count, launch_count, rows):
@@ -187,6 +360,14 @@ def host_commit(duration_us, group_count, launch_count, rows):
         _COUNTS["kernel_submissions"] += launch_count
         _COUNTS["commit_rows"] += rows
         _COUNTS["groups"] += group_count
+        if _RANK == 0:
+            stats = _PHASE_COMMITS[_LATEST.phase if _LATEST is not None else "unknown"]
+            stats["samples"] += 1
+            stats["sum_us"] += duration_us
+            stats["max_us"] = max(stats["max_us"], duration_us)
+            stats["kernel_submissions"] += launch_count
+            stats["rows"] += rows
+            stats["groups"] += group_count
 
 
 def observe_graph(desc, attn_metadata):
@@ -212,12 +393,48 @@ def observe_graph(desc, attn_metadata):
         _COUNTS["graph_actual_tokens"] += actual
         _COUNTS["graph_padded_tokens"] += max(captured - actual, 0)
         _COUNTS["graph_observed_steps"] += 1
+        if _RANK == 0:
+            graph = _PHASE_GRAPHS[_LATEST.phase if _LATEST is not None else "unknown"]
+            graph["observed_steps"] += 1
+            graph["actual_tokens"] += actual
+            graph["padded_tokens"] += max(captured - actual, 0)
+
+
+def _record_phase(step, emitted):
+    stats = _PHASES[step.phase]
+    stats["steps"] += 1
+    stats["emitted_tokens"] += emitted
+    stats["target_tokens"] += step.num_tokens
+    stats["request_rows"] += step.num_reqs
+    if step.scheduled_drafts is not None:
+        stats["scheduled_draft_tokens"] += step.scheduled_drafts
+        stats["scheduled_draft_known_steps"] += 1
+    if step.prefill_rows is not None:
+        stats["prefill_rows"] += step.prefill_rows
+        stats["prefill_rows_known_steps"] += 1
+    if step.prefill_tokens is not None:
+        stats["prefill_target_tokens"] += step.prefill_tokens
+        stats["decode_target_tokens"] += step.num_tokens - step.prefill_tokens
+        stats["target_split_known_steps"] += 1
+    if step.context_rows:
+        stats["context_known_rows"] += step.context_rows
+        stats["context_tokens_sum"] += step.context_sum
+        stats["context_tokens_max"] = max(stats["context_tokens_max"], step.context_max)
+        label = _CONTEXT_LABELS[bisect_left(_CONTEXT_BUCKETS, step.context_max)]
+        _PHASE_CONTEXT[step.phase][label] += 1
+    if step.attention_work is not None:
+        stats["attention_work_proxy"] += step.attention_work
+        stats["q_context_known_rows"] += step.context_rows
+    if step.prefill_attention_work is not None:
+        stats["prefill_attention_work_proxy"] += step.prefill_attention_work
+        stats["decode_attention_work_proxy"] += step.attention_work - step.prefill_attention_work
+        stats["q_context_split_known_steps"] += 1
 
 
 def record_completed(counts, step):
     """Called only after AsyncOutput.get_output's pre-existing copy-event wait."""
-    global _START, _LAST_OUTPUT_AT
-    if not _READY or counts is None or not hasattr(counts, "__array_interface__"):
+    global _START, _LAST_OUTPUT_AT, _LAST_COMPLETED_UNIX
+    if not _READY or _cpu_array(counts) is None:
         return
     # counts is the runner-owned NumPy array, not its device Tensor counterpart.
     with _LOCK:
@@ -225,7 +442,10 @@ def record_completed(counts, step):
             _START = time.monotonic()
         _LAST_OUTPUT_AT = time.monotonic()
         _COUNTS["output_steps"] += 1
-        _COUNTS["emitted_tokens"] += int(counts.sum())
+        emitted = int(counts.sum())
+        _COUNTS["emitted_tokens"] += emitted
+        if _RANK == 0:
+            _LAST_COMPLETED_UNIX = time.time()
         if step is not None:
             if not isinstance(step, StepSnapshot):
                 step = StepSnapshot(*step)  # Legacy tuple/mock compatibility.
@@ -238,25 +458,90 @@ def record_completed(counts, step):
             _COUNTS["context_known_rows"] += step.context_rows
             _COUNTS["context_tokens_max"] = max(_COUNTS["context_tokens_max"], step.context_max)
             _BATCHES[(step.phase, step.num_reqs)] += 1
+            if _RANK == 0:
+                _record_phase(step, emitted)
             if spec_rows is not None:
                 # These are CPU-owned completed outputs and CPU row identities.
                 # Reduce in NumPy rather than taking a Python scalar per row.
-                import numpy as np
-
                 rows = np.asarray(spec_rows, dtype=np.int64)
                 rows = rows[(rows >= 0) & (rows < len(counts))]
                 values = counts[rows]
+                spec_emitted = int(values.sum())
                 _COUNTS["spec_rows"] += int(values.size)
-                _COUNTS["spec_emitted_tokens"] += int(values.sum())
+                _COUNTS["spec_emitted_tokens"] += spec_emitted
                 _COUNTS["spec_rows_phase_" + step.phase] += int(values.size)
-                _COUNTS["spec_emitted_phase_" + step.phase] += int(values.sum())
+                _COUNTS["spec_emitted_phase_" + step.phase] += spec_emitted
                 unique, frequencies = np.unique(values, return_counts=True)
-                _ACCEPTED.update(dict(zip(map(int, unique), map(int, frequencies))))
+                histogram = dict(zip(map(int, unique), map(int, frequencies)))
+                _ACCEPTED.update(histogram)
+                if _RANK == 0:
+                    stats = _PHASES[step.phase]
+                    stats["spec_rows"] += int(values.size)
+                    stats["spec_emitted_tokens"] += spec_emitted
+                    if step.spec_tokens is not None and len(spec_rows) == values.size:
+                        stats["spec_target_tokens"] += step.spec_tokens
+                        stats["spec_target_known_rows"] += int(values.size)
+                    _PHASE_ACCEPTED[step.phase].update(histogram)
         emit = (
             _COUNTS["output_steps"] <= 3 or _COUNTS["output_steps"] % REPORT_STEPS == 0
         )
     if emit:
         report()
+
+
+def _phase_payload(elapsed, counts):
+    """Build the cumulative JSON while holding the snapshot lock."""
+    phases = {}
+    for phase, stats in sorted(_PHASES.items()):
+        phases[phase] = {
+            **stats,
+            "accepted_output_hist": dict(_PHASE_ACCEPTED.get(phase, {})),
+            "context_max_steps": dict(_PHASE_CONTEXT.get(phase, {})),
+        }
+    timings = defaultdict(dict)
+    for (stage, phase), stats in sorted(_HOST_TIMINGS.items()):
+        total_us = stats["sum_ns"] / 1000.0
+        timings[stage][phase] = {
+            "samples": stats["samples"],
+            "sampled_steps": stats["sampled_steps"],
+            "sample_total_us": round(total_us, 3),
+            "mean_us": round(total_us / stats["samples"], 3),
+            "max_us": stats["max_ns"] / 1000.0,
+        }
+    for phase, stats in sorted(_PHASE_COMMITS.items()):
+        timings["grouped_commit_host"][phase] = {
+            "samples": stats["samples"],
+            "sample_total_us": round(stats["sum_us"], 3),
+            "mean_us": round(stats["sum_us"] / stats["samples"], 3),
+            "max_us": round(stats["max_us"], 3),
+            "kernel_submissions": stats["kernel_submissions"],
+            "rows": stats["rows"],
+            "groups": stats["groups"],
+        }
+    dispatch = defaultdict(dict)
+    for (phase, path), stats in sorted(_PREFILL_DISPATCH.items()):
+        dispatch[phase][path] = {
+            **stats, "state_layout_examples": list(stats["state_layout_examples"]),
+        }
+    return {
+        "schema": 1,
+        "pid": os.getpid(),
+        "rank": _RANK,
+        "scope": "WORKER_CUMULATIVE_CPU_COMPLETED",
+        "host_timing_scope": "HOST_WALL_MAY_INCLUDE_NATIVE_WAIT_OR_IN_FLIGHT_STEPS",
+        "prefill_dispatch_scope": "HOST_LAYER_CALLS_NOT_DEVICE_GRAPH_EXECUTIONS",
+        "context_source": "CPU_INPUT_MIRROR_MAY_BE_OPTIMISTIC_WITH_ASYNC",
+        "first_submit_unix_s": _FIRST_SUBMIT_UNIX,
+        "last_completed_unix_s": _LAST_COMPLETED_UNIX,
+        "worker_window_s": round(elapsed, 6),
+        "steps": counts.get("output_steps", 0),
+        "emitted_tokens": counts.get("emitted_tokens", 0),
+        "unattributed_steps": counts.get("output_steps", 0) - counts.get("batch_snapshot_steps", 0),
+        "phases": phases,
+        "graph_submissions": {phase: dict(stats) for phase, stats in _PHASE_GRAPHS.items()},
+        "host_timings": dict(timings),
+        "prefill_paths": dict(dispatch),
+    }
 
 
 def report():
@@ -287,6 +572,7 @@ def report():
             if _START is None or _LAST_OUTPUT_AT is None
             else _LAST_OUTPUT_AT - _START
         )
+        phase_payload = _phase_payload(elapsed, c)
         _LAST_REPORTED_STEPS = c.get("output_steps", 0)
     spec_rows = c.get("spec_rows", 0)
     commits = c.get("commits", 0)
@@ -341,6 +627,7 @@ def report():
         json.dumps(ascendc_backend.counts(), sort_keys=True, separators=(",", ":")),
         json.dumps(mixed_forward.counters(), sort_keys=True, separators=(",", ":")),
     )
+    logger.info("GDN_PHASE_PERF json=%s", json.dumps(phase_payload, separators=(",", ":")))
 
 
 def install():
@@ -357,24 +644,25 @@ def install():
     @functools.wraps(original_init)
     def init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
-        if _enabled():
+        if _READY and _enabled():
             self._gdn_perf_step = _LATEST
             self._gdn_perf_reported = False
 
     @functools.wraps(original_get)
     def get_output(self, *args, **kwargs):
+        tracked = _READY and not getattr(self, "_gdn_perf_reported", True)
+        step = getattr(self, "_gdn_perf_step", None) if tracked else None
+        timer = timing_start("output_get_wall", step=step) if step is not None else None
         result = original_get(self, *args, **kwargs)
-        if _enabled() and not getattr(self, "_gdn_perf_reported", True):
+        if tracked:
             self._gdn_perf_reported = True
-            record_completed(
-                getattr(self, "num_sampled_tokens_np", None),
-                getattr(self, "_gdn_perf_step", None),
-            )
+            timing_end(timer)
+            record_completed(getattr(self, "num_sampled_tokens_np", None), step)
         return result
 
     @functools.wraps(original_warmup)
     def warmup(self, *args, **kwargs):
-        global _READY, _IDLE_THREAD
+        global _READY, _IDLE_THREAD, _LATEST
         result = original_warmup(self, *args, **kwargs)
         if _enabled():
             if not getattr(self, "_gdn_patch_prepared", False):
@@ -391,6 +679,7 @@ def install():
                     _LAST_CONFIG,
                     final,
                 )
+            _LATEST = None
             _READY = True
             if _RANK == 0 and _IDLE_THREAD is None:
                 _STOP_REPORTING.clear()
@@ -412,6 +701,22 @@ def install():
                 _fingerprint(final),
                 paths.get("verify_fused_model_calls", 0),
                 paths.get("verify_fused", 0),
+            )
+            logger.info(
+                "GDN_PHASE_PERF_CONFIG json=%s",
+                json.dumps({
+                    "schema": 1, "pid": os.getpid(), "rank": _RANK,
+                    "local_rank": getattr(self, "local_rank", None),
+                    "patch": PATCH_ID, "source_fingerprint": _SOURCE_FINGERPRINT,
+                    "launch_fingerprint": _fingerprint(final),
+                    "ready_unix_s": time.time(), "parameters": final,
+                    "workload_report_rank": 0,
+                    "timing_sample_block_steps": TIMING_SAMPLE_BLOCK,
+                    "timing_first_steps": TIMING_FIRST_STEPS,
+                    "timing_scopes": _TIMING_SCOPES,
+                    "timing_full_counter": "grouped_commit_host",
+                    "report_interval_completed_steps": REPORT_STEPS,
+                }, separators=(",", ":"), default=str),
             )
         return result
 

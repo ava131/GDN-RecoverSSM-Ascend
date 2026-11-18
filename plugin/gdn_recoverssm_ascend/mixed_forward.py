@@ -69,6 +69,15 @@ def mixed_preflight(layer, meta, mixed_qkv, a, b, core_out):
         _decline("native mixed spec metadata requires num_decodes=0")
         return None
 
+    from . import diagnostics
+
+    timer = diagnostics.timing_start("mixed_preflight_host")
+    result = _check_mixed_inputs(layer, meta, mixed_qkv, a, b, core_out)
+    diagnostics.timing_end(timer)
+    return result
+
+
+def _check_mixed_inputs(layer, meta, mixed_qkv, a, b, core_out):
     import torch
 
     spec = getattr(meta, "spec_token_indx", None)
@@ -140,8 +149,10 @@ def prepare_mixed_gates(layer, a, b, plan, native_gate, *, record=True):
 
 def verify_mixed_spec(layer, q, k, v, raw_a, raw_b, ssm_state):
     """Retain _verify's epoch/records checks and only replace preprocessing."""
+    from . import diagnostics
     from .layer_patch import _verify
 
+    timer = diagnostics.timing_start("mixed_verify_submit_host")
     output = _verify(
         layer,
         q.squeeze(0),
@@ -156,6 +167,7 @@ def verify_mixed_spec(layer, q, k, v, raw_a, raw_b, ssm_state):
             "raw_fused_scope": "mixed",
         },
     )
+    diagnostics.timing_end(timer)
     _COUNTS["verify_model_calls"] += 1
     return output.unsqueeze(0)
 
@@ -190,6 +202,68 @@ def _find_block(body, expected, label):
             f"GDN mixed core source contract {label}: expected one block, found {len(matches)}"
         )
     return matches[0]
+
+
+def _instrument_native_prefill(function, prefix):
+    """Bracket the original rc1 stages in place, with a safe skip on other source."""
+    pattern = _nodes("if fla_gdn_prefill_op is not None: pass")[0]
+    candidates = [
+        node for node in ast.walk(function)
+        if isinstance(node, ast.If) and _same(node.test, pattern.test)
+    ]
+    if len(candidates) != 1:
+        return False
+    choice = candidates[0]
+    if len(choice.orelse) != 1 or not isinstance(choice.orelse[0], ast.If):
+        return False
+    chunk = choice.orelse[0]
+    if not _same(chunk.test, ast.Name(id="use_fused_chunk", ctx=ast.Load())):
+        return False
+    stages = ("prefill_state_load_host", "prefill_compute_submit_host", "prefill_state_store_host")
+    branches = (
+        ("fla", choice.body, 1, "gather_ssm_states", "fla_gdn_prefill", "scatter_ssm_states_"),
+        ("fused_chunk", chunk.body, 1, "gather_ssm_states", "_chunk_gated_delta_rule_fused", "scatter_ssm_states_"),
+        ("triton_chunk", chunk.orelse, 2, "clear_ssm_states", "chunk_gated_delta_rule", None),
+    )
+
+    def calls(node, name):
+        return any(
+            isinstance(child, ast.Call)
+            and (getattr(child.func, "id", None) == name or getattr(child.func, "attr", None) == name)
+            for child in ast.walk(node)
+        )
+
+    for _, body, load_end, load_call, compute_call, store_call in branches:
+        if (
+            len(body) != load_end + 2
+            or not calls(body[load_end - 1], load_call)
+            or not calls(body[load_end], compute_call)
+            or (
+                not calls(body[-1], store_call) if store_call is not None
+                else not (
+                    isinstance(body[-1], ast.Assign)
+                    and _same(body[-1].targets[0], _nodes(
+                        "ssm_state[prefill_state_indices] = None"
+                    )[0].targets[0])
+                )
+            )
+        ):
+            return False
+    sampled = prefix + "_perf_sampled"
+    timer = prefix + "_perf_timer"
+    for path, body, load_end, *_ in branches:
+        instrumented = _nodes(f"{sampled} = {prefix}_perf_active()")
+        groups = (body[:load_end], body[load_end:load_end + 1], body[load_end + 1:])
+        for stage, original in zip(stages, groups):
+            instrumented.extend(_nodes(f"if {sampled}: {timer} = {prefix}_perf_start({stage!r})"))
+            instrumented.extend(original)
+            instrumented.extend(_nodes(f"if {sampled}: {prefix}_perf_end({timer})"))
+        instrumented.extend(_nodes(f"""
+            {prefix}_perf_prefill({path!r}, query_non_spec.shape[1],
+                                 prefill_state_indices.numel(), ssm_state)
+        """))
+        body[:] = instrumented
+    return True
 
 
 _PRE_CONV = "conv_weights_T = _get_packed_conv_weights(self)"
@@ -307,6 +381,7 @@ def build_mixed_core(original_core):
 
     digest = hashlib.sha256(source.encode()).hexdigest()
     prefix = "_gdn_recoverssm_mixed_" + digest[:16]
+    prefill_diagnostics = _instrument_native_prefill(function, prefix)
     bindings = {
         prefix + "_preflight": mixed_preflight,
         prefix + "_qkv": None,  # resolved only after source validation below
@@ -314,6 +389,15 @@ def build_mixed_core(original_core):
         prefix + "_verify": verify_mixed_spec,
         prefix + "_merge": merge_mixed_output,
     }
+    if prefill_diagnostics:
+        from . import diagnostics
+
+        bindings.update({
+            prefix + "_perf_active": diagnostics.timing_active,
+            prefix + "_perf_start": diagnostics.timing_start,
+            prefix + "_perf_end": diagnostics.timing_end,
+            prefix + "_perf_prefill": diagnostics.prefill_dispatch,
+        })
     from .spec_forward import _packed_qkv_views
 
     bindings[prefix + "_qkv"] = _packed_qkv_views
@@ -371,6 +455,7 @@ def build_mixed_core(original_core):
     functools.update_wrapper(adapted, original_core)
     adapted._gdn_mixed_source_digest = digest
     adapted._gdn_mixed_generated_digest = hashlib.sha256(generated.encode()).hexdigest()
+    adapted._gdn_prefill_diagnostics = prefill_diagnostics
     adapted._gdn_mixed_patch_counts = {
         "preflight": 1, "spec_qkv": 1, "gates": 1, "spec_verify": 1, "merge": 1,
     }

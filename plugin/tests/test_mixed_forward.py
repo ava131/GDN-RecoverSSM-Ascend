@@ -1004,6 +1004,32 @@ def test_later_native_global_redirect_is_visible_to_transformed_core(runtime):
     assert core.__globals__ is runtime.original.__globals__
 
 
+def test_sampled_prefill_observes_native_fallback_and_keeps_tensors(runtime, monkeypatch):
+    diagnostics = importlib.import_module(runtime.module.__package__ + ".diagnostics")
+    spans = []
+    dispatches = []
+    monkeypatch.setattr(diagnostics, "timing_active", lambda: True)
+    monkeypatch.setattr(diagnostics, "timing_start", lambda stage: stage)
+    monkeypatch.setattr(diagnostics, "timing_end", spans.append)
+    monkeypatch.setattr(diagnostics, "prefill_dispatch", lambda *values: dispatches.append(values))
+    adapted = runtime.module.build_mixed_core(runtime.original)
+    assert adapted._gdn_prefill_diagnostics
+    owned = runtime.case()
+    runtime.run(adapted, owned)
+    assert [stage for stage in spans if stage.startswith("prefill_")] == [
+        "prefill_state_load_host", "prefill_compute_submit_host", "prefill_state_store_host",
+    ]
+    [(path, tokens, rows, state)] = dispatches
+    assert (path, tokens, rows) == (
+        "triton_chunk", owned.non_tokens, owned.meta.prefill_state_indices.numel(),
+    )
+    assert state is owned.layer.kv_cache[1]
+    baseline = runtime.case()
+    runtime.run(runtime.original, baseline)
+    torch.testing.assert_close(owned.out, baseline.out)
+    torch.testing.assert_close(state, baseline.layer.kv_cache[1])
+
+
 @pytest.mark.parametrize("change", ["missing_gate", "duplicate_qkv"])
 def test_source_abi_mismatch_fails_before_runtime(runtime, change):
     source = _NATIVE_CORE

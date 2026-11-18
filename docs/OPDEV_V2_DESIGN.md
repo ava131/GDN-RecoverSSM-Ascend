@@ -12,7 +12,7 @@ comment from gpt
 
 **2026-11-18 修正：首版 v2 `e132137` 的融合检查错误要求 dt_bias 为 FP32，标准 BF16 Qwen 加载路径会因此拒绝融合。已支持直接读取 BF16/FP32 bias，保留原 Parameter；启动自检也补齐真实混合精度。融合路径另改为直接使用 packed QKV views，删除 native rearrange 的整段副本。问题、证据和收益边界见 [本轮复查](OPDEV_V2_NO_GAIN_REVIEW_20261118.md)。**
 
-**后续mixed覆盖已实现，见 [mixed batch接入说明](OPDEV_V2_MIXED_BATCH.md)。下文是首轮窗口/算子设计，最新PATCH_ID为`ascendc-op-dev-v2-mixed-fused`，完整CPU套件350项。**
+**混批覆盖见 [mixed batch 接入说明](OPDEV_V2_MIXED_BATCH.md)，最新采集方式见 [性能证据与场景](GDN_PERF_EVIDENCE_AND_SCENARIOS.md)。下文保留首轮窗口与算子设计。**
 
 ## 2. 稳定版保留了什么
 

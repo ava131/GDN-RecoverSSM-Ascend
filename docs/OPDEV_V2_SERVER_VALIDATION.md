@@ -21,7 +21,7 @@ python -m pip install -e ./plugin --no-deps
 
 在server日志中保留这些行：
 
-- `GDN_CONFIG patch=ascendc-op-dev-v2-mixed-fused`：最新mixed接入版，配置快照、source fingerprint、启动参数指纹。此前 `ascendc-op-dev-v2-bf16-bias-qkv-views` 只覆盖pure-spec；首版 `ascendc-op-dev-v2-window-fused` 还有BF16 bias拒绝融合的问题。
+- `GDN_CONFIG patch=ascendc-op-dev-v2-perf-evidence` 带配置快照、源码与启动参数指纹。该版沿用 `ascendc-op-dev-v2-mixed-fused` 的混批路径，并增加 [性能证据采集与脚本](GDN_PERF_EVIDENCE_AND_SCENARIOS.md)。再早的 `ascendc-op-dev-v2-bf16-bias-qkv-views` 只覆盖 pure-spec。
 - `GDN_ASCENDC loaded`：实际加载的库、build fingerprint、是否命中缓存及算子入口。
 - `GDN_PREPARED_CONTEXT`：实际state dtype、shape、stride、record key dtype、records字节数。这里的数字比配置摘要更直接。
 - `GDN_ASCENDC_SELFTEST`及现有grouped/conv自检结果：启动时在自有缓冲中验证，失败应阻止ready，不能当成运行中fallback理由。修正版应包含 `dt_bias=fp32,bf16 bias_storage_promotion=PASS`。

@@ -30,6 +30,7 @@ without executing a model forward.
 from __future__ import annotations
 
 import functools
+import json
 import math
 import os
 from importlib.metadata import PackageNotFoundError, version
@@ -58,11 +59,17 @@ def install() -> None:
         # KV cache is bound by initialize_from_config, which runs before this
         # method; if it is not bound the preparation must fail the startup
         # instead of silently deferring to the first request.
+        enabled = feature_enabled(getattr(self, "vllm_config", None))
+        if enabled:
+            _log_memory(self, "kv_bound_before_prepare")
         _prepare(self)
+        if enabled:
+            _log_memory(self, "prepared_before_native_warmup")
         result = original(self, *args, **kwargs)
         if feature_enabled(getattr(self, "vllm_config", None)):
             for builder in _iter_builders(getattr(self, "model_runner", None)):
                 builder._gdn_serving_ready = True
+            _log_memory(self, "after_native_warmup")
         return result
 
     NPUWorker.compile_or_warm_up_model = compile_or_warm_up_model
@@ -84,6 +91,13 @@ def install() -> None:
         reserve = _record_scratch_bytes(config)
         margin = _graph_margin_bytes(config)
         total = reserve + margin
+        adjusted = max(available - total, 0)
+        self._gdn_perf_kv_budget = {
+            "native_available_bytes": int(available),
+            "adjusted_available_bytes": int(adjusted),
+            "record_reserve_bytes": reserve,
+            "transient_reserve_bytes": margin,
+        }
         if not total:
             return available
         logger.info(
@@ -100,13 +114,73 @@ def install() -> None:
             max(available - total, 0) / (1024**3),
             _MARGIN_ENV,
         )
-        return max(available - total, 0)
+        return adjusted
 
     NPUWorker.determine_available_memory = determine_available_memory
     _APPLIED = True
 
 
 _MARGIN_ENV = "GDN_RECOVERSSM_KV_MARGIN_MB"
+
+
+def _describe_kv_plan(kv_plan):
+    if kv_plan is None:
+        return {"kv_plan_status": "unavailable"}
+    groups = []
+    for index, group in enumerate(kv_plan.kv_cache_groups):
+        spec = group.kv_cache_spec
+        groups.append({
+            "group": index,
+            "layers": len(group.layer_names),
+            "spec": type(spec).__name__,
+            "block_tokens": spec.block_size,
+            "page_bytes": spec.page_size_bytes,
+            "speculative_blocks": getattr(spec, "num_speculative_blocks", None),
+            "cache_dtype": str(getattr(spec, "dtypes", getattr(spec, "dtype", None))),
+        })
+    return {
+        "kv_blocks": kv_plan.num_blocks,
+        "kv_plan_tensor_bytes": sum(tensor.size for tensor in kv_plan.kv_cache_tensors),
+        "kv_groups": groups,
+    }
+
+
+def _log_memory(worker, phase):
+    """Log allocator bookkeeping and the native KV plan at startup only."""
+    import torch
+
+    runner = getattr(worker, "model_runner", None)
+    try:
+        plan = _describe_kv_plan(getattr(runner, "kv_cache_config", None))
+    except (AttributeError, TypeError, ValueError, NotImplementedError) as exc:
+        plan = {"kv_plan_status": type(exc).__name__}
+    allocator = {}
+    stats_fn = getattr(getattr(torch, "npu", None), "memory_stats", None)
+    if stats_fn is not None and getattr(worker, "device", None) is not None:
+        try:
+            stats = stats_fn(worker.device)
+            allocator = {
+                key: stats.get(key)
+                for key in (
+                    "allocated_bytes.all.current", "allocated_bytes.all.peak",
+                    "reserved_bytes.all.current", "reserved_bytes.all.peak",
+                )
+            }
+        except (RuntimeError, TypeError, AttributeError, NotImplementedError) as exc:
+            allocator = {"status": type(exc).__name__}
+    logger.info(
+        "GDN_MEMORY json=%s",
+        json.dumps({
+            "schema": 1,
+            "pid": os.getpid(),
+            "rank": int(getattr(worker, "rank", 0)),
+            "phase": phase,
+            "scope": "STARTUP_PYTORCH_ALLOCATOR_PEAK_SINCE_LAST_NATIVE_RESET",
+            "allocator_bytes": allocator,
+            "kv_budget_bytes": getattr(worker, "_gdn_perf_kv_budget", None),
+            **plan,
+        }, separators=(",", ":"), default=str),
+    )
 
 
 def feature_enabled(config) -> bool:
@@ -322,6 +396,7 @@ def _check_mixed_adapters(worker, builders) -> None:
     if registry is None or not names:
         raise RuntimeError("GDN mixed adapter cannot resolve the actual model layers")
     sources = {}
+    observed_prefill_layers = 0
     for name in names:
         layer = registry.get(name)
         method = getattr(layer, "_forward_core", None)
@@ -341,12 +416,13 @@ def _check_mixed_adapters(worker, builders) -> None:
         ):
             raise RuntimeError(f"GDN mixed adapter has an incomplete patch contract: {name}")
         sources[digest] = sources.get(digest, 0) + 1
+        observed_prefill_layers += bool(getattr(adapter, "_gdn_prefill_diagnostics", False))
     logger.info(
         "GDN_MIXED_ADAPTER READY layers=%d native_source_digests=%s "
         "patches=preflight,spec_qkv,gates,spec_verify,merge "
-        "non_spec_native=preserved capture_policy=unchanged "
+        "non_spec_native=preserved capture_policy=unchanged prefill_observation_layers=%d "
         "scope=BOUND_METHOD_CHECK_NOT_DEVICE_TIMING",
-        len(names), sources,
+        len(names), sources, observed_prefill_layers,
     )
 
 

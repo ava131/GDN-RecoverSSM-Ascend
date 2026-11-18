@@ -87,7 +87,9 @@ def _adapter(original):
         global _FIRST_CALL
         if not _enabled():
             return original(logits, k, p)
-        if _FIRST_CALL and (k is not None or p is not None):
+        if k is None and p is None:
+            return logits
+        if _FIRST_CALL:
             _FIRST_CALL = False
             logger.info(
                 "GDN_SAMPLER active rows=%d vocab=%d row_tile=%d "
@@ -98,7 +100,12 @@ def _adapter(original):
                 "values-only" if _SORT_VALUES is not None else "bounded-sort",
                 FILTER_WORKING_BYTES,
             )
-        return filter_logits(logits, k, p, sort_values=_SORT_VALUES)
+        from . import diagnostics
+
+        timer = diagnostics.timing_start("sampler_filter_host")
+        result = filter_logits(logits, k, p, sort_values=_SORT_VALUES)
+        diagnostics.timing_end(timer)
+        return result
 
     return apply
 
