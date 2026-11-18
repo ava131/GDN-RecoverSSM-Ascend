@@ -719,6 +719,9 @@ def test_startup_preparation_runs_before_warmup(monkeypatch):
     )
     monkeypatch.setattr(startup_patch, "_log_context_geometry", lambda *args: 0)
     monkeypatch.setattr(startup_patch, "_log_versions", lambda: None)
+    # This test isolates commit-context preparation. Bound-method validation
+    # has separate tests using a model layer registry and real adapter markers.
+    monkeypatch.setattr(startup_patch, "_check_mixed_adapters", lambda *args: None)
     monkeypatch.setattr(startup_patch, "_SELFTEST_DONE", True)
     from gdn_recoverssm_ascend import ascendc_backend
 

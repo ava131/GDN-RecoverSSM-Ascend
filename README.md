@@ -14,6 +14,8 @@
 
 同日新增server日志已审查：融合已有模型入口证据，下一优化重点是mixed中的spec子集与输出合并，见 [最新日志复查](docs/OPDEV_V2_ISSUE4_LOG_REVIEW_20261118.md)。
 
+该mixed接入现已在op-dev-v2实现，复用现有AC核并删除整块输出副本；PD融合部署继续使用原参数。实现与验证见 [mixed batch接入说明](docs/OPDEV_V2_MIXED_BATCH.md)。
+
 ## 执行路径
 
 ```text

@@ -173,8 +173,11 @@ def test_workload_uses_completed_snapshot_and_cpu_context(perf, caplog):
     assert perf._COUNTS["context_tokens_sum"] == 24000
     assert perf._COUNTS["context_tokens_max"] == 23000
     assert perf._COUNTS["peak_request_rows"] == 2
+    assert perf._COUNTS["spec_rows_phase_mixed"] == 1
+    assert perf._COUNTS["spec_emitted_phase_mixed"] == 4
     assert 'accepted_output_hist={"4":1}' in caplog.text
     assert "mean_computed_context=12000.0" in caplog.text
+    assert 'spec_phase_hist={"mixed":{"rows":1,"emitted":4}}' in caplog.text
     assert "HOST_DISPATCH_COUNTS_NOT_GRAPH_EXECUTIONS" in caplog.text
 
 

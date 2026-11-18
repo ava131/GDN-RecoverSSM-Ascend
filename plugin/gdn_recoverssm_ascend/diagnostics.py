@@ -22,7 +22,7 @@ from vllm.logger import init_logger
 from .metrics_math import padding_fraction
 
 logger = init_logger("vllm.gdn_recoverssm_ascend.perf")
-PATCH_ID = "ascendc-op-dev-v2-bf16-bias-qkv-views"
+PATCH_ID = "ascendc-op-dev-v2-mixed-fused"
 REPORT_STEPS = 200
 _INSTALLED = False
 _READY = False
@@ -248,6 +248,8 @@ def record_completed(counts, step):
                 values = counts[rows]
                 _COUNTS["spec_rows"] += int(values.size)
                 _COUNTS["spec_emitted_tokens"] += int(values.sum())
+                _COUNTS["spec_rows_phase_" + step.phase] += int(values.size)
+                _COUNTS["spec_emitted_phase_" + step.phase] += int(values.sum())
                 unique, frequencies = np.unique(values, return_counts=True)
                 _ACCEPTED.update(dict(zip(map(int, unique), map(int, frequencies))))
         emit = (
@@ -272,6 +274,14 @@ def report():
             for (phase, rows), steps in sorted(_BATCHES.items())
         ]
         accepted = dict(sorted(_ACCEPTED.items()))
+        spec_phases = {
+            phase: {
+                "rows": c.get("spec_rows_phase_" + phase, 0),
+                "emitted": c.get("spec_emitted_phase_" + phase, 0),
+            }
+            for phase in ("prefill", "decode", "mixed", "unknown")
+            if c.get("spec_rows_phase_" + phase, 0)
+        }
         elapsed = (
             0.0
             if _START is None or _LAST_OUTPUT_AT is None
@@ -308,7 +318,7 @@ def report():
         "GDN_WORKLOAD steps=%d batch_snapshot_steps=%d mean_rows=%.4f peak_rows=%d "
         "mean_gdn_rows=%.4f mean_commit_rows=%.4f target_tokens=%d "
         "mean_computed_context=%.1f max_computed_context=%d context_known_rows=%d "
-        "accepted_output_hist=%s batch_hist=%s "
+        "spec_phase_hist=%s accepted_output_hist=%s batch_hist=%s "
         "context_source=CPU_INPUT_MIRROR_MAY_BE_OPTIMISTIC_WITH_ASYNC "
         "scope=WORKER_CUMULATIVE_CPU_COMPLETED not_client_duration=1",
         c.get("output_steps", 0), snapshot_steps,
@@ -319,15 +329,17 @@ def report():
         c.get("actual_target_tokens", 0) if snapshot_steps else -1,
         c.get("context_tokens_sum", 0) / context_rows if context_rows else -1.0,
         c.get("context_tokens_max", 0) if context_rows else -1,
-        context_rows, json.dumps(accepted, separators=(",", ":")),
+        context_rows, json.dumps(spec_phases, separators=(",", ":")),
+        json.dumps(accepted, separators=(",", ":")),
         json.dumps(batches, separators=(",", ":")),
     )
-    from . import ascendc_backend
+    from . import ascendc_backend, mixed_forward
 
     logger.info(
         "GDN_PATHS counts=%s scope=HOST_DISPATCH_COUNTS_NOT_GRAPH_EXECUTIONS "
-        "graph_replay_does_not_run_python=1 device_scalar_reads=0 timing_events=0",
+        "graph_replay_does_not_run_python=1 device_scalar_reads=0 timing_events=0 mixed=%s",
         json.dumps(ascendc_backend.counts(), sort_keys=True, separators=(",", ":")),
+        json.dumps(mixed_forward.counters(), sort_keys=True, separators=(",", ":")),
     )
 
 

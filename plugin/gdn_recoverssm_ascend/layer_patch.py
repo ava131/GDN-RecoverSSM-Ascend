@@ -190,9 +190,26 @@ def install() -> None:
 
         # -------------------------------------------------------- forward hook
         original_core = cls._forward_core
+        from .mixed_forward import UnsupportedCoreError, build_mixed_core
+
+        mixed_core = None
+        mixed_error = None
+        try:
+            mixed_core = build_mixed_core(original_core)
+        except UnsupportedCoreError as exc:
+            # The real class can still expose the vLLM GPU donor at this import
+            # point. The worker subsequently copies the Ascend donor wrapper.
+            # Startup checks the methods bound to the actual model layers.
+            mixed_error = str(exc)
+            logger.debug(
+                "GDN_MIXED_ADAPTER candidate=%s status=unsupported reason=%s",
+                cls.__name__, mixed_error,
+            )
 
         @functools.wraps(original_core)
-        def _forward_core(self, *args, _original=original_core, **kwargs):
+        def _forward_core(
+            self, *args, _original=original_core, _mixed=mixed_core, **kwargs
+        ):
             depth = _push_layer(self)
             try:
                 # The pinned native ABI has four tensor arguments. Older/mock
@@ -208,10 +225,14 @@ def install() -> None:
 
                     if try_spec_forward(self, *args, **kwargs):
                         return None
+                    if _mixed is not None:
+                        return _mixed(self, *args, **kwargs)
                 return _original(self, *args, **kwargs)
             finally:
                 _pop_layer(depth)
 
+        _forward_core._gdn_mixed_core = mixed_core
+        _forward_core._gdn_mixed_error = mixed_error
         cls._forward_core = _forward_core
 
     real_cls.__name__ = real_cls.__name__  # keep linters quiet about the alias
@@ -484,6 +505,7 @@ def _verify(layer, q, k, v, ssm_state, kwargs, out=None):
             kv_cache[1], records, query_start_loc, checkpoint_indices,
             spec_query_len=layer.num_spec + 1,
             scale=kwargs.get("scale"), out=out,
+            scope=kwargs.get("raw_fused_scope", "pure_spec"),
         )
         return out.squeeze(0)
 

@@ -247,7 +247,7 @@ def assert_ready():
     )
 
 
-def can_fuse_verify(layer, mixed_qkv, a, b, *, meta=None, out=None):
+def can_fuse_verify(layer, mixed_qkv, a, b, *, meta=None, out=None, num_tokens=None):
     """Host-only eligibility, evaluated before convolution changes its history."""
     if not _ENABLED or _OPS is None:
         return _no_fusion("AscendC not initialized")
@@ -308,7 +308,11 @@ def can_fuse_verify(layer, mixed_qkv, a, b, *, meta=None, out=None):
     if out.ndim != 3:
         return _no_fusion("output rank")
     rows = min(int(getattr(meta, "num_spec_decodes", 0)), qsl.numel() - 1)
-    actual = int(getattr(meta, "num_actual_tokens", -1))
+    # A mixed batch's metadata counts prefill and spec tokens together. The
+    # mixed adapter supplies the host-known size of its spec token index view.
+    actual = int(
+        getattr(meta, "num_actual_tokens", -1) if num_tokens is None else num_tokens
+    )
     if (
         qsl.dtype != torch.int32
         or indices.dtype != torch.int32
@@ -396,12 +400,15 @@ def launch_fused_verify(
     spec_query_len,
     scale=None,
     out=None,
+    scope="pure_spec",
 ):
     """Raw-input AC entry point. A failure is fatal; never retry after conv."""
     import torch
 
     if not _ENABLED or _OPS is None:
         raise RuntimeError("GDN fused verify was not initialized")
+    if scope not in ("pure_spec", "mixed"):
+        raise ValueError(f"unknown GDN fused verify scope: {scope}")
     if out is None:
         out = torch.empty_like(v)
     corr, key, decay = records.correction, records.key, records.decay
@@ -459,16 +466,23 @@ def launch_fused_verify(
         float(scale if scale is not None else 128**-0.5),
     ).launch()
     _COUNTS["verify_fused_model_calls"] += 1
-    _COUNTS["verify_fused_saved_helpers"] += 3
-    if _COUNTS["verify_fused_model_calls"] == 1:
+    scope_counter = "verify_fused_" + scope + "_model_calls"
+    _COUNTS[scope_counter] += 1
+    # Mixed batches still need a non-spec gating call. They remove only the
+    # two standalone spec norm helpers; do not claim that whole gate vanished.
+    saved_helpers = 2 if scope == "mixed" else 3
+    _COUNTS["verify_fused_saved_helpers"] += saved_helpers
+    if scope == "mixed":
+        _COUNTS["verify_fused_mixed_tokens_host_layer_sum"] += tokens
+    if _COUNTS[scope_counter] == 1:
         _log().info(
-            "GDN_ASCENDC_FUSION model_dispatch=PASS activation=%s state=%s "
+            "GDN_ASCENDC_FUSION model_dispatch=PASS phase=%s activation=%s state=%s "
             "A_log=%s dt_bias=%s "
-            "query_len=%d key_heads=%d value_heads=%d external_helpers_removed=3 "
+            "query_len=%d key_heads=%d value_heads=%d external_helpers_removed=%d "
             "q_token_stride=%d v_token_stride=%d "
             "scope=HOST_DISPATCH_NOT_GRAPH_REPLAY",
-            q.dtype, state.dtype, A_log.dtype, dt_bias.dtype,
-            spec_query_len, q.shape[2], v.shape[2],
+            scope, q.dtype, state.dtype, A_log.dtype, dt_bias.dtype,
+            spec_query_len, q.shape[2], v.shape[2], saved_helpers,
             q.stride(1), v.stride(1),
         )
     return out

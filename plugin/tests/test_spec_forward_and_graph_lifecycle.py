@@ -481,6 +481,9 @@ def test_startup_prepares_align_actual_rows_dtype_and_mandatory_selftest(runtime
     )
     module._iter_builders = lambda runner: iter([builder])
     module._log_runtime_flags = lambda worker: None
+    # Bound-model validation is checked against actual method registries in
+    # test_mixed_readiness; this fixture isolates the buffer/signature setup.
+    module._check_mixed_adapters = lambda worker, builders: None
     module._prepare(worker)
     prepared = next(entry[1] for entry in calls if entry[0] == "prepare")
     assert prepared["capacity"] == 128

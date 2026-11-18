@@ -312,6 +312,44 @@ def _log_runtime_flags(worker) -> None:
         )
 
 
+def _check_mixed_adapters(worker, builders) -> None:
+    """Check actual bound layers after worker donor-method copying is complete."""
+    config = worker.vllm_config
+    registry = getattr(getattr(config, "compilation_config", None), "static_forward_context", None)
+    names = tuple(dict.fromkeys(
+        name for builder in builders for name in getattr(builder, "layer_names", ())
+    ))
+    if registry is None or not names:
+        raise RuntimeError("GDN mixed adapter cannot resolve the actual model layers")
+    sources = {}
+    for name in names:
+        layer = registry.get(name)
+        method = getattr(layer, "_forward_core", None)
+        function = getattr(method, "__func__", method)
+        adapter = getattr(function, "_gdn_mixed_core", None)
+        if adapter is None:
+            reason = getattr(function, "_gdn_mixed_error", "method wrapper missing")
+            raise RuntimeError(
+                f"GDN mixed adapter is not bound to model layer {name}: {reason}. "
+                "This plugin requires the supported Ascend 0.30rc1 core ABI; "
+                "refusing READY with only the pure-decode optimization active."
+            )
+        digest = getattr(adapter, "_gdn_mixed_source_digest", None)
+        counts = getattr(adapter, "_gdn_mixed_patch_counts", {})
+        if not digest or counts != dict.fromkeys(
+            ("preflight", "spec_qkv", "gates", "spec_verify", "merge"), 1
+        ):
+            raise RuntimeError(f"GDN mixed adapter has an incomplete patch contract: {name}")
+        sources[digest] = sources.get(digest, 0) + 1
+    logger.info(
+        "GDN_MIXED_ADAPTER READY layers=%d native_source_digests=%s "
+        "patches=preflight,spec_qkv,gates,spec_verify,merge "
+        "non_spec_native=preserved capture_policy=unchanged "
+        "scope=BOUND_METHOD_CHECK_NOT_DEVICE_TIMING",
+        len(names), sources,
+    )
+
+
 def _prepare(worker) -> None:
     global _SELFTEST_DONE
     if not feature_enabled(getattr(worker, "vllm_config", None)):
@@ -342,6 +380,7 @@ def _prepare(worker) -> None:
             "RecoverSSM enabled GDN has no recovery metadata builders; "
             "refusing startup readiness without verify/commit preparation"
         )
+    _check_mixed_adapters(worker, builders)
 
     # op-dev uses an ahead-of-time AscendC library for verify/grouped fold.
     # Build/load before capture. A compiler/registration failure must not turn

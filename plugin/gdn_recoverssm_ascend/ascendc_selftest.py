@@ -258,6 +258,18 @@ def _probe(case, device, *, fused=False):
         q, k, g, beta = (
             cpu[name].to(device) for name in ("raw_q", "raw_k", "raw_a", "raw_b")
         )
+        # The model path consumes views of packed convolution output. Probe
+        # that actual token stride instead of testing only compact Q/K inputs.
+        tokens, heads, value_heads = q.shape[1], q.shape[2], v.shape[2]
+        packed = torch.cat(
+            (q.reshape(tokens, -1), k.reshape(tokens, -1), v.reshape(tokens, -1)),
+            dim=-1,
+        )
+        qw, vw = heads * 128, value_heads * 128
+        q, k, v = packed.split((qw, qw, vw), dim=-1)
+        q = q.view(1, tokens, heads, 128)
+        k = k.view(1, tokens, heads, 128)
+        v = v.view(1, tokens, value_heads, 128)
         tensors = (q, k, v, g, beta, state, corr, key, decay, out, qsl, indices)
         fused_tensors = (*tensors, cpu["A_log"].to(device), cpu["dt_bias"].to(device))
         AscendCSpec(
@@ -459,6 +471,63 @@ def make_fused_case(
     return case
 
 
+def _mixed_staging_probe(device):
+    """Validate mixed gathers/gate/merge on owned buffers, never model state."""
+    from types import SimpleNamespace
+
+    from vllm.logger import init_logger
+    from vllm_ascend.ops import gdn as native
+
+    from .mixed_forward import MixedPlan, merge_mixed_output, prepare_mixed_gates
+
+    actual, heads = 11, 3
+    spec_cpu = torch.tensor([6, 1, 9, 3], dtype=torch.int64)
+    other_cpu = torch.tensor([0, 2, 4, 5, 7, 8, 10], dtype=torch.int64)
+    cases = 0
+    for dtype in (torch.float32, torch.bfloat16):
+        for bias_dtype in (torch.float32, torch.bfloat16):
+            a_cpu = _values((actual, heads), offset=4, amplitude=2).to(dtype)
+            b_cpu = _values((actual, heads), offset=11, amplitude=2).to(dtype)
+            logA = torch.tensor([-1.0, -0.5, 0.0], dtype=torch.float32)
+            bias = torch.tensor([-0.2, 0.1, 0.3], dtype=bias_dtype)
+            layer = SimpleNamespace(A_log=logA.to(device), dt_bias=bias.to(device))
+            plan = MixedPlan(spec_cpu.to(device), other_cpu.to(device), 4, 7)
+            raw_a, raw_b, g, beta = prepare_mixed_gates(
+                layer, a_cpu.to(device), b_cpu.to(device), plan,
+                native.DeviceOperator.fused_gdn_gating, record=False,
+            )
+            if not torch.equal(raw_a.cpu()[0], a_cpu[spec_cpu]) or not torch.equal(
+                raw_b.cpu()[0], b_cpu[spec_cpu]
+            ):
+                raise RuntimeError("GDN_MIXED_SELFTEST raw partition mismatch")
+            x = a_cpu[other_cpu].float() + bias.float()
+            expected_g = -logA.exp() * torch.where(x <= 20, (1 + x.exp()).log(), x)
+            expected_beta = b_cpu[other_cpu].float().sigmoid().to(dtype)
+            _assert_close(g[0], expected_g, label="mixed native gate", dtype=torch.float32)
+            _assert_close(beta[0], expected_beta, label="mixed native beta", dtype=dtype)
+            # Distinct values make accidental subset swaps and padded-tail
+            # writes observable without running a synthetic prefill kernel.
+            spec_out = torch.stack((raw_a[0], raw_b[0]), dim=-1).unsqueeze(0)
+            other_out = torch.stack((g[0], beta[0].float()), dim=-1).to(dtype).unsqueeze(0)
+            out = torch.full((actual + 2, heads, 2), -7.0, dtype=dtype, device=device)
+            merge_mixed_output(
+                out, actual, plan.spec_indices, plan.non_spec_indices,
+                spec_out, other_out, record=False,
+            )
+            expected = torch.full((actual + 2, heads, 2), -7.0, dtype=dtype)
+            expected[spec_cpu] = torch.stack((a_cpu[spec_cpu], b_cpu[spec_cpu]), dim=-1)
+            expected[other_cpu] = torch.stack((expected_g, expected_beta.float()), dim=-1).to(dtype)
+            _assert_close(out, expected, label="mixed output scatter", dtype=dtype)
+            if not torch.equal(out.cpu()[actual:], expected[actual:]):
+                raise RuntimeError("GDN_MIXED_SELFTEST output padding overwritten")
+            cases += 1
+    init_logger("vllm.gdn_recoverssm_ascend.ascendc").info(
+        "GDN_MIXED_SELFTEST PASS cases=%d raw_partition=PASS native_non_spec_gate=PASS "
+        "direct_output_merge=PASS padding=PASS model_buffers_touched=0 "
+        "scope=OWNED_STAGING_NOT_FULL_PREFILL", cases,
+    )
+
+
 def run(device):
     """Execute every BF16/FP32 entry-point specialization before graph capture."""
     from vllm.logger import init_logger
@@ -482,11 +551,12 @@ def run(device):
                             fused=True,
                         )
                         fused_calls += 1
+    _mixed_staging_probe(device)
     init_logger("vllm.gdn_recoverssm_ascend.ascendc").info(
         "GDN_ASCENDC_SELFTEST PASS cases=%d verify_calls=%d fold_calls=%d "
         "fused_verify_calls=%d norm_gate_roundtrip=PASS fused_key_tolerance=PASS "
         "Q=1,4,8 activation=fp32,bf16 state=fp32,bf16 beta=fp32,activation "
-        "dt_bias=fp32,bf16 bias_storage_promotion=PASS "
+        "dt_bias=fp32,bf16 bias_storage_promotion=PASS packed_qkv=PASS "
         "GQA=3 prefix=0..Q null_padding=PASS readonly=PASS prenormalized_key_bits=PASS "
         "boundary_source_final_alias=PASS tolerance_fp32=%g tolerance_bf16=%g",
         calls + fused_calls,
