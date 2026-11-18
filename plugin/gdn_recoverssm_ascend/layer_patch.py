@@ -386,7 +386,7 @@ def _records_for(layer) -> torch.Tensor:
 
 
 def _trace_step(layer, attn_metadata, rows, total, query_start_loc, checkpoint_indices):
-    """One line per speculative step for the first few steps of the process.
+    """Trace the first few speculative steps when explicitly requested.
 
     This is the "is RecoverSSM live on this request?" signal. Every field below is
     a Python integer already sitting in the metadata, so the line never touches
@@ -400,10 +400,8 @@ def _trace_step(layer, attn_metadata, rows, total, query_start_loc, checkpoint_i
     still returns the truth for the recording phase itself. Keeping the trace free of
     device reads means it is safe in either phase without needing to tell them apart.
     """
-    if _is_capturing():
-        return
-    limit = int(os.getenv("GDN_RECOVERSSM_TRACE_STEPS", "3") or "0")
-    if limit <= 0 or _TRACE["steps"] >= limit:
+    limit = int(os.getenv("GDN_RECOVERSSM_TRACE_STEPS", "0") or "0")
+    if limit <= 0 or _TRACE["steps"] >= limit or _is_capturing():
         return
     _TRACE["steps"] += 1
     num_prefills = int(getattr(attn_metadata, "num_prefills", 0))

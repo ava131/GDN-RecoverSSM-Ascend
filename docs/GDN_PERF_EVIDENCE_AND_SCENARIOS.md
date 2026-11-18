@@ -2,6 +2,8 @@
 
 当前最值得确认的是，**同一批请求里，时间花在长输入处理、解码恢复，还是两者之间的调度和等待**。同为 BS20 图模式，Base 为 **739.37 s**，旧 main Replay 为 **768.51 s**，本轮 mixed Replay 为 **759.52 s**。混批路径已接入，本轮首 token 更快，但平均每个输出 token 仍比 Base 多 **4.4 ms**，整批多 **20.15 s**。这是单轮历史对照，20.15 s 是待解释的差距。 [结果审查](OPDEV_V2_MIXED_RESULTS_20261118.md)
 
+**容量收益已经有实测。** 早期 eager 的实际并发从 Base 20 到 Replay 25，增加 25%，两边整批都约 14 分钟。另一组图模式在客户端并发 24 时，Replay C 跑满 24 且未抢占，Base 到 20 且有抢占。客户端并发 32 的图模式又观察到 Base 21、Replay 25，同时 TPOT 从 100.2 增到 123.5 ms。后者表示每个输出 token 的间隔变长了 23.3%。BS20 对照用来衡量同并发成本，后续要解释的是已验证的额外容量如何更好地换成整批吞吐。 [#3 eager 记录](https://github.com/ava131/GDN-RecoverSSM-Ascend/issues/3#issuecomment-6811604488) · [#4 对照表](https://github.com/ava131/GDN-RecoverSSM-Ascend/issues/4#issuecomment-6940508676)
+
 ## 一次完整压测里需要留下的证据
 
 继续使用当前启动命令和完整请求集。已有 Base/Replay 日志也可以先提取，同步保留启动配置、模型版本、客户端并发和请求集。两次运行缺失的字段记为未知。只要能把下面几项对上，就能决定下一刀改哪里。
@@ -11,7 +13,7 @@
 | 客户端整批时间、120 条是否全成功、处理的输入和输出量、TTFT 和 TPOT 的均值与尾部 | 先确认两轮工作量接近，再看差距集中在首 token、持续生成还是尾部收尾。整体耗时以客户端 `Benchmark Duration` 为准。 |
 | 服务端每个阶段的 CPU 调度目标 token、请求行、上下文长度、spec 提案和接受量、graph 桶与 padding | 看 mixed、纯 decode、纯 prefill 分别处理了多少工作。若平均接受长度下降，每生成同量 token 需要更多轮，有可能抵消单轮提速。 |
 | 各阶段 Host 提交和等待的样本，mixed 实际命中的 prefill backend，verify/fold 路径与次数 | Host 调用很重就先清重复检查或提交；mixed 命中率正常时，转看原生 prefill 的状态 gather/scatter、拷贝和算子。Host 样本只能定位 CPU 时间和等待线索。 |
-| KV 页数和使用率、等待队列、抢占、state dtype、records/图的显存 | 判断 Replay 省出的空间是否让更多请求持续运行，还是请求并发、token 预算或批次上限先到了。峰值 BS20 可由客户端上限造成。 |
+| KV 页数和使用率、等待队列、抢占、state dtype、records/图的显存 | 解释已测得的容量增益来自哪些页和状态变化，判断当前负载有多少持续活跃请求、是否用足已释放的容量。 |
 | 仍需拆算子的那一次设备时间线，限定同一完整负载中的少量代表步 | 若 Host 证据解释不了差距，才从设备侧核对原生 prefill/state 搬运、verify、采样、fold 及其空隙。看各段实际阻塞后续工作的时间和跨 stream 重叠。普通服务日志无法给出这些 kernel 耗时。 |
 
 这轮已经知道，**69.4% 的 spec 窗口在 mixed，mixed 里 spec 却只占 token 的 3.70%**。大量 prefill 工作仍在执行。两者都可以从计数读出，阶段耗时和关键路径要分别测。各 TP rank 往往观察的是同一批请求，按 rank 比较异常和不均衡，不能把输出量相加。单轮尾日志和客户端报告也各有自己的时间窗口。 [本轮服务端结果](https://github.com/ava131/GDN-RecoverSSM-Ascend/issues/4#issuecomment-6974380561)
@@ -22,20 +24,20 @@
 
 ```bash
 python3 tools/extract_gdn_perf.py \
-  --server replay=server.log --client replay=ais.log \
+  --server server.log --client ais.log \
   --json-out replay-evidence.json
 ```
 
-给我 **`replay-evidence.json`** 就可以。已有 Base 日志时，可在同一个命令追加 `--server base=base-server.log --client base=base-ais.log`。各文件和 worker 独立输出。支持普通文本、`.gz`、Docker JSON 日志。脚本只读取本地文件，输出汇总，并可选写 JSON。
+把 `server.log` 和 `ais.log` 换成你的实际文件名。AIS 是发请求的压测客户端，日志提供整批耗时、TTFT、TPOT、吞吐和成功请求数；只定位服务端路径时可省略 `--client`。给我 **`replay-evidence.json`** 就可以。`replay=`、`base=` 都是可选标签，只在一起提取多份日志时方便区分。各文件和 worker 独立输出。支持普通文本、`.gz`、Docker JSON 日志。脚本只读本地文件，可选写 JSON。
 
 | 日志 | 读哪一项 |
 |---|---|
-| `GDN_PHASE_PERF_CONFIG` | 生效参数、版本指纹、READY 时间和计时覆盖范围。所有 TP rank 启动时各一条。 |
-| `GDN_PHASE_PERF` | 看 `phases` 的阶段 token 和接受量，再看 `prefill_paths` 的 FLA、fused chunk、Triton fallback 命中及 state 布局。后者若命中 Triton 且 state 行间有填充，优先核对原生 gather 是否使整块 cache 连续化。 [rc1 prefill 分支源码](https://github.com/vllm-project/vllm-ascend/blob/v0.30.0rc1/vllm_ascend/ops/gdn.py#L655) |
+| `GDN_READY` | 每个 TP rank 启动准备、强制自检和原生 warmup 通过后各一条，包含生效参数、版本指纹、READY 时间、实际 state/records 布局和采样范围。 |
+| `GDN_PHASE_PERF` | 看 `phases` 的阶段 token 和接受量、`totals` 的批次和恢复提交，以及 `paths` 从 READY 之后的模型分派与回退。若 `prefill_paths` 命中 Triton 且 state 行间有填充，优先核对原生 gather 是否使整块 cache 连续化。 [rc1 prefill 分支源码](https://github.com/vllm-project/vllm-ascend/blob/v0.30.0rc1/vllm_ascend/ops/gdn.py#L655) |
 | 同一行的 `host_timings`、`graph_submissions` | 观察 metadata、预检、混批 verify 提交、prefill state 读/算/写提交、采样过滤、图提交、恢复提交，以及原生获取输出的等待与处理。多数计时取前三步及每 64 步约一个样本，commit 延续原来每步都记录的 Host 计时。看 `sampled_steps` 和 `samples` 确认覆盖。同一阶段若命中多种 prefill 分支，计时是这些分支的混合样本。 |
-| `GDN_MEMORY`、`GDN_PREPARED_CONTEXT`、原生引擎日志 | 对照 KV block、页布局、预算与记录实际字节。分 rank 采集 KV 已绑定、插件准备完成、原生 warmup 完成三个时点的 PyTorch allocator 数据；服务期容量另看引擎的 KV 占用、等待和抢占。 |
+| `GDN_MEMORY` 和原生引擎日志 | 对照 KV block、页布局和内存预算。分 rank 采集 KV 已绑定、插件准备完成、原生 warmup 完成三个时点的 PyTorch allocator 数据。服务期容量另看引擎的 KV 占用、等待和抢占。 |
 
-阶段统计由 rank 0 累计，每 200 个完成步骤输出，空闲后补发最后一份。worker 窗口可能包含 READY 后的预热请求。token 分项来自 CPU 调度数组，`known_steps` 或 `known_rows` 表示覆盖量，异步调度的上下文也可能偏高。`attention_work_proxy` 按每行新增 token 所能看到的历史长度累计，用来比较上下文工作量。 [rc1 InputBatch 来源](https://github.com/vllm-project/vllm-ascend/blob/v0.30.0rc1/vllm_ascend/worker/v2/model_runner.py#L790)
+阶段统计由 rank 0 累计。第一个完成步骤、首次恢复提交对应的完成步骤及每 200 步输出，空闲后补发尚未输出的尾部。worker 窗口可能包含 READY 后的预热请求。token 分项来自 CPU 调度数组，`known_steps` 或 `known_rows` 表示覆盖量，异步调度的上下文也可能偏高。`attention_work_proxy` 按每行新增 token 所能看到的历史长度累计，用来比较上下文工作量。 [rc1 InputBatch 来源](https://github.com/vllm-project/vllm-ascend/blob/v0.30.0rc1/vllm_ascend/worker/v2/model_runner.py#L790)
 
 请求期间沿用原有输出等待，不增加设备 Event、同步或 Tensor 回读。Host 分段可能重叠，输出等待也可能很短，因为设备在此前已经完成部分工作。若它们解释不了差距，设备时间线只需回答一件事：真实的 prefill/state 搬运、verify、采样、fold 在完整负载下各阻塞了后续工作多久。可复用已有 trace，仅在确需区分时另作采集。
 

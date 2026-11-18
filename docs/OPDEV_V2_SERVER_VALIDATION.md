@@ -19,17 +19,13 @@ python -m pip install -e ./plugin --no-deps
 
 然后原样执行已保存的 Replay server 启动命令及完整压测。不需要手动清构建缓存；源码变化会产生新 fingerprint。首次构建和启动自检有开销，后续启动可命中编译缓存；记录整批时间时应保留其具体计时范围，不能混算。
 
-在server日志中保留这些行：
+正常 INFO 日志保留三类：
 
-- `GDN_CONFIG patch=ascendc-op-dev-v2-perf-evidence` 带配置快照、源码与启动参数指纹。该版沿用 `ascendc-op-dev-v2-mixed-fused` 的混批路径，并增加 [性能证据采集与脚本](GDN_PERF_EVIDENCE_AND_SCENARIOS.md)。再早的 `ascendc-op-dev-v2-bf16-bias-qkv-views` 只覆盖 pure-spec。
-- `GDN_ASCENDC loaded`：实际加载的库、build fingerprint、是否命中缓存及算子入口。
-- `GDN_PREPARED_CONTEXT`：实际state dtype、shape、stride、record key dtype、records字节数。这里的数字比配置摘要更直接。
-- `GDN_ASCENDC_SELFTEST`及现有grouped/conv自检结果：启动时在自有缓冲中验证，失败应阻止ready，不能当成运行中fallback理由。修正版应包含 `dt_bias=fp32,bf16 bias_storage_promotion=PASS`。
-- `GDN_ASCENDC_FUSION model_dispatch=PASS`：模型路径首次提交融合 verify；与专项自检分开计数，并打印真实 `A_log`、`dt_bias` dtype 与 Q/V token stride。TP4、HK4/HV12/K128 的 packed view token stride 应为 2560。若出现 `eligible=0`，同一行说明保留独立 helper 的原因，verify 仍按已有后端选择。
-- `GDN_READY`：只有准备和原生warmup完成后才打印。新增 `fused_model_dispatches` 和 `fused_total_dispatches`，明确模型调用与包含专项自检的调用总数。eager warmup若未构造pure-spec行，模型计数可以暂为0；普通模型首次进入时仍应看到 `model_dispatch=PASS`，不能只拿自检PASS证明模型融合。
-- `GDN_MIXED_ADAPTER READY`确认实际模型方法的五处patch，`GDN_MIXED_SELFTEST PASS`检查自有缓冲的分区/gate/merge。实际混批应看到 `model_dispatch=PASS phase=mixed`。
+- `GDN_READY json=...`。每个 TP rank 一条。实际模型绑定、强制自检和原生 warmup 完成后才打印，包含生效参数、state/records 布局、各组件版本、源码及 AscendC 构建指纹。
+- `GDN_MEMORY json=...`。每个 rank 三个阶段的 KV 页配置、预算及 PyTorch allocator 快照。
+- `GDN_PHASE_PERF json=...`。rank 0 汇总完成步骤，包含分阶段工作量、选中的 prefill 分支、融合 verify 和 fold、Host 时间、graph bucket/padding。看 `totals.commits` 是否随请求增长。看 `paths.counts.verify_fused_mixed_model_calls` 确认混批进入融合。图重放不重复执行 Python，因此可结合 READY 的捕获计数和运行时 `graph_submissions` 核对纯 decode。
 
-source fingerprint识别安装后的真实文件内容，包括editable install。build fingerprint识别实际编译输入。它们与git提交号属于不同口径，不能用单个旧日志证明新提交已执行。
+失败阶段、回退和配置变化仍可定位。成功自检及逐图等历史细节降到 DEBUG。source fingerprint 识别安装内容，build fingerprint 识别实际编译输入。 [字段说明与提取脚本](GDN_PERF_EVIDENCE_AND_SCENARIOS.md)
 
 ## 本轮实现目标
 
@@ -42,46 +38,15 @@ source fingerprint识别安装后的真实文件内容，包括editable install�
 
 融合签名修复后须正常重启 server，让图重新捕获；仅对运行中的进程执行 git pull 不会替换已有图。仍使用原命令，不需要清缓存或新增参数。
 
-## 压测结束后看哪些统计
+## 压测结束后看什么
 
-`GDN_PERF`：
-
-- `spec_emitted_per_row`：每个spec请求行最终采样产出的平均token数，不等于仅draft接受数。
-- `launches_per_commit`、`groups_per_commit`：提交结构是否保持预期；不能只看某个kernel变快，却增加大量提交。
-- `graph_observed_steps`、`graph_hist`、`graph_padding_fraction`：覆盖legacy和updatable两种原生fullgraph分派。未观测到图时padding fraction为-1，表示未知，不表示没有padding。
-- `host_submit_us_avg`：CPU提交时间，**不是设备kernel时间**。
-- `worker_observed_s`：worker已观察窗口，不是客户端整批Duration；不包含最后输出后的空闲等待。
-
-`GDN_WORKLOAD`：
-
-- `mean_rows` / `peak_rows`：平均与峰值请求行。
-- `mean_gdn_rows` / `mean_commit_rows`：实际GDN/恢复工作量口径。
-- `accepted_output_hist`：产出token数分布，辅助识别接受行为是否变化。
-- `batch_hist`：decode、prefill、mixed以及请求行数分布。字段不存在时phase为unknown，不读取设备Tensor补齐。
-- `spec_phase_hist`：每个phase的spec请求行和产出，直接核对mixed覆盖率。
-- `mean_computed_context` / `max_computed_context`：已有CPU输入镜像的上下文长度；async下可能是乐观镜像，日志明确标注，不能当成精确设备状态。
-
-`GDN_PATHS`：
-
-- `verify_fused`包含专项启动自检，单独大于零不能证明模型使用融合路径。
-- `verify_fused_model_calls`只统计模型入口，配合 `model_dispatch=PASS` 确认 warmup/捕获/普通模型调用进入了融合路径。
-- `verify_fused_mixed_model_calls`与`verify_fused_pure_spec_model_calls`区分模型路径。`verify_fused_saved_helpers`在mixed每次加2、pure-spec加3；mixed仍需non-spec gate，不能算整个gate被删除。
-- 行尾`mixed={...}`汇总分区、gate、verify、直接merge的Host调用，startup staging probe不计入。
-- fullgraph replay不会重复执行Python，**不能把这些计数当成全程设备kernel次数**。日志有 `HOST_DISPATCH_COUNTS_NOT_GRAPH_EXECUTIONS` 明确提示。
-
-统计只使用runner已经完成的CPU输出和CPU batch信息，不增加NPU scalar读取、计时event或热路径synchronize。每200步、首几步、空闲和退出时输出汇总，避免每层每token刷日志。
-
-## 性能判断
-
-保持原有完整压测，保留客户端结果与本次server完整日志。首先看总请求成功数、总输入/输出token和整批Duration，然后看TTFT、TPOT、接受长度、平均batch、graph分布。容量增加和每轮执行成本会同时影响最终时间，不能用峰值batch替代吞吐成绩。
-
-主基线仍是9c5ce34。相同完整负载的Duration下降才算端到端改善。CPU测试通过、启动自检通过、进入新算子、单个host提交时间下降，各自都不能单独证明性能已达标。
-
-应保留四个 TP worker 的日志，确认它们都完成自检、ready，并正常处理到最后一个请求。最终汇总从三类行取数：
+保持完整负载，用脚本同时提取服务端统计和客户端成绩。把文件名换成实际保存的日志。只有服务端日志时省略 `--client`。客户端的 `Benchmark Duration` 衡量整批端到端时间，worker 时钟测量自己的观察窗口。
 
 ```bash
-rg 'GDN_CONFIG|GDN_ASCENDC|GDN_PREPARED_CONTEXT|GDN_READY' server.log
-rg 'GDN_PERF|GDN_WORKLOAD|GDN_PATHS' server.log
+python3 tools/extract_gdn_perf.py \
+  --server server.log --client ais.log --json-out replay-evidence.json
 ```
 
-无需增加 debug 日志级别、改变 async/graph/batch/prefix 参数或单独安排关闭功能的实验。
+重点核对成功请求数、输入与输出量、TTFT/TPOT、接受长度、平均批次、graph 大小和实际 prefill 分支。Host 时间只覆盖提交或原有等待，路径计数只统计 Python 分派。Base 20 到 Replay 25 的历史 eager 容量收益已有实测，后续比较关心这项收益如何转成整批吞吐。 [历史容量结果与模型](GDN_PERF_EVIDENCE_AND_SCENARIOS.md)
+
+无需增加启动参数或单独安排关闭功能的实验。

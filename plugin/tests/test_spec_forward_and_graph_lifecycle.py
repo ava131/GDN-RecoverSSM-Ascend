@@ -52,6 +52,7 @@ def runtime(monkeypatch):
     monkeypatch.setitem(sys.modules, package_name, package)
     events = []
     logger = types.SimpleNamespace(
+        debug=lambda *a: None,
         info=lambda *a: events.append(("info", a)),
         warning=lambda *a: events.append(("warning", a)),
         error=lambda *a: events.append(("error", a)),
@@ -488,7 +489,6 @@ def test_startup_prepares_align_actual_rows_dtype_and_mandatory_selftest(runtime
         model_runner=types.SimpleNamespace(block_tables="actual-block-tables"),
     )
     module._iter_builders = lambda runner: iter([builder])
-    module._log_runtime_flags = lambda worker: None
     # Bound-model validation is checked against actual method registries in
     # test_mixed_readiness; this fixture isolates the buffer/signature setup.
     module._check_mixed_adapters = lambda worker, builders: None
@@ -546,8 +546,6 @@ def test_native_kda_is_inert_and_missing_gdn_builders_refuse_ready(runtime):
 
     runtime.relative("diagnostics", configure=lambda worker: None)
     runtime.relative("sampling_patch", prepare=lambda worker: None)
-    module._log_versions = lambda: None
-    module._log_runtime_flags = lambda worker: None
     worker = types.SimpleNamespace(vllm_config=make_config())
     with pytest.raises(RuntimeError, match="no model runner"):
         module._prepare(worker)

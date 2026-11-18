@@ -1007,7 +1007,7 @@ class GroupedCommitCoordinator:
         reason = (len(entries), len(grouped))
         if reason not in self._seen:
             self._seen.add(reason)
-            logger.info(
+            logger.debug(
                 "GDN recovery coordinator: groups=%d buckets=%d launches=%d "
                 "(separate buckets preserve heterogeneous layouts or row geometry)",
                 len(entries),
@@ -1358,7 +1358,7 @@ def _run_grouped_selftest(
                 raise RuntimeError(
                     "GDN grouped selftest: convolution boundary/final mismatch"
                 )
-    logger.info(
+    logger.debug(
         "GDN_GROUPED_SELFTEST PASS groups=2 layers_per_group=2 cases=%d "
         "(actual plan/conv/fold; reordered rows, null/no-work, boundary and full acceptance)",
         len(cases),

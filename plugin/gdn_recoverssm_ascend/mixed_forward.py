@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 _COUNTS = Counter()
 _DECLINED = set()
+_FALLBACK_COUNTS = Counter()
 _PLAN_NAME = "_gdn_recoverssm_mixed_plan"
 
 
@@ -41,12 +42,18 @@ def counters():
     return dict(_COUNTS)
 
 
+def fallback_counts():
+    """Reasons genuine mixed candidates kept the original helper path."""
+    return dict(_FALLBACK_COUNTS)
+
+
 def _decline(reason):
+    _FALLBACK_COUNTS[reason] += 1
     if reason not in _DECLINED:
         _DECLINED.add(reason)
         from vllm.logger import init_logger
 
-        init_logger("vllm.gdn_recoverssm_ascend.mixed").info(
+        init_logger("vllm.gdn_recoverssm_ascend.mixed").debug(
             "GDN_MIXED eligibility=0 reason=%s decision=BEFORE_CONV", reason
         )
 

@@ -132,3 +132,65 @@ def test_native_log_and_ais_have_independent_windows(tmp_path):
     assert b["offered_concurrency"] == 4
     assert "success_requests" not in b["metrics"]
     assert "未见 GDN_PHASE_PERF" in text
+
+
+def test_consolidated_logs_keep_ready_evidence_with_each_epoch(tmp_path):
+    def line(marker, **payload):
+        return f"{marker} json=" + json.dumps({"schema": 2, "pid": 10, "rank": 0, **payload})
+
+    def ready(timestamp):
+        return line(
+            "GDN_READY",
+            ready_unix_s=timestamp,
+            patch="quiet",
+            launch_fingerprint="f00d",
+            parameters={"tp": 4, "num_speculative_tokens": 3},
+            startup={
+                "contexts": [
+                    {"kv_group": 1, "layers": 48, "state_dtype": "torch.bfloat16",
+                     "actual_record_bytes": 4194304}
+                ],
+                "sampler": {"sort": "native", "workspace_model_bytes": 134217728},
+            },
+        )
+
+    def phase(steps):
+        return line(
+            "GDN_PHASE_PERF", steps=steps, worker_window_s=3.14,
+            totals={"peak_rows": 25, "graph_padding_fraction": 0.05, "commits": steps},
+            paths={"counts": {"verify_fused_mixed_model_calls": 23}},
+        )
+
+    path = tmp_path / "server.log"
+    path.write_text(
+        "\n".join([
+            ready(1),
+            phase(20),
+            ready(1),  # A duplicate record still belongs to the first startup.
+            line("GDN_MEMORY", phase="kv_bound_before_prepare", kv_blocks=25),
+            line("GDN_MEMORY", phase="after_native_warmup", kv_blocks=25),
+            ready(2),
+            phase(24),  # An increasing step number still belongs to a new worker.
+            ready(3),  # Recognize restart when the first memory line was omitted.
+            phase(30),
+        ]),
+        encoding="utf-8",
+    )
+
+    shown, data = extract(tmp_path, "--server", str(path))
+    assert data["client"] == []
+    server = data["server"][0]
+    assert server["label"] == "server.log"
+    first, second, third = server["processes"]
+    assert [p["session"] for p in (first, second, third)] == [1, 2, 3]
+    assert first["startup"]["GDN_READY"]["count"] == 2
+    assert set(second["startup"]["GDN_MEMORY"]["by_phase"]) == {
+        "kv_bound_before_prepare", "after_native_warmup"
+    }
+    assert second["startup"]["GDN_READY"]["last"]["fields"]["json"]["ready_unix_s"] == 2
+    assert third["periodic"]["GDN_PHASE_PERF"]["last"]["fields"]["json"]["steps"] == 30
+    assert "launch_fingerprint=f00d" in shown
+    assert "kv_group=1" in shown and "actual_record_bytes=4194304" in shown
+    assert "peak_rows=25" in shown and "worker_observed_s=3.14" in shown
+    assert "verify_fused_mixed_model_calls=23" in shown
+    assert "sort=native" in shown

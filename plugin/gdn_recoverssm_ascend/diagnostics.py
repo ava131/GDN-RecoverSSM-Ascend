@@ -25,7 +25,7 @@ from vllm.logger import init_logger
 from .metrics_math import padding_fraction
 
 logger = init_logger("vllm.gdn_recoverssm_ascend.perf")
-PATCH_ID = "ascendc-op-dev-v2-perf-evidence"
+PATCH_ID = "ascendc-op-dev-v2-clean-evidence"
 REPORT_STEPS = 200
 TIMING_SAMPLE_BLOCK = 64
 TIMING_FIRST_STEPS = 3
@@ -48,10 +48,10 @@ _READY = False
 _RANK = 0
 _LATEST = None
 _LOCK = threading.Lock()
+_REPORT_LOCK = threading.Lock()
 _COUNTS = Counter()
 _GRAPHS = Counter()
 _BATCHES = Counter()
-_ACCEPTED = Counter()
 _PHASES = defaultdict(Counter)
 _PHASE_ACCEPTED = defaultdict(Counter)
 _PHASE_CONTEXT = defaultdict(Counter)
@@ -68,6 +68,8 @@ _SOURCE_FINGERPRINT = None
 _IDLE_THREAD = None
 _LAST_OUTPUT_AT = None
 _LAST_REPORTED_STEPS = 0
+_LAST_REPORTED_COMMITS = 0
+_PATHS_AT_READY = {}
 _STOP_REPORTING = threading.Event()
 
 
@@ -153,14 +155,6 @@ def configure(worker):
     manifest = launch_manifest(worker)
     _LAST_CONFIG = manifest
     _SOURCE_FINGERPRINT = source_fingerprint()
-    logger.info(
-        "GDN_CONFIG patch=%s rank=%d source_fingerprint=%s fingerprint=%s parameters=%s",
-        PATCH_ID,
-        _RANK,
-        _SOURCE_FINGERPRINT,
-        _fingerprint(manifest),
-        json.dumps(manifest, sort_keys=True, default=str),
-    )
 
 
 def source_fingerprint():
@@ -469,11 +463,8 @@ def record_completed(counts, step):
                 spec_emitted = int(values.sum())
                 _COUNTS["spec_rows"] += int(values.size)
                 _COUNTS["spec_emitted_tokens"] += spec_emitted
-                _COUNTS["spec_rows_phase_" + step.phase] += int(values.size)
-                _COUNTS["spec_emitted_phase_" + step.phase] += spec_emitted
                 unique, frequencies = np.unique(values, return_counts=True)
                 histogram = dict(zip(map(int, unique), map(int, frequencies)))
-                _ACCEPTED.update(histogram)
                 if _RANK == 0:
                     stats = _PHASES[step.phase]
                     stats["spec_rows"] += int(values.size)
@@ -483,7 +474,9 @@ def record_completed(counts, step):
                         stats["spec_target_known_rows"] += int(values.size)
                     _PHASE_ACCEPTED[step.phase].update(histogram)
         emit = (
-            _COUNTS["output_steps"] <= 3 or _COUNTS["output_steps"] % REPORT_STEPS == 0
+            _COUNTS["output_steps"] == 1
+            or _COUNTS["output_steps"] % REPORT_STEPS == 0
+            or (_LAST_REPORTED_COMMITS == 0 and _COUNTS["commits"] > 0)
         )
     if emit:
         report()
@@ -524,7 +517,7 @@ def _phase_payload(elapsed, counts):
             **stats, "state_layout_examples": list(stats["state_layout_examples"]),
         }
     return {
-        "schema": 1,
+        "schema": 2,
         "pid": os.getpid(),
         "rank": _RANK,
         "scope": "WORKER_CUMULATIVE_CPU_COMPLETED",
@@ -544,90 +537,85 @@ def _phase_payload(elapsed, counts):
     }
 
 
-def report():
-    global _LAST_REPORTED_STEPS
-    if _RANK != 0:
-        return
-    with _LOCK:
-        c = dict(_COUNTS)
-        hist = [
-            {"actual": a, "captured": b, "steps": n}
-            for (a, b), n in _GRAPHS.most_common(8)
-        ]
-        batches = [
-            {"phase": phase, "rows": rows, "steps": steps}
-            for (phase, rows), steps in sorted(_BATCHES.items())
-        ]
-        accepted = dict(sorted(_ACCEPTED.items()))
-        spec_phases = {
-            phase: {
-                "rows": c.get("spec_rows_phase_" + phase, 0),
-                "emitted": c.get("spec_emitted_phase_" + phase, 0),
-            }
-            for phase in ("prefill", "decode", "mixed", "unknown")
-            if c.get("spec_rows_phase_" + phase, 0)
-        }
-        elapsed = (
-            0.0
-            if _START is None or _LAST_OUTPUT_AT is None
-            else _LAST_OUTPUT_AT - _START
-        )
-        phase_payload = _phase_payload(elapsed, c)
-        _LAST_REPORTED_STEPS = c.get("output_steps", 0)
-    spec_rows = c.get("spec_rows", 0)
-    commits = c.get("commits", 0)
-    actual = c.get("graph_actual_tokens", 0)
-    padded = c.get("graph_padded_tokens", 0)
-    logger.info(
-        "GDN_PERF steps=%d emitted_tokens=%d spec_rows=%d "
-        "spec_emitted_per_row=%.4f commits=%d host_submit_us_avg=%.1f "
-        "kernel_submissions=%d launches_per_commit=%.3f groups_per_commit=%.3f "
-        "graph_observed_steps=%d graph_padding_tokens=%d graph_padding_fraction=%.6f "
-        "worker_observed_s=%.3f graph_hist=%s timing=HOST_ONLY",
-        c.get("output_steps", 0),
-        c.get("emitted_tokens", 0),
-        spec_rows,
-        c.get("spec_emitted_tokens", 0) / spec_rows if spec_rows else 0.0,
-        commits,
-        c.get("host_submit_us", 0) / commits if commits else 0.0,
-        c.get("kernel_submissions", 0),
-        c.get("kernel_submissions", 0) / commits if commits else 0.0,
-        c.get("groups", 0) / commits if commits else 0.0,
-        c.get("graph_observed_steps", 0), padded,
-        padding_fraction(actual, actual + padded) if c.get("graph_observed_steps", 0) else -1.0,
-        elapsed,
-        json.dumps(hist, separators=(",", ":")),
-    )
-    snapshot_steps = c.get("batch_snapshot_steps", 0)
-    context_rows = c.get("context_known_rows", 0)
-    logger.info(
-        "GDN_WORKLOAD steps=%d batch_snapshot_steps=%d mean_rows=%.4f peak_rows=%d "
-        "mean_gdn_rows=%.4f mean_commit_rows=%.4f target_tokens=%d "
-        "mean_computed_context=%.1f max_computed_context=%d context_known_rows=%d "
-        "spec_phase_hist=%s accepted_output_hist=%s batch_hist=%s "
-        "context_source=CPU_INPUT_MIRROR_MAY_BE_OPTIMISTIC_WITH_ASYNC "
-        "scope=WORKER_CUMULATIVE_CPU_COMPLETED not_client_duration=1",
-        c.get("output_steps", 0), snapshot_steps,
-        c.get("request_rows", 0) / snapshot_steps if snapshot_steps else -1.0,
-        c.get("peak_request_rows", 0) if snapshot_steps else -1,
-        spec_rows / snapshot_steps if snapshot_steps else -1.0,
-        c.get("commit_rows", 0) / commits if commits else 0.0,
-        c.get("actual_target_tokens", 0) if snapshot_steps else -1,
-        c.get("context_tokens_sum", 0) / context_rows if context_rows else -1.0,
-        c.get("context_tokens_max", 0) if context_rows else -1,
-        context_rows, json.dumps(spec_phases, separators=(",", ":")),
-        json.dumps(accepted, separators=(",", ":")),
-        json.dumps(batches, separators=(",", ":")),
-    )
+def _path_counters():
     from . import ascendc_backend, mixed_forward
 
-    logger.info(
-        "GDN_PATHS counts=%s scope=HOST_DISPATCH_COUNTS_NOT_GRAPH_EXECUTIONS "
-        "graph_replay_does_not_run_python=1 device_scalar_reads=0 timing_events=0 mixed=%s",
-        json.dumps(ascendc_backend.counts(), sort_keys=True, separators=(",", ":")),
-        json.dumps(mixed_forward.counters(), sort_keys=True, separators=(",", ":")),
-    )
-    logger.info("GDN_PHASE_PERF json=%s", json.dumps(phase_payload, separators=(",", ":")))
+    return {
+        "counts": ascendc_backend.counts(),
+        "mixed": mixed_forward.counters(),
+        "ascendc_fallbacks": ascendc_backend.fallback_counts(),
+        "mixed_fallbacks": mixed_forward.fallback_counts(),
+    }
+
+
+def _report_totals(counts):
+    spec_rows = counts.get("spec_rows", 0)
+    commits = counts.get("commits", 0)
+    actual = counts.get("graph_actual_tokens", 0)
+    padded = counts.get("graph_padded_tokens", 0)
+    graph_steps = counts.get("graph_observed_steps", 0)
+    snapshot_steps = counts.get("batch_snapshot_steps", 0)
+    context_rows = counts.get("context_known_rows", 0)
+    return {
+        "spec_rows": spec_rows,
+        "spec_emitted_per_row": counts.get("spec_emitted_tokens", 0) / spec_rows if spec_rows else None,
+        "commits": commits,
+        "host_submit_us_avg": counts.get("host_submit_us", 0) / commits if commits else None,
+        "kernel_submissions": counts.get("kernel_submissions", 0),
+        "launches_per_commit": counts.get("kernel_submissions", 0) / commits if commits else None,
+        "groups_per_commit": counts.get("groups", 0) / commits if commits else None,
+        "graph_observed_steps": graph_steps,
+        "graph_padding_tokens": padded,
+        "graph_padding_fraction": padding_fraction(actual, actual + padded) if graph_steps else None,
+        "graph_hist": [{"actual": a, "captured": b, "steps": n} for (a, b), n in _GRAPHS.most_common(8)],
+        "batch_snapshot_steps": snapshot_steps,
+        "target_tokens": counts.get("actual_target_tokens", 0) if snapshot_steps else None,
+        "mean_rows": counts.get("request_rows", 0) / snapshot_steps if snapshot_steps else None,
+        "peak_rows": counts.get("peak_request_rows", 0) if snapshot_steps else None,
+        "mean_commit_rows": counts.get("commit_rows", 0) / commits if commits else None,
+        "mean_computed_context": counts.get("context_tokens_sum", 0) / context_rows if context_rows else None,
+        "batch_hist": [
+            {"phase": phase, "rows": rows, "steps": steps}
+            for (phase, rows), steps in sorted(_BATCHES.items())
+        ],
+    }
+
+
+def report():
+    global _LAST_REPORTED_STEPS, _LAST_REPORTED_COMMITS
+    if _RANK != 0:
+        return
+    from . import sampling_patch
+
+    # Serialize periodic and idle reports without holding the worker's stats
+    # lock while writing to the logging handler.
+    with _REPORT_LOCK:
+        with _LOCK:
+            counts = dict(_COUNTS)
+            steps = counts.get("output_steps", 0)
+            if steps <= _LAST_REPORTED_STEPS:
+                return
+            elapsed = (
+                0.0
+                if _START is None or _LAST_OUTPUT_AT is None
+                else _LAST_OUTPUT_AT - _START
+            )
+            payload = _phase_payload(elapsed, counts)
+            payload["totals"] = _report_totals(counts)
+            _LAST_REPORTED_STEPS = steps
+            _LAST_REPORTED_COMMITS = counts.get("commits", 0)
+        paths = {}
+        for metric, values in _path_counters().items():
+            baseline = _PATHS_AT_READY.get(metric, {})
+            paths[metric] = {
+                name: count - baseline.get(name, 0)
+                for name, count in values.items()
+                if count > baseline.get(name, 0)
+            }
+        paths["scope"] = "HOST_DISPATCH_COUNTS_SINCE_READY_NOT_GRAPH_EXECUTIONS"
+        payload["paths"] = paths
+        payload["sampler"] = sampling_patch.perf_configuration()
+        logger.info("GDN_PHASE_PERF json=%s", json.dumps(payload, separators=(",", ":")))
 
 
 def install():
@@ -662,7 +650,7 @@ def install():
 
     @functools.wraps(original_warmup)
     def warmup(self, *args, **kwargs):
-        global _READY, _IDLE_THREAD, _LATEST
+        global _READY, _IDLE_THREAD, _LATEST, _PATHS_AT_READY
         result = original_warmup(self, *args, **kwargs)
         if _enabled():
             if not getattr(self, "_gdn_patch_prepared", False):
@@ -679,6 +667,9 @@ def install():
                     _LAST_CONFIG,
                     final,
                 )
+            from . import graph_probe
+
+            _PATHS_AT_READY = _path_counters()
             _LATEST = None
             _READY = True
             if _RANK == 0 and _IDLE_THREAD is None:
@@ -688,28 +679,19 @@ def install():
                 )
                 _IDLE_THREAD.start()
                 atexit.register(_shutdown_reporting)
-            from . import ascendc_backend
-
-            paths = ascendc_backend.counts()
             logger.info(
-                "GDN_READY patch=%s rank=%d launch_fingerprint=%s "
-                "capture_policy=UNCHANGED validation=STARTUP_COMPLETE "
-                "fused_model_dispatches=%d fused_total_dispatches=%d "
-                "dispatch_scope=HOST_NOT_GRAPH_REPLAY",
-                PATCH_ID,
-                _RANK,
-                _fingerprint(final),
-                paths.get("verify_fused_model_calls", 0),
-                paths.get("verify_fused", 0),
-            )
-            logger.info(
-                "GDN_PHASE_PERF_CONFIG json=%s",
+                "GDN_READY json=%s",
                 json.dumps({
-                    "schema": 1, "pid": os.getpid(), "rank": _RANK,
+                    "schema": 2, "pid": os.getpid(), "rank": _RANK,
                     "local_rank": getattr(self, "local_rank", None),
                     "patch": PATCH_ID, "source_fingerprint": _SOURCE_FINGERPRINT,
                     "launch_fingerprint": _fingerprint(final),
                     "ready_unix_s": time.time(), "parameters": final,
+                    "replay_enabled": True,
+                    "validation": "STARTUP_COMPLETE",
+                    "startup": getattr(self, "_gdn_perf_startup", {}),
+                    "startup_graphs": graph_probe.metrics(),
+                    "startup_host_dispatches": _PATHS_AT_READY,
                     "workload_report_rank": 0,
                     "timing_sample_block_steps": TIMING_SAMPLE_BLOCK,
                     "timing_first_steps": TIMING_FIRST_STEPS,

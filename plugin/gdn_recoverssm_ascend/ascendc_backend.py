@@ -14,6 +14,7 @@ _ENABLED = False
 _OPS = None
 _COUNTS = Counter()
 _FALLBACKS = set()
+_FALLBACK_COUNTS = Counter()
 
 
 def _log():
@@ -33,7 +34,7 @@ def initialize():
     if _OPS.abi_version() != 1:
         raise RuntimeError("GDN AscendC library ABI mismatch")
     _ENABLED = True
-    _log().info(
+    _log().debug(
         "GDN_ASCENDC loaded fingerprint=%s library=%s cache_hit=%s "
         "kernels=verify,verify_fused,grouped-fold plan_conv_publisher=triton",
         artifact.fingerprint,
@@ -71,11 +72,20 @@ def counts():
     return dict(_COUNTS)
 
 
+def fallback_counts():
+    """Host decisions, including startup and graph capture."""
+    return {
+        f"{name}: {reason}": count
+        for (name, reason), count in _FALLBACK_COUNTS.copy().items()
+    }
+
+
 def _no_fusion(reason):
     key = ("verify_fused", reason)
+    _FALLBACK_COUNTS[key] += 1
     if key not in _FALLBACKS:
         _FALLBACKS.add(key)
-        _log().info(
+        _log().debug(
             "GDN_ASCENDC_FUSION eligible=0 preprocessing=separate-native-helpers "
             "verify_backend=existing-dispatch reason=%s", reason
         )
@@ -84,12 +94,12 @@ def _no_fusion(reason):
 
 def _decline(name, reason):
     key = (name, reason)
+    _FALLBACK_COUNTS[key] += 1
     if key not in _FALLBACKS:
         _FALLBACKS.add(key)
-        _log().info(
+        _log().debug(
             "GDN_ASCENDC compatibility backend=triton kernel=%s reason=%s", name, reason
         )
-    return None
 
 
 def select(spec):
@@ -238,7 +248,7 @@ def assert_ready():
             "GDN AscendC verify/fold must be prepared for the actual model; verify_fused "
             "and ordinary entry points must execute startup self-tests before READY"
         )
-    _log().info(
+    _log().debug(
         "GDN_ASCENDC_READY PASS verify_launches=%d fold_launches=%d fused_launches=%d "
         "request_parameters=unchanged",
         _COUNTS["verify"],
@@ -475,7 +485,7 @@ def launch_fused_verify(
     if scope == "mixed":
         _COUNTS["verify_fused_mixed_tokens_host_layer_sum"] += tokens
     if _COUNTS[scope_counter] == 1:
-        _log().info(
+        _log().debug(
             "GDN_ASCENDC_FUSION model_dispatch=PASS phase=%s activation=%s state=%s "
             "A_log=%s dt_bias=%s "
             "query_len=%d key_heads=%d value_heads=%d external_helpers_removed=%d "

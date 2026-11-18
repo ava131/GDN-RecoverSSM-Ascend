@@ -1757,7 +1757,7 @@ class GDNRecoverSSMCommitContext:
                     ub_estimate_bytes=_verify_ub_floats(block_v, block_k) * 4,
                 )
                 report.append(description)
-                logger.info("GDN_VERIFY_PREPARED %s", description)
+                logger.debug("GDN_VERIFY_PREPARED %s", description)
         self.verify_prepare_report = tuple(report)
         return report
 

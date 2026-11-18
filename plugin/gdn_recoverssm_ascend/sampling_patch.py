@@ -25,7 +25,7 @@ ESTIMATED_BYTES_PER_ELEMENT = 32
 _SORT_VALUES = None
 _INSTALLED = False
 _PREPARED = False
-_FIRST_CALL = True
+_FIRST_INVOCATION = None
 
 
 def chunk_rows(vocab_size: int, rows: int) -> int:
@@ -82,24 +82,29 @@ def _enabled():
     return is_enabled()
 
 
+def perf_configuration():
+    """Describe prepared filter policy and first shape, which may be warmup."""
+    return {
+        "prepared": _PREPARED,
+        "sort": "values-only" if _SORT_VALUES is not None else "bounded-sort",
+        "workspace_model_bytes": FILTER_WORKING_BYTES,
+        "first_invocation": dict(_FIRST_INVOCATION) if _FIRST_INVOCATION else None,
+    }
+
+
 def _adapter(original):
     def apply(logits, k, p):
-        global _FIRST_CALL
+        global _FIRST_INVOCATION
         if not _enabled():
             return original(logits, k, p)
         if k is None and p is None:
             return logits
-        if _FIRST_CALL:
-            _FIRST_CALL = False
-            logger.info(
-                "GDN_SAMPLER active rows=%d vocab=%d row_tile=%d "
-                "sort=%s workspace_model_bytes=%d semantics=rc1-threshold",
-                logits.shape[0],
-                logits.shape[1],
-                chunk_rows(logits.shape[1], logits.shape[0]),
-                "values-only" if _SORT_VALUES is not None else "bounded-sort",
-                FILTER_WORKING_BYTES,
-            )
+        if _FIRST_INVOCATION is None:
+            rows, vocab = logits.shape
+            _FIRST_INVOCATION = {
+                "rows": int(rows), "vocab": int(vocab),
+                "row_tile": int(chunk_rows(vocab, rows)),
+            }
         from . import diagnostics
 
         timer = diagnostics.timing_start("sampler_filter_host")
@@ -151,7 +156,7 @@ def prepare(worker):
             )
         del probe
     _PREPARED = True
-    logger.info(
+    logger.debug(
         "GDN_SAMPLER ready sort=%s working_bytes=%d sampling_params=unchanged "
         "reason=%s",
         "values-only" if _SORT_VALUES else "bounded-sort",

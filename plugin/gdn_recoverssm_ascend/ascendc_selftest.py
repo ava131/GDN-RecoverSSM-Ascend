@@ -521,7 +521,7 @@ def _mixed_staging_probe(device):
             if not torch.equal(out.cpu()[actual:], expected[actual:]):
                 raise RuntimeError("GDN_MIXED_SELFTEST output padding overwritten")
             cases += 1
-    init_logger("vllm.gdn_recoverssm_ascend.ascendc").info(
+    init_logger("vllm.gdn_recoverssm_ascend.ascendc").debug(
         "GDN_MIXED_SELFTEST PASS cases=%d raw_partition=PASS native_non_spec_gate=PASS "
         "direct_output_merge=PASS padding=PASS model_buffers_touched=0 "
         "scope=OWNED_STAGING_NOT_FULL_PREFILL", cases,
@@ -552,7 +552,7 @@ def run(device):
                         )
                         fused_calls += 1
     _mixed_staging_probe(device)
-    init_logger("vllm.gdn_recoverssm_ascend.ascendc").info(
+    init_logger("vllm.gdn_recoverssm_ascend.ascendc").debug(
         "GDN_ASCENDC_SELFTEST PASS cases=%d verify_calls=%d fold_calls=%d "
         "fused_verify_calls=%d norm_gate_roundtrip=PASS fused_key_tolerance=PASS "
         "Q=1,4,8 activation=fp32,bf16 state=fp32,bf16 beta=fp32,activation "

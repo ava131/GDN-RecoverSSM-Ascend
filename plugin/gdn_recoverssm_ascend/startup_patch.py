@@ -98,23 +98,7 @@ def install() -> None:
             "record_reserve_bytes": reserve,
             "transient_reserve_bytes": margin,
         }
-        if not total:
-            return available
-        logger.info(
-            "Ascend GDN RecoverSSM KV budget: records %.1f MiB (%s) + graph "
-            "headroom %.0f MiB = %.1f MiB deducted from available KV memory "
-            "(%.1f GiB -> %.1f GiB). The existing transient headroom defaults to "
-            "512 MiB; it is a budget reserve, not measured graph-pool bytes. "
-            "Override remains %s.",
-            reserve / (1024 * 1024),
-            _record_scratch_desc(config),
-            margin / (1024 * 1024),
-            total / (1024 * 1024),
-            available / (1024**3),
-            max(available - total, 0) / (1024**3),
-            _MARGIN_ENV,
-        )
-        return adjusted
+        return adjusted if total else available
 
     NPUWorker.determine_available_memory = determine_available_memory
     _APPLIED = True
@@ -296,17 +280,6 @@ def _record_scratch_bytes(config) -> int:
     )
 
 
-def _record_scratch_desc(config) -> str:
-    geo = _record_geometry(config)
-    if geo is None:
-        return "geometry unavailable"
-    return (
-        "rows={rows}, layers={layers}, value_heads={heads}, key_heads={key_heads}, "
-        "window={window}, typed-SoA: correction/decay=fp32 key={key_dtype}, "
-        "per-request temporaries reused every step"
-    ).format(**geo)
-
-
 def _iter_builders(model_runner):
     """Every distinct RecoverSSM metadata builder the runner will use."""
     seen: set[int] = set()
@@ -332,61 +305,7 @@ def _iter_builders(model_runner):
             yield builder
 
 
-def _log_runtime_flags(worker) -> None:
-    """Record the FINAL config values, not what the command line looked like.
-
-    ``--async-scheduling`` is a BooleanOptionalAction: omitting it leaves the
-    value at ``None``, which VllmConfig may resolve to ``True``. Deleting the flag
-    is therefore not a way to disable it, and ``--async-scheduling false`` is
-    rejected by argparse. Logging the resolved value (and the scheduler class it
-    selected) is the only reliable record.
-    """
-    config = getattr(worker, "vllm_config", None)
-    scheduler = getattr(config, "scheduler_config", None)
-    if scheduler is None:
-        return
-    try:
-        cls_name = scheduler.get_scheduler_cls().__name__
-    except Exception as exc:  # pragma: no cover - defensive
-        cls_name = f"<unavailable: {exc}>"
-    enabled = bool(scheduler.async_scheduling)
-    logger.info(
-        "Ascend GDN RecoverSSM: async_scheduling=%s (raw=%s) scheduler_cls=%s",
-        enabled,
-        scheduler.async_scheduling,
-        cls_name,
-    )
-    compilation = getattr(config, "compilation_config", None)
-    if compilation is not None:
-        mode = getattr(compilation, "cudagraph_mode", None)
-        logger.info(
-            "Ascend GDN RecoverSSM: cudagraph_mode=%s%s",
-            mode,
-            " (eager: no graph capture, so no first-execute queue setup is needed)"
-            if str(mode).endswith("NONE") or mode is None
-            else "",
-        )
-    cache = getattr(config, "cache_config", None)
-    if cache is not None:
-        logger.info(
-            "Ascend GDN RecoverSSM: prefix_caching=%s mamba_cache_mode=%s "
-            "records=row-indexed (a prefix-cache-shared page cannot carry another "
-            "request's records)",
-            getattr(cache, "enable_prefix_caching", "?"),
-            getattr(cache, "mamba_cache_mode", "?"),
-        )
-    if enabled:
-        # Asynchronous scheduling is supported: the plugin executes every captured
-        # graph once right after capture (see graph_probe._warm_captured_graphs),
-        # which is where the lazy queue construction used to fail.
-        logger.info(
-            "Ascend GDN RecoverSSM: async scheduling enabled; graph first "
-            "execution is prepared before readiness; serving replay failures "
-            "are not automatically retried"
-        )
-
-
-def _check_mixed_adapters(worker, builders) -> None:
+def _check_mixed_adapters(worker, builders) -> dict:
     """Check actual bound layers after worker donor-method copying is complete."""
     config = worker.vllm_config
     registry = getattr(getattr(config, "compilation_config", None), "static_forward_context", None)
@@ -417,13 +336,12 @@ def _check_mixed_adapters(worker, builders) -> None:
             raise RuntimeError(f"GDN mixed adapter has an incomplete patch contract: {name}")
         sources[digest] = sources.get(digest, 0) + 1
         observed_prefill_layers += bool(getattr(adapter, "_gdn_prefill_diagnostics", False))
-    logger.info(
-        "GDN_MIXED_ADAPTER READY layers=%d native_source_digests=%s "
-        "patches=preflight,spec_qkv,gates,spec_verify,merge "
-        "non_spec_native=preserved capture_policy=unchanged prefill_observation_layers=%d "
-        "scope=BOUND_METHOD_CHECK_NOT_DEVICE_TIMING",
-        len(names), sources, observed_prefill_layers,
-    )
+    return {
+        "layers": len(names),
+        "native_source_digests": sources,
+        "prefill_observation_layers": observed_prefill_layers,
+        "scope": "BOUND_METHOD_CHECK_NOT_DEVICE_TIMING",
+    }
 
 
 def _prepare(worker) -> None:
@@ -431,12 +349,11 @@ def _prepare(worker) -> None:
     if not feature_enabled(getattr(worker, "vllm_config", None)):
         return
     worker._gdn_patch_prepared = False
+    worker._gdn_perf_startup = {}
     from . import diagnostics, sampling_patch
 
     diagnostics.configure(worker)
     sampling_patch.prepare(worker)
-    _log_versions()
-    _log_runtime_flags(worker)
     compilation = getattr(worker.vllm_config, "compilation_config", None)
     mode = getattr(compilation, "cudagraph_mode", None)
     if mode is not None and not str(mode).endswith("NONE"):
@@ -456,17 +373,16 @@ def _prepare(worker) -> None:
             "RecoverSSM enabled GDN has no recovery metadata builders; "
             "refusing startup readiness without verify/commit preparation"
         )
-    _check_mixed_adapters(worker, builders)
+    mixed_adapter = _check_mixed_adapters(worker, builders)
 
     # op-dev uses an ahead-of-time AscendC library for verify/grouped fold.
     # Build/load before capture. A compiler/registration failure must not turn
     # this deployment silently back into the old Triton implementation.
     from . import ascendc_backend
 
-    ascendc_backend.initialize()
+    artifact = ascendc_backend.initialize()
 
-    total_rows = 0
-    verify_variants = 0
+    contexts = []
     actual_record_bytes = 0
     req_states = getattr(model_runner, "req_states", None)
     computed_owner = getattr(req_states, "num_computed_tokens", None)
@@ -502,13 +418,12 @@ def _prepare(worker) -> None:
         state_index_dtype = table.dtype if table is not None else torch.int32
         query_buffer = getattr(builder, "spec_query_start_loc", None)
         query_dtype = getattr(query_buffer, "dtype", torch.int32)
-        verify_prepared = context.prepare_verify(
+        context.prepare_verify(
             activation_dtype=config.model_config.dtype,
             state_table_width=int(getattr(builder, "num_spec", 0)) + 1,
             device=context.checkpoints[0].device,
         )
-        verify_variants += len(verify_prepared)
-        prepared = context.prepare(
+        context.prepare(
             capacity=capacity,
             # ``state_indices`` is a column view of the [rows, num_spec+1] table,
             # so its stride is the table width; the prepared variant has to match
@@ -524,39 +439,19 @@ def _prepare(worker) -> None:
             query_index_dtype=query_dtype,
             computed_dtype=getattr(computed_tokens, "dtype", torch.int32),
         )
-        total_rows += len(prepared)
-        logger.info(
-            "Ascend GDN RecoverSSM: prepared %d commit variants for %d layers "
-            "(rows 1..%d)",
-            len(prepared),
-            len(context.checkpoints),
-            capacity,
-        )
-        actual_record_bytes += _log_context_geometry(builder, context, capacity)
+        geometry = _describe_context_geometry(builder, context, capacity)
+        contexts.append(geometry)
+        actual_record_bytes += geometry["actual_record_bytes"]
     reserved_record_bytes = _record_scratch_bytes(worker.vllm_config)
     if actual_record_bytes > reserved_record_bytes:
         raise RuntimeError(
             "RecoverSSM record allocation exceeds its KV-budget reservation: "
             f"actual={actual_record_bytes}, reserved={reserved_record_bytes}"
         )
-    logger.info(
-        "GDN_RECORD_BUDGET actual_bytes=%d reserved_bytes=%d transient_reserve_bytes=%d PASS",
-        actual_record_bytes,
-        reserved_record_bytes,
-        _graph_margin_bytes(worker.vllm_config),
-    )
     from .grouped_commit import prepare_grouped_commit
 
-    grouped_variants = prepare_grouped_commit(
+    prepare_grouped_commit(
         builders, model_runner.block_tables, num_computed_tokens=computed_tokens
-    )
-    logger.info(
-        "Ascend GDN RecoverSSM: startup preparation complete "
-        "(%d verify signatures, %d per-group commit variants, "
-        "%d grouped variants; capture sizes unchanged)",
-        verify_variants,
-        total_rows,
-        grouped_variants,
     )
 
     if not _SELFTEST_DONE:
@@ -616,11 +511,28 @@ def _prepare(worker) -> None:
             spec_query_len=int(context.spec_query_len),
         )
     ascendc_backend.assert_ready()
+    worker._gdn_perf_startup = {
+        "packages": _installed_packages(),
+        "adapter_abi": "Ascend-0.30rc1",
+        # Reference sources used by the adapter, not installed package SHAs.
+        "adapter_reference": {"vllm_ascend": "5f828ad", "vllm": "ced6857"},
+        "mixed_adapter": mixed_adapter,
+        "contexts": contexts,
+        "record_budget": {
+            "actual_bytes": actual_record_bytes,
+            "reserved_bytes": reserved_record_bytes,
+        },
+    }
+    if artifact is not None:
+        worker._gdn_perf_startup["ascendc"] = {
+            "fingerprint": artifact.fingerprint,
+            "cache_hit": artifact.cache_hit,
+        }
     _SELFTEST_DONE = True
     worker._gdn_patch_prepared = True
 
 
-def _log_context_geometry(builder, context, capacity: int) -> int:
+def _describe_context_geometry(builder, context, capacity: int) -> dict:
     """Describe actual bound tensors without reading any device contents."""
     state = context.checkpoints[0]
     records = context.records
@@ -630,27 +542,22 @@ def _log_context_geometry(builder, context, capacity: int) -> int:
         from .kernels import record_nbytes
 
         actual_bytes = sum(record_nbytes(record) for record in records)
-    logger.info(
-        "GDN_PREPARED_CONTEXT layers=%d state_shape=%s state_stride=%s "
-        "state_dtype=%s record_key_dtype=%s actual_record_bytes=%d "
-        "record_rows=%d plan_rows=%d commit_rows_prepared=%d "
-        "cache_mode=%s available_strategies=typed-SoA/direct-output/grouped-commit "
-        "capture_geometry=unchanged",
-        len(context.checkpoints),
-        tuple(state.shape),
-        tuple(state.stride()),
-        state.dtype,
-        key_dtype,
-        actual_bytes,
-        context.record_rows,
-        context.commit_lens.numel(),
-        capacity,
-        builder.vllm_config.cache_config.mamba_cache_mode,
-    )
-    return actual_bytes
+    return {
+        "kv_group": getattr(builder, "_gdn_kv_cache_group_id", None),
+        "layers": len(context.checkpoints),
+        "state_shape": tuple(state.shape),
+        "state_stride": tuple(state.stride()),
+        "state_dtype": str(state.dtype),
+        "record_key_dtype": str(key_dtype),
+        "actual_record_bytes": actual_bytes,
+        "record_rows": context.record_rows,
+        "plan_rows": context.commit_lens.numel(),
+        "commit_rows_prepared": capacity,
+        "cache_mode": builder.vllm_config.cache_config.mamba_cache_mode,
+    }
 
 
-def _log_versions() -> None:
+def _installed_packages() -> dict:
     """Record installed package versions without importing extra device code."""
     packages = {}
     for name in (
@@ -665,9 +572,4 @@ def _log_versions() -> None:
             packages[name] = version(name)
         except PackageNotFoundError:
             packages[name] = "distribution-metadata-unavailable"
-    logger.info(
-        "GDN_RUNTIME packages=%s adapter_ABI=Ascend-0.30rc1 "
-        "source_pair=ascend:5f828ad/vllm:ced6857 "
-        "source_pair_status=adapter-reference-not-installed-sha",
-        packages,
-    )
+    return packages

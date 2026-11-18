@@ -717,8 +717,10 @@ def test_startup_preparation_runs_before_warmup(monkeypatch):
     monkeypatch.setattr(
         grouped_commit, "prepare_grouped_commit", lambda *args, **kwargs: 0
     )
-    monkeypatch.setattr(startup_patch, "_log_context_geometry", lambda *args: 0)
-    monkeypatch.setattr(startup_patch, "_log_versions", lambda: None)
+    monkeypatch.setattr(
+        startup_patch, "_describe_context_geometry", lambda *args: {"actual_record_bytes": 0}
+    )
+    monkeypatch.setattr(startup_patch, "_installed_packages", lambda: {"vllm": "0.30.0rc1"})
     # This test isolates commit-context preparation. Bound-method validation
     # has separate tests using a model layer registry and real adapter markers.
     monkeypatch.setattr(startup_patch, "_check_mixed_adapters", lambda *args: None)
@@ -729,6 +731,8 @@ def test_startup_preparation_runs_before_warmup(monkeypatch):
     monkeypatch.setattr(ascendc_backend, "assert_ready", lambda: None)
     startup_patch._prepare(worker)
     assert events == [("prepare", 8, 4, True)], events
+    assert worker._gdn_perf_startup["packages"] == {"vllm": "0.30.0rc1"}
+    assert worker._gdn_perf_startup["contexts"] == [{"actual_record_bytes": 0}]
 
     # unbound KV cache must fail the startup, not silently defer to the first request
     class _Lazy(_Builder):
@@ -986,7 +990,6 @@ def test_record_scratch_is_reserved_from_the_kv_budget():
     assert startup_patch._record_scratch_bytes(config) == expected
     # ~67 MiB, below the packed FP32 representation and the state pages saved.
     assert 60 * 1024 * 1024 < expected < 75 * 1024 * 1024, expected
-    assert "rows=51" in startup_patch._record_scratch_desc(config)
 
     # Records are sized by max_num_seqs, not by the padded graph batch: padded
     # rows never reach the record stores.

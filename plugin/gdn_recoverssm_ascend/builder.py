@@ -118,7 +118,7 @@ class AscendGDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
         global _COMMIT_STEPS
         _COMMIT_STEPS += 1
         if _COMMIT_STEPS <= 3 or _COMMIT_STEPS % 200 == 0:
-            logger.info(
+            logger.debug(
                 "Ascend GDN RecoverSSM commit: step=%d rows=%d mode=%s "
                 "(checkpoint advanced by the GDN commit kernel)",
                 _COMMIT_STEPS,
@@ -299,7 +299,7 @@ class AscendGDNRecoverSSMMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         # Keep the binding objects alive; neither container identity nor a raw
         # pointer alone is a reliable storage/layout invalidation protocol.
         self._ctx_bindings = tuple(tuple(layer.kv_cache) for layer in layers)
-        logger.info(
+        logger.debug(
             "Ascend GDN RecoverSSM commit context: %d layers, spec_query_len=%d, "
             "state tensors per layer=%d, replay shape=%s, plan rows=%d",
             len(layers),

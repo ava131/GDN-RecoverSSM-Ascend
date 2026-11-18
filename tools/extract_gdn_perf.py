@@ -186,7 +186,15 @@ def collect_gdn(line, where, active, processes):
         reset = (
             isinstance(steps, int) and isinstance(old_steps, int) and steps < old_steps
         )
-        reset |= key == "GDN_CONFIG" and "patch" in fields and bool(process["periodic"])
+        if process["periodic"]:
+            ready = last_fields(process, "GDN_READY", "startup")
+            if key == "GDN_CONFIG" and "patch" in fields:
+                reset = True
+            elif key == "GDN_MEMORY" and current.get("phase") == "kv_bound_before_prepare":
+                # A new worker's memory snapshots are emitted before READY.
+                reset = True
+            elif key == "GDN_READY" and current.get("ready_unix_s") is not None:
+                reset = current["ready_unix_s"] != ready.get("ready_unix_s")
     if process is None or reset:
         process = new_process(name, pid, rank, process["session"] + 1 if process else 1)
         active[identity] = process
@@ -487,10 +495,14 @@ def print_server(work):
     for p in work["processes"]:
         label = f"{p['name']} pid={p['pid']} rank={p['rank']} 会话={p['session']}"
         print("  " + label)
-        config = last_fields(p, "GDN_PHASE_PERF_CONFIG", "startup") or last_fields(
-            p, "GDN_CONFIG", "startup"
+        ready_record = last_fields(p, "GDN_READY", "startup")
+        config = (
+            (ready_record if "parameters" in ready_record else None)
+            or last_fields(p, "GDN_PHASE_PERF_CONFIG", "startup")
+            or last_fields(p, "GDN_CONFIG", "startup")
+            or ready_record
         )
-        ready = "GDN_READY" in p["startup"]
+        ready = bool(ready_record)
         if config or ready:
             manifest = config.get("parameters", {})
             print(
@@ -527,15 +539,19 @@ def print_server(work):
                         ),
                     ),
                 )
-        ctx = last_fields(p, "GDN_PREPARED_CONTEXT", "startup")
-        if ctx:
+        startup = ready_record.get("startup", {})
+        legacy_context = last_fields(p, "GDN_PREPARED_CONTEXT", "startup")
+        contexts = startup.get("contexts") or ([legacy_context] if legacy_context else [])
+        for ctx in contexts:
             print(
                 "    State",
                 display_fields(
                     ctx,
                     (
+                        "kv_group",
                         "layers",
                         "state_shape",
+                        "state_stride",
                         "state_dtype",
                         "actual_record_bytes",
                         "record_rows",
@@ -560,7 +576,13 @@ def print_server(work):
                 ),
             )
         phase = last_fields(p, "GDN_PHASE_PERF")
-        perf = last_fields(p, "GDN_PERF")
+        totals = phase.get("totals")
+        perf = (
+            {"steps": phase.get("steps"), "emitted_tokens": phase.get("emitted_tokens"),
+             "worker_observed_s": phase.get("worker_window_s"), **totals}
+            if isinstance(totals, dict)
+            else last_fields(p, "GDN_PERF")
+        )
         if perf:
             print(
                 "    Worker 累计",
@@ -576,6 +598,9 @@ def print_server(work):
                         "host_submit_us_avg",
                         "launches_per_commit",
                         "graph_padding_fraction",
+                        "target_tokens",
+                        "mean_rows",
+                        "peak_rows",
                     ),
                 ),
             )
@@ -603,9 +628,12 @@ def print_server(work):
                     ),
                     f"phase_steps={json.dumps(steps)}",
                 )
-        if paths := last_fields(p, "GDN_PATHS"):
+        current_paths = phase.get("paths")
+        if paths := current_paths or last_fields(p, "GDN_PATHS"):
             print(
-                "    verify Host 分派（旧计数包括启动，图 replay 不走 Python）",
+                "    verify Host 分派（READY 后，图 replay 不走 Python）"
+                if current_paths
+                else "    verify Host 分派（旧计数包括启动，图 replay 不走 Python）",
                 display_fields(
                     paths.get("counts", {}),
                     (
@@ -615,7 +643,11 @@ def print_server(work):
                     ),
                 ),
             )
-        if sampler := last_fields(p, "GDN_SAMPLER", "dispatch"):
+        if sampler := (
+            phase.get("sampler")
+            or startup.get("sampler")
+            or last_fields(p, "GDN_SAMPLER", "dispatch")
+        ):
             print(
                 "    Sampling",
                 display_fields(
@@ -702,20 +734,27 @@ def input_logs(entries, parser, kind):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=(
+            "Example: %(prog)s --server server.log --client ais.log "
+            "--json-out evidence.json. File labels are optional: "
+            "--server replay=server.log gives this input the label 'replay'."
+        ),
+    )
     parser.add_argument(
         "--server",
         action="append",
         required=True,
-        metavar="[LABEL=]PATH",
-        help="vLLM server text log, repeat for separate P/D, Base or Replay logs",
+        metavar="PATH",
+        help="vLLM server log file; repeat for separate P/D, Base or Replay logs",
     )
     parser.add_argument(
         "--client",
         action="append",
         default=[],
-        metavar="[LABEL=]PATH",
-        help="optional AIS Bench text log, repeat for separate benchmark logs",
+        metavar="PATH",
+        help="optional AIS Bench client log for whole-run duration, TTFT/TPOT and throughput",
     )
     parser.add_argument(
         "--json-out", type=Path, metavar="PATH", help="save structured evidence JSON"

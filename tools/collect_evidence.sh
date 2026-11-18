@@ -14,6 +14,13 @@ if [[ ! -f "$LOG" ]]; then
   exit 1
 fi
 
+# Current workers aggregate startup checks and dispatch evidence into JSON.
+# Keep the old checklist available for archived logs with separate markers.
+if grep -qF 'GDN_READY json=' "$LOG"; then
+  collector_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  exec python3 "$collector_dir/extract_gdn_perf.py" --server "$LOG"
+fi
+
 have() { grep -c "$1" "$LOG" 2>/dev/null || true; }
 sec()  { printf '\n===== %s =====\n' "$1"; }
 show() {  # show <description> <grep-pattern> [head-count]

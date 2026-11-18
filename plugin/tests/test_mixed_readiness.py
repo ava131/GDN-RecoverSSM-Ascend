@@ -46,17 +46,21 @@ def bound_layer():
     return Layer()
 
 
-def test_readiness_checks_all_actual_layers_and_logs_source(startup, caplog):
+def test_readiness_checks_all_actual_layers_and_describes_source(startup):
     registry = {"layer.0": bound_layer(), "layer.1": bound_layer()}
     config = types.SimpleNamespace(
         compilation_config=types.SimpleNamespace(static_forward_context=registry)
     )
     builders = [types.SimpleNamespace(layer_names=list(registry))]
-    with caplog.at_level(logging.INFO):
-        startup._check_mixed_adapters(types.SimpleNamespace(vllm_config=config), builders)
-    assert "GDN_MIXED_ADAPTER READY layers=2" in caplog.text
-    assert "a" * 64 in caplog.text
-    assert "BOUND_METHOD_CHECK_NOT_DEVICE_TIMING" in caplog.text
+    evidence = startup._check_mixed_adapters(
+        types.SimpleNamespace(vllm_config=config), builders
+    )
+    assert evidence == {
+        "layers": 2,
+        "native_source_digests": {"a" * 64: 2},
+        "prefill_observation_layers": 0,
+        "scope": "BOUND_METHOD_CHECK_NOT_DEVICE_TIMING",
+    }
 
 
 @pytest.mark.parametrize("change", ["missing_layer", "unpatched", "incomplete", "no_source"])

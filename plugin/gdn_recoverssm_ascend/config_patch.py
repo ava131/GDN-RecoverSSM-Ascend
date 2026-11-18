@@ -16,6 +16,7 @@ shapes the Ascend kernel supports and then enable the same downstream machinery
 from __future__ import annotations
 
 import functools
+import logging
 import os
 
 from vllm.logger import init_logger
@@ -163,7 +164,7 @@ def _summary(config, query_len: int) -> str:
         replay = (
             f"typed-SoA scratch: correction={hv // tp}x{query_len}x{v} fp32, "
             f"shared_key={hk // tp}x{query_len}x{k} {key_dtype}, "
-            f"decay={hv // tp}x{query_len} fp32; actual bytes in GDN_PREPARED_CONTEXT"
+            f"decay={hv // tp}x{query_len} fp32; actual bytes in GDN_READY startup.contexts"
         )
         states = "conv/checkpoint components; resident slots follow native cache mode"
     else:
@@ -230,7 +231,8 @@ def install() -> None:
             from . import graph_probe
 
             graph_probe.enable()
-        logger.info("Ascend GDN RecoverSSM %s", _summary(self, query_len))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Ascend GDN RecoverSSM %s", _summary(self, query_len))
         return self
 
     VllmConfig.validate_mamba_cached_kernel = validate_mamba_cached_kernel

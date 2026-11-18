@@ -355,7 +355,7 @@ def run(
             passed += int(ok)
             name = str(dtype).split(".")[-1]
             worst[name] = max(worst.get(name, 0.0), max_rel)
-            logger.info(
+            (logger.debug if ok else logger.error)(
                 "Ascend GDN RecoverSSM selftest: %s q=%d fold=%d layers=%d "
                 "heads=%d key_heads=%d output+all-layer-state+null+padding "
                 "max_rel=%.3e %s",
@@ -373,7 +373,7 @@ def run(
         )
         cases += 1
         passed += int(align_ok)
-    logger.info(
+    (logger.debug if passed == cases else logger.error)(
         "Ascend GDN RecoverSSM selftest SUMMARY: cases=%d pass=%d fail=%d "
         "worst_max_rel=%s tolerance fp32=%.1e bf16=%.1e %s",
         cases,
@@ -445,7 +445,7 @@ def _run_align(context, checkpoints, records, dtype, key_heads, head_k, head_v, 
         for page, want in zip((2, 3), expected[layer]):
             _, rel, cosine = _metrics(checkpoints[layer][page], want)
             ok &= rel <= tolerance and cosine >= 0.999
-    logger.info(
+    (logger.debug if ok else logger.error)(
         "Ascend GDN RecoverSSM selftest ALIGN: layers=%d q=%d boundary=%d %s",
         len(checkpoints),
         window,
@@ -545,7 +545,7 @@ def run_conv(
             cases += 1
             passed += int(ok)
             worst = max(worst, max_rel)
-            logger.info(
+            (logger.debug if ok else logger.error)(
                 "Ascend GDN RecoverSSM selftest: conv %s accepted=%d history=%d "
                 "max_abs=%.3e max_rel=%.3e %s",
                 str(dtype).split(".")[-1],
@@ -555,7 +555,7 @@ def run_conv(
                 max_rel,
                 "PASS" if ok else "FAIL",
             )
-    logger.info(
+    (logger.debug if passed == cases else logger.error)(
         "Ascend GDN RecoverSSM selftest CONV SUMMARY: cases=%d pass=%d fail=%d "
         "worst_max_rel=%.3e tolerance fp32=%.1e bf16=%.1e %s",
         cases,

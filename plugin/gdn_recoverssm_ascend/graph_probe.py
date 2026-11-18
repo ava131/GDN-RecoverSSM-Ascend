@@ -175,7 +175,7 @@ def _warm_captured_graphs(manager) -> None:
     # Startup only. Surface asynchronous warmup failures before server readiness.
     torch.npu.synchronize()
     _METRICS["warmed_graphs"] += done
-    logger.info(
+    logger.debug(
         "Ascend full-graph warmup: executed %d captured graphs before serving "
         "(0 without recorded metadata); runtime_retry=disabled",
         done,
@@ -218,7 +218,7 @@ def _log_replay_attempt(manager, desc, attn_metadata=None) -> None:
     padded = (
         None if logical is None or capacity is None else max(int(capacity) - logical, 0)
     )
-    logger.info(
+    logger.debug(
         "RecoverSSM graph dispatch: %s updatable_tasks=%s "
         "logical_spec_rows=%s graph_request_capacity=%s padded_rows=%s",
         _describe(desc),
