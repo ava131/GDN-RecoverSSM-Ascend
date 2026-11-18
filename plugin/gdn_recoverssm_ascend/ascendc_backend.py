@@ -272,13 +272,17 @@ def can_fuse_verify(layer, mixed_qkv, a, b, *, meta=None, out=None):
         return _no_fusion("raw activation/gate dtype, layout, or head dimension")
     for param in params:
         if (
-            param.dtype != torch.float32
-            or param.ndim != 1
+            param.ndim != 1
             or param.numel() != a.shape[1]
             or not param.is_contiguous()
             or param.device != mixed_qkv.device
         ):
-            return _no_fusion("gate parameters must be contiguous FP32 local heads")
+            return _no_fusion("gate parameters must be contiguous local heads on the input device")
+    if params[0].dtype != torch.float32 or params[1].dtype not in supported:
+        return _no_fusion(
+            f"gate parameter dtype: A_log={params[0].dtype} dt_bias={params[1].dtype}; "
+            "requires FP32 A_log and BF16/FP32 dt_bias"
+        )
     if a.device != b.device or a.device != mixed_qkv.device:
         return _no_fusion("raw inputs must share a device")
     state = getattr(layer, "kv_cache", ())
@@ -459,8 +463,12 @@ def launch_fused_verify(
     if _COUNTS["verify_fused_model_calls"] == 1:
         _log().info(
             "GDN_ASCENDC_FUSION model_dispatch=PASS activation=%s state=%s "
+            "A_log=%s dt_bias=%s "
             "query_len=%d key_heads=%d value_heads=%d external_helpers_removed=3 "
+            "q_token_stride=%d v_token_stride=%d "
             "scope=HOST_DISPATCH_NOT_GRAPH_REPLAY",
-            q.dtype, state.dtype, spec_query_len, q.shape[2], v.shape[2],
+            q.dtype, state.dtype, A_log.dtype, dt_bias.dtype,
+            spec_query_len, q.shape[2], v.shape[2],
+            q.stride(1), v.stride(1),
         )
     return out

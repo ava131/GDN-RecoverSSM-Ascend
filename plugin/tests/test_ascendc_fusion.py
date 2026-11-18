@@ -17,8 +17,8 @@ def layer_and_inputs():
     layer = types.SimpleNamespace(
         head_k_dim=128,
         head_v_dim=128,
-        A_log=torch.zeros(3),
-        dt_bias=torch.zeros(3),
+        A_log=torch.zeros(3, dtype=torch.float32),
+        dt_bias=torch.nn.Parameter(torch.zeros(3, dtype=torch.bfloat16)),
         num_spec=3,
         kv_cache=(None, torch.zeros(4, 3, 128, 128)),
         _gdn_recoverssm_records=types.SimpleNamespace(
@@ -59,6 +59,28 @@ def test_fused_preflight_is_host_only_and_rejects_other_contracts(runtime):
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    ("bias_dtype", "expected"),
+    [(torch.float32, True), (torch.bfloat16, True), (torch.float16, False)],
+)
+def test_fused_preflight_matches_native_qwen_bias_storage(runtime, bias_dtype, expected):
+    _, ac, calls = runtime
+    layer, mixed, a, b = layer_and_inputs()
+    layer.dt_bias = torch.nn.Parameter(layer.dt_bias.to(bias_dtype))
+    original_bias = layer.dt_bias
+    meta = types.SimpleNamespace(
+        spec_query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+        spec_state_indices_tensor=torch.ones(2, 1, dtype=torch.int32),
+        num_spec_decodes=2,
+        num_actual_tokens=8,
+    )
+    out = torch.empty(8, 3, 128, dtype=torch.bfloat16)
+    assert ac.can_fuse_verify(layer, mixed, a, b, meta=meta, out=out) is expected
+    assert layer.dt_bias is original_bias
+    assert layer.dt_bias.dtype == bias_dtype
+    assert calls == []
+
+
 def test_fused_dispatch_preserves_output_record_and_index_strides(runtime, monkeypatch):
     kernels, ac, calls = runtime
     monkeypatch.setattr(
@@ -71,6 +93,8 @@ def test_fused_dispatch_preserves_output_record_and_index_strides(runtime, monke
     q, k, v, _, beta, state, corr, key, decay, out, qsl, indices = base.args[:12]
     raw_a = torch.zeros((8, 3), dtype=q.dtype)
     raw_b = torch.zeros((8, 3), dtype=beta.dtype)
+    A_log = torch.zeros(3, dtype=torch.float32)
+    dt_bias = torch.nn.Parameter(torch.tensor([-0.2, 0.1, 0.3], dtype=torch.bfloat16))
     records = types.SimpleNamespace(correction=corr, key=key, decay=decay)
     result = ac.launch_fused_verify(
         q,
@@ -78,8 +102,8 @@ def test_fused_dispatch_preserves_output_record_and_index_strides(runtime, monke
         v,
         raw_a,
         raw_b,
-        torch.zeros(3),
-        torch.zeros(3),
+        A_log,
+        dt_bias,
         state,
         records,
         qsl,
@@ -92,6 +116,8 @@ def test_fused_dispatch_preserves_output_record_and_index_strides(runtime, monke
     args = calls[0][1]
     assert args[3] is raw_a and args[4] is raw_b
     assert args[6] is corr and args[7] is key and args[8] is decay
+    assert args[12] is A_log and args[13] is dt_bias
+    assert args[13].dtype == torch.bfloat16
     assert args[-2] == list(ac.select(base).config)
     assert args[-2][-1] == 4
     assert ac.counts()["verify_fused"] == 1
@@ -131,10 +157,20 @@ def test_fused_execution_failure_is_not_retried(runtime, monkeypatch):
 
 @pytest.mark.parametrize("activation", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("query_len", [1, 4, 8])
-def test_owned_raw_case_rounding_and_gate_reference(runtime, activation, query_len):
+@pytest.mark.parametrize("bias_dtype", [torch.float32, torch.bfloat16])
+def test_owned_raw_case_rounding_and_gate_reference(
+    runtime, activation, query_len, bias_dtype
+):
     kernels, _, _ = runtime
     probe = importlib.import_module(kernels._contract_package + ".ascendc_selftest")
-    case = probe.make_fused_case(query_len, activation, torch.float32, activation)
+    case = probe.make_fused_case(
+        query_len, activation, torch.float32, activation, bias_dtype
+    )
+    assert case["dt_bias"].dtype == bias_dtype
+    if bias_dtype == torch.bfloat16:
+        assert not torch.equal(
+            case["dt_bias"].float(), torch.tensor([-0.2, 0.1, 0.3])
+        )
     assert torch.count_nonzero(case["q"][0, 0]) == 0
     assert torch.count_nonzero(case["k"][0, 1]) == 0
     assert torch.count_nonzero(case["q"][0, 2]) == 1

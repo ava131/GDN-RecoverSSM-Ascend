@@ -420,8 +420,12 @@ def _probe(case, device, *, fused=False):
                 )
 
 
-def make_fused_case(query_len, activation_dtype, state_dtype, beta_dtype):
+def make_fused_case(
+    query_len, activation_dtype, state_dtype, beta_dtype, bias_dtype=torch.float32
+):
     """Raw inputs and independently rounded rc1 preprocessing reference."""
+    if bias_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("fused bias probes cover BF16/FP32 only")
     case = make_case(query_len, activation_dtype, state_dtype, beta_dtype)
     case["raw_q"] = _values(case["q"].shape, offset=3).to(activation_dtype)
     case["raw_k"] = _values(case["k"].shape, offset=11).to(activation_dtype)
@@ -444,8 +448,10 @@ def make_fused_case(query_len, activation_dtype, state_dtype, beta_dtype):
     case["raw_b"].flatten()[::7] = 20.0
     case["raw_b"].flatten()[1::7] = -20.0
     case["A_log"] = torch.tensor([-1.0, -0.5, 0.0], dtype=torch.float32)
-    case["dt_bias"] = torch.tensor([-0.2, 0.1, 0.3], dtype=torch.float32)
-    x = case["raw_a"].float() + case["dt_bias"]
+    case["dt_bias"] = torch.tensor([-0.2, 0.1, 0.3], dtype=bias_dtype)
+    # Native gating promotes the parameter's stored value before adding it;
+    # BF16 bias must not be replaced with its unquantized FP32 construction.
+    x = case["raw_a"].float() + case["dt_bias"].float()
     case["g"] = -case["A_log"].exp() * torch.where(
         x <= 20.0, torch.log(1.0 + x.exp()), x
     )
@@ -469,16 +475,18 @@ def run(device):
         for activation in (torch.float32, torch.bfloat16):
             for state in (torch.float32, torch.bfloat16):
                 for beta in dict.fromkeys((activation, torch.float32)):
-                    _probe(
-                        make_fused_case(query_len, activation, state, beta),
-                        device,
-                        fused=True,
-                    )
-                    fused_calls += 1
+                    for bias in (torch.float32, torch.bfloat16):
+                        _probe(
+                            make_fused_case(query_len, activation, state, beta, bias),
+                            device,
+                            fused=True,
+                        )
+                        fused_calls += 1
     init_logger("vllm.gdn_recoverssm_ascend.ascendc").info(
         "GDN_ASCENDC_SELFTEST PASS cases=%d verify_calls=%d fold_calls=%d "
         "fused_verify_calls=%d norm_gate_roundtrip=PASS fused_key_tolerance=PASS "
         "Q=1,4,8 activation=fp32,bf16 state=fp32,bf16 beta=fp32,activation "
+        "dt_bias=fp32,bf16 bias_storage_promotion=PASS "
         "GQA=3 prefix=0..Q null_padding=PASS readonly=PASS prenormalized_key_bits=PASS "
         "boundary_source_final_alias=PASS tolerance_fp32=%g tolerance_bf16=%g",
         calls + fused_calls,

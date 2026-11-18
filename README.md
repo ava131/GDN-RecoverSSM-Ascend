@@ -10,6 +10,8 @@
 
 本轮说明见 [设计与交接](docs/OPDEV_V2_DESIGN.md) 和 [正常启动及日志验收](docs/OPDEV_V2_SERVER_VALIDATION.md)。沿用现有完整启动命令，无新增用户开关。
 
+11月18日已修复首版 v2 错误拒绝 BF16 dt_bias 的融合接入问题，并删除融合路径的 QKV 整段副本。原因、证据与收益边界见 [v2 无明显收益复查](docs/OPDEV_V2_NO_GAIN_REVIEW_20261118.md)。
+
 ## 执行路径
 
 ```text

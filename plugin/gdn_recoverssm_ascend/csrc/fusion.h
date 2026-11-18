@@ -73,17 +73,19 @@ __aicore__ inline void NormalizeFusedWindow(
     }
 }
 
-template<class Activation, class Beta>
+template<class Activation, class Beta, class Bias>
 __aicore__ inline void LoadFusedMeta(
     GlobalTensor<Activation> a, GlobalTensor<Beta> b,
-    GlobalTensor<float> A_log, GlobalTensor<float> dt_bias,
+    GlobalTensor<float> A_log, GlobalTensor<Bias> dt_bias,
     LocalTensor<float> gates, LocalTensor<float> beta_values,
     LocalTensor<Beta> raw_beta, LocalTensor<float> scratch,
     int64_t head, int64_t begin, uint32_t count,
     int64_t a_stride, int64_t b_stride,
     TEventID scalarReady, TEventID scalarResult)
 {
-    const float bias = dt_bias.GetValue(head);
+    // Native Qwen creates dt_bias in the model dtype, while A_log is FP32.
+    // Convert the loaded scalar, preserving the stored BF16 parameter value.
+    const float bias = FusedFloat(dt_bias.GetValue(head));
     const float logA = A_log.GetValue(head);
     auto expA = scratch;
     auto ones = scratch[32];

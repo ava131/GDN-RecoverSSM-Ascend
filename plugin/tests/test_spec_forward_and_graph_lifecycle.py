@@ -34,6 +34,15 @@ class Array:
     def squeeze(self, dim):
         return Array(np.squeeze(self.data, axis=dim))
 
+    def split(self, sizes, dim):
+        return tuple(
+            Array(value)
+            for value in np.split(self.data, np.cumsum(sizes)[:-1], axis=dim)
+        )
+
+    def view(self, *shape):
+        return Array(self.data.reshape(shape))
+
 
 @pytest.fixture
 def runtime(monkeypatch):
@@ -141,6 +150,11 @@ def spec_setup(runtime):
         conv1d=types.SimpleNamespace(bias="bias"),
         activation=True,
         num_spec=3,
+        tp_size=1,
+        num_k_heads=1,
+        num_v_heads=1,
+        head_k_dim=2,
+        head_v_dim=2,
         A_log="A_log",
         dt_bias="dt_bias",
         rearrange_mixed_qkv=lambda value: (

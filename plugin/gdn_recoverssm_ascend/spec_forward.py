@@ -12,6 +12,36 @@ fused AscendC preprocessing path; other supported paths retain native helpers.
 from __future__ import annotations
 
 
+def _packed_qkv_views(layer, packed):
+    """Split a validated packed row without materializing contiguous copies.
+
+    The raw AscendC ABI accepts the packed token stride. Keep its Q/K/V views
+    on the convolution output's storage until verify has consumed them.
+    """
+    tp = int(getattr(layer, "tp_size", 1))
+    key_heads = getattr(layer, "num_k_heads", None)
+    value_heads = getattr(layer, "num_v_heads", None)
+    key_heads = (
+        int(key_heads) // tp
+        if key_heads is not None
+        else layer._gdn_recoverssm_records.key.shape[1]
+    )
+    value_heads = (
+        int(value_heads) // tp
+        if value_heads is not None
+        else layer.kv_cache[1].shape[1]
+    )
+    key_dim, value_dim = int(layer.head_k_dim), int(layer.head_v_dim)
+    key_width, value_width = key_heads * key_dim, value_heads * value_dim
+    q, k, v = packed.split((key_width, key_width, value_width), dim=-1)
+    tokens = packed.shape[0]
+    return (
+        q.view(1, tokens, key_heads, key_dim),
+        k.view(1, tokens, key_heads, key_dim),
+        v.view(1, tokens, value_heads, value_dim),
+    )
+
+
 def try_spec_forward(layer, mixed_qkv, b, a, core_attn_out, **kwargs) -> bool:
     """Fill the core output and return True, or decline before any side effect.
 
@@ -90,10 +120,11 @@ def try_spec_forward(layer, mixed_qkv, b, a, core_attn_out, **kwargs) -> bool:
         null_block_id=0,
         out=conv_output,
     )
-    q, k, v = layer.rearrange_mixed_qkv(conv_output)
     if fused:
+        q, k, v = _packed_qkv_views(layer, conv_output)
         g, beta = a[:actual], b[:actual]
     else:
+        q, k, v = layer.rearrange_mixed_qkv(conv_output)
         g, beta = native.DeviceOperator.fused_gdn_gating(
             layer.A_log, a[:actual], b[:actual], layer.dt_bias
         )

@@ -84,16 +84,29 @@ void VerifyState(uint32_t blocks, aclrtStream stream,
 #undef RUN_STATE
 }
 
-template<class A, class S, class B>
+template<class A, class S, class B, class Bias>
 void LaunchVerifyFused(uint32_t blocks, aclrtStream stream,
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
     const Tensor& beta, const Tensor& state, const Tensor& correction,
     const Tensor& key, const Tensor& decay, const Tensor& out,
     const Tensor& qsl, const Tensor& indices, const Tensor& A_log,
     const Tensor& dt_bias, VerifyTiling t) {
-    VerifyFusedKernel<A,S,A,B,int32_t,int32_t><<<blocks,nullptr,stream>>>(
+    VerifyFusedKernel<A,S,A,B,int32_t,int32_t,Bias><<<blocks,nullptr,stream>>>(
         PTR(q),PTR(k),PTR(v),PTR(g),PTR(beta),PTR(state),PTR(correction),
         PTR(key),PTR(decay),PTR(out),PTR(qsl),PTR(indices),PTR(A_log),PTR(dt_bias),t);
+}
+template<class A, class S, class B>
+void VerifyFusedBias(uint32_t blocks, aclrtStream stream,
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+    const Tensor& beta, const Tensor& state, const Tensor& correction,
+    const Tensor& key, const Tensor& decay, const Tensor& out,
+    const Tensor& qsl, const Tensor& indices, const Tensor& A_log,
+    const Tensor& dt_bias, VerifyTiling t) {
+    if (dt_bias.scalar_type()==at::kFloat) {
+        LaunchVerifyFused<A,S,B,float>(blocks,stream,q,k,v,g,beta,state,correction,key,decay,out,qsl,indices,A_log,dt_bias,t);
+    } else {
+        LaunchVerifyFused<A,S,B,bfloat16_t>(blocks,stream,q,k,v,g,beta,state,correction,key,decay,out,qsl,indices,A_log,dt_bias,t);
+    }
 }
 template<class A, class S>
 void VerifyFusedBeta(uint32_t blocks, aclrtStream stream,
@@ -103,9 +116,9 @@ void VerifyFusedBeta(uint32_t blocks, aclrtStream stream,
     const Tensor& qsl, const Tensor& indices, const Tensor& A_log,
     const Tensor& dt_bias, VerifyTiling t) {
     if (beta.scalar_type()==at::kFloat) {
-        LaunchVerifyFused<A,S,float>(blocks,stream,q,k,v,g,beta,state,correction,key,decay,out,qsl,indices,A_log,dt_bias,t);
+        VerifyFusedBias<A,S,float>(blocks,stream,q,k,v,g,beta,state,correction,key,decay,out,qsl,indices,A_log,dt_bias,t);
     } else {
-        LaunchVerifyFused<A,S,A>(blocks,stream,q,k,v,g,beta,state,correction,key,decay,out,qsl,indices,A_log,dt_bias,t);
+        VerifyFusedBias<A,S,A>(blocks,stream,q,k,v,g,beta,state,correction,key,decay,out,qsl,indices,A_log,dt_bias,t);
     }
 }
 template<class A>
@@ -246,9 +259,11 @@ void VerifyFused(const Tensor& q,const Tensor& k,const Tensor& v,const Tensor& g
         "GDN AscendC verify config does not match tensor strides");
     for (const Tensor* x : {&A_log,&dt_bias}) {
         CheckNpu(*x,q);
-        TORCH_CHECK(x->scalar_type()==at::kFloat && x->dim()==1 && x->numel()==t.value_heads && x->is_contiguous(),
-                    "GDN AscendC fused gate parameters must be contiguous FP32 heads");
+        TORCH_CHECK(x->dim()==1 && x->numel()==t.value_heads && x->is_contiguous(),
+                    "GDN AscendC fused gate parameters must be contiguous local heads");
     }
+    TORCH_CHECK(A_log.scalar_type()==at::kFloat, "GDN AscendC fused A_log must be FP32");
+    CheckFloat(dt_bias.scalar_type());
     const c10::OptionalDeviceGuard guard(q.device());
     const auto stream=c10_npu::getCurrentNPUStream().stream(false);
     const auto blocks=Blocks(t.rows*t.value_heads);

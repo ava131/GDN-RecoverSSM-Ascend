@@ -10,6 +10,8 @@ comment from gpt
 
 这是待设备验证的开发版本。CPU 测试和本地 Host 接口检查通过，尚无本分支的 NPU 编译、自检、full graph 稳定性或端到端收益数据。不能把减少 helper 数量直接换算成已经实现的加速。
 
+**2026-11-18 修正：首版 v2 `e132137` 的融合检查错误要求 dt_bias 为 FP32，标准 BF16 Qwen 加载路径会因此拒绝融合。已支持直接读取 BF16/FP32 bias，保留原 Parameter；启动自检也补齐真实混合精度。融合路径另改为直接使用 packed QKV views，删除 native rearrange 的整段副本。问题、证据和收益边界见 [本轮复查](OPDEV_V2_NO_GAIN_REVIEW_20261118.md)。**
+
 ## 2. 稳定版保留了什么
 
 - checkpoint 在 verify 中只读；采样后仍完整执行恢复。
@@ -106,7 +108,7 @@ BF16 的 q/k、beta 先 roundtrip 再参与 FP32 recurrence；key records 保存
 
 ## 7. 日志与建模口径
 
-`PATCH_ID=ascendc-op-dev-v2-window-fused`。源码指纹包含 csrc；构建指纹包含源码和实际工具链，新头文件会触发新库，不需手动清缓存。
+`PATCH_ID=ascendc-op-dev-v2-bf16-bias-qkv-views`。源码指纹包含 csrc；构建指纹包含源码和实际工具链，新头文件会触发新库，不需手动清缓存。
 
 - `GDN_ASCENDC_FUSION model_dispatch=PASS`：模型首次使用融合入口；`eligible=0 reason=...`：为何保留独立 helper。
 - `GDN_PATHS verify_fused`：包含专项自检；`verify_fused_model_calls` 和 `verify_fused_saved_helpers` 只来自模型入口。都是 Host dispatch 计数，不能当成 graph replay 的设备执行次数。
@@ -121,7 +123,7 @@ BF16 的 q/k、beta 先 roundtrip 再参与 FP32 recurrence；key records 保存
 
 ## 8. 验证、交接和下一步
 
-本地已执行完整 CPU 套件：**278 passed**。覆盖原生命周期/协调器/接线，以及新 raw 入口、写前拒绝、错误不重试、布局/容量、Q1..8 地址边界、任意接受前缀和最后 token 数学恒等式。测试不模拟出硬件性能结论。
+首版完整 CPU 套件为278项；11月18日修正版为 **302 passed**。覆盖原生命周期/协调器/接线，以及新 raw 入口、真实 BF16 bias、零拷贝 QKV views、写前拒绝、错误不重试、布局/容量、Q1..8 地址边界、任意接受前缀和最后 token 数学恒等式。测试不模拟出硬件性能结论。
 
 另外使用普通 C++ 编译器保留完整 Host 函数体、真实 Torch 校验和注册，只替换 NPU 头及设备 launch 机制，成功编译并加载，执行 ABI/verify/verify_fused/fold 的 Meta 接口。本机 Torch 2.15/C++20；这不证明部署工具链、Torch 版本或设备 API 编译通过。
 

@@ -19,12 +19,12 @@ python -m pip install -e ./plugin --no-deps
 
 在server日志中保留这些行：
 
-- `GDN_CONFIG patch=ascendc-op-dev-v2-window-fused`：配置快照、source fingerprint、启动参数指纹。
+- `GDN_CONFIG patch=ascendc-op-dev-v2-bf16-bias-qkv-views`：11月18日修正版，配置快照、source fingerprint、启动参数指纹。首版 v2 的 `ascendc-op-dev-v2-window-fused` 尚有 BF16 bias 拒绝融合的问题。
 - `GDN_ASCENDC loaded`：实际加载的库、build fingerprint、是否命中缓存及算子入口。
 - `GDN_PREPARED_CONTEXT`：实际state dtype、shape、stride、record key dtype、records字节数。这里的数字比配置摘要更直接。
-- `GDN_ASCENDC_SELFTEST`及现有grouped/conv自检结果：启动时在自有缓冲中验证，失败应阻止ready，不能当成运行中fallback理由。
-- `GDN_ASCENDC_FUSION model_dispatch=PASS`：模型路径首次提交融合 verify；与专项自检分开计数。若出现 `eligible=0`，同一行说明保留独立 helper 的原因，verify 仍按已有后端选择。
-- `GDN_READY`：只有准备和原生warmup完成后才打印。
+- `GDN_ASCENDC_SELFTEST`及现有grouped/conv自检结果：启动时在自有缓冲中验证，失败应阻止ready，不能当成运行中fallback理由。修正版应包含 `dt_bias=fp32,bf16 bias_storage_promotion=PASS`。
+- `GDN_ASCENDC_FUSION model_dispatch=PASS`：模型路径首次提交融合 verify；与专项自检分开计数，并打印真实 `A_log`、`dt_bias` dtype 与 Q/V token stride。TP4、HK4/HV12/K128 的 packed view token stride 应为 2560。若出现 `eligible=0`，同一行说明保留独立 helper 的原因，verify 仍按已有后端选择。
+- `GDN_READY`：只有准备和原生warmup完成后才打印。新增 `fused_model_dispatches` 和 `fused_total_dispatches`，明确模型调用与包含专项自检的调用总数。eager warmup若未构造pure-spec行，模型计数可以暂为0；普通模型首次进入时仍应看到 `model_dispatch=PASS`，不能只拿自检PASS证明模型融合。
 
 source fingerprint识别安装后的真实文件内容，包括editable install。build fingerprint识别实际编译输入。它们与git提交号属于不同口径，不能用单个旧日志证明新提交已执行。
 
@@ -36,6 +36,8 @@ source fingerprint识别安装后的真实文件内容，包括editable install�
 4. fold按窗口加载decay，避免递推中逐个读取GM标量。
 
 这些改变都需要数值验证。尤其最后token的公式调整了浮点计算顺序，不能因为数学恒等就声称逐bit相同。本地CPU检查不能证明CANN编译、设备数值或性能已经通过。
+
+融合签名修复后须正常重启 server，让图重新捕获；仅对运行中的进程执行 git pull 不会替换已有图。仍使用原命令，不需要清缓存或新增参数。
 
 ## 压测结束后看哪些统计
 

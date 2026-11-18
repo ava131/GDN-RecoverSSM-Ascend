@@ -14,7 +14,7 @@ using namespace AscendC;
 // alternate as recurrence state and reduction scratch. QKV are loaded once per
 // short window; checkpoint GM is read-only throughout this kernel.
 template <typename Activation, typename State, typename Key, typename Beta,
-          typename Index, typename Qsl, bool Fused = false>
+          typename Index, typename Qsl, bool Fused = false, typename Bias = float>
 class Verify {
     static constexpr uint32_t kDim = 128;
     static constexpr uint32_t kElements = kDim * kDim;
@@ -55,7 +55,7 @@ public:
         if constexpr (Fused) {
             raw_a_.SetGlobalBuffer(reinterpret_cast<__gm__ Activation *>(g));
             A_log_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(A_log));
-            dt_bias_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(dt_bias));
+            dt_bias_.SetGlobalBuffer(reinterpret_cast<__gm__ Bias *>(dt_bias));
         }
         beta_.SetGlobalBuffer(reinterpret_cast<__gm__ Beta *>(beta));
         state_.SetGlobalBuffer(reinterpret_cast<__gm__ State *>(state));
@@ -375,7 +375,7 @@ private:
                 ub_.GetWithOffset<Activation>(kWindowElements, kRawOffset),
                 ub_.GetWithOffset<Activation>(kWindowElements, kRawKeyOffset),
                 scratch, count);
-            LoadFusedMeta<Activation, Beta>(
+            LoadFusedMeta<Activation, Beta, Bias>(
                 raw_a_, beta_, A_log_, dt_bias_,
                 ub_.GetWithOffset<float>(kWindow, kMetaOffset),
                 ub_.GetWithOffset<float>(kWindow, kMetaOffset + 32),
@@ -432,7 +432,8 @@ private:
     TPipe pipe_;
     TBuf<TPosition::VECCALC> ub_;
     GlobalTensor<Activation> q_, k_, v_, out_;
-    GlobalTensor<float> g_, correction_, decays_, A_log_, dt_bias_;
+    GlobalTensor<float> g_, correction_, decays_, A_log_;
+    GlobalTensor<Bias> dt_bias_;
     GlobalTensor<Activation> raw_a_;
     GlobalTensor<State> state_;
     GlobalTensor<Key> keys_;
@@ -456,7 +457,7 @@ __global__ __aicore__ void VerifyKernel(
     op.Process();
 }
 template <typename Activation, typename State, typename Key, typename Beta,
-          typename Index, typename Qsl>
+          typename Index, typename Qsl, typename Bias = float>
 __global__ __aicore__ void VerifyFusedKernel(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR a, GM_ADDR b, GM_ADDR state,
     GM_ADDR correction, GM_ADDR key_record, GM_ADDR decay_record,
@@ -464,7 +465,7 @@ __global__ __aicore__ void VerifyFusedKernel(
     VerifyTiling tiling)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    verify_detail::Verify<Activation, State, Key, Beta, Index, Qsl, true> op(tiling);
+    verify_detail::Verify<Activation, State, Key, Beta, Index, Qsl, true, Bias> op(tiling);
     op.Init(q, k, v, a, b, state, correction, key_record, decay_record,
             out, qsl, indices, A_log, dt_bias);
     op.Process();

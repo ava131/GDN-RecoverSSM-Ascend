@@ -22,7 +22,7 @@ from vllm.logger import init_logger
 from .metrics_math import padding_fraction
 
 logger = init_logger("vllm.gdn_recoverssm_ascend.perf")
-PATCH_ID = "ascendc-op-dev-v2-window-fused"
+PATCH_ID = "ascendc-op-dev-v2-bf16-bias-qkv-views"
 REPORT_STEPS = 200
 _INSTALLED = False
 _READY = False
@@ -387,12 +387,19 @@ def install():
                 )
                 _IDLE_THREAD.start()
                 atexit.register(_shutdown_reporting)
+            from . import ascendc_backend
+
+            paths = ascendc_backend.counts()
             logger.info(
                 "GDN_READY patch=%s rank=%d launch_fingerprint=%s "
-                "capture_policy=UNCHANGED validation=STARTUP_COMPLETE",
+                "capture_policy=UNCHANGED validation=STARTUP_COMPLETE "
+                "fused_model_dispatches=%d fused_total_dispatches=%d "
+                "dispatch_scope=HOST_NOT_GRAPH_REPLAY",
                 PATCH_ID,
                 _RANK,
                 _fingerprint(final),
+                paths.get("verify_fused_model_calls", 0),
+                paths.get("verify_fused", 0),
             )
         return result
 
